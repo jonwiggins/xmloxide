@@ -1,0 +1,40 @@
+[package]
+name = "xmloxide"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+description = "A pure Rust reimplementation of libxml2 — memory-safe XML/HTML parsing"
+repository = "https://github.com/jondot/xmloxide"
+keywords = ["xml", "html", "parser", "dom", "xpath"]
+categories = ["parser-implementations", "web-programming"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+encoding_rs = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+pretty_assertions = "1"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Allow these pedantic lints with justification
+module_name_repetitions = "allow"   # e.g., tree::TreeNode is fine
+must_use_candidate = "allow"        # too noisy for builder methods
+missing_errors_doc = "allow"        # we document errors but not on every fn
+missing_panics_doc = "allow"        # we don't panic in library code anyway
+# Deny these — they indicate real bugs
+unwrap_used = "warn"
+expect_used = "warn"
+
+[[bin]]
+name = "xmllint"
+path = "src/bin/xmllint.rs"
+
+[[bench]]
+name = "parser_bench"
+harness = false
