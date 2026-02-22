@@ -49,7 +49,7 @@ pub(crate) const DEFAULT_MAX_ENTITY_EXPANSIONS: u32 = 10_000;
 // XML Name character classes (XML 1.0 §2.3)
 // -------------------------------------------------------------------------
 
-/// Returns `true` if `c` is a valid `Char` per XML 1.0 §2.2 [2].
+/// Returns `true` if `c` is a valid `Char` per XML 1.0 §2.2 `[2]`.
 ///
 /// The XML 1.0 (Fifth Edition) `Char` production allows:
 /// `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]`
@@ -59,7 +59,7 @@ pub(crate) fn is_xml_char(c: char) -> bool {
     )
 }
 
-/// Returns `true` if `c` is a valid `NameStartChar` per XML 1.0 §2.3 [4].
+/// Returns `true` if `c` is a valid `NameStartChar` per XML 1.0 §2.3 `[4]`.
 pub(crate) fn is_name_start_char(c: char) -> bool {
     matches!(c,
         ':' | 'A'..='Z' | '_' | 'a'..='z' |
@@ -110,7 +110,7 @@ pub(crate) fn validate_qname(name: &str) -> Option<&'static str> {
 /// The well-known xmlns namespace URI.
 pub(crate) const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
-/// Returns `true` if `c` is a valid `PubidChar` per XML 1.0 §2.3 [13].
+/// Returns `true` if `c` is a valid `PubidChar` per XML 1.0 §2.3 `[13]`.
 ///
 /// `PubidChar ::= #x20 | #xD | #xA | [a-zA-Z0-9] | [-'()+,./:=?;!*#@$_%]`
 pub(crate) fn is_pubid_char(c: char) -> bool {
@@ -516,7 +516,7 @@ impl<'a> ParserInput<'a> {
 
     // -- Name parsing (XML 1.0 §2.3) --
 
-    /// Parses an XML `Name` per XML 1.0 §2.3 production [5].
+    /// Parses an XML `Name` per XML 1.0 §2.3 production `[5]`.
     ///
     /// A `Name` starts with a `NameStartChar` followed by zero or more
     /// `NameChar`s. Returns an error if the name is empty or starts with
@@ -1002,7 +1002,7 @@ impl NamespaceResolver {
 ///
 /// The opening `<!--` must not have been consumed yet.
 ///
-/// See XML 1.0 §2.5 production [15].
+/// See XML 1.0 §2.5 production `[15]`.
 pub(crate) fn parse_comment_content(input: &mut ParserInput<'_>) -> Result<String, ParseError> {
     input.expect_str(b"<!--")?;
     let mut content = String::new();
@@ -1040,7 +1040,7 @@ pub(crate) fn parse_comment_content(input: &mut ParserInput<'_>) -> Result<Strin
 ///
 /// The opening `<![CDATA[` must not have been consumed yet.
 ///
-/// See XML 1.0 §2.7 production [18].
+/// See XML 1.0 §2.7 production `[18]`.
 pub(crate) fn parse_cdata_content(input: &mut ParserInput<'_>) -> Result<String, ParseError> {
     input.expect_str(b"<![CDATA[")?;
     let mut content = String::new();
@@ -1065,7 +1065,7 @@ pub(crate) fn parse_cdata_content(input: &mut ParserInput<'_>) -> Result<String,
 ///
 /// The opening `<?` must not have been consumed yet.
 ///
-/// See XML 1.0 §2.6 production [16].
+/// See XML 1.0 §2.6 production `[16]`.
 pub(crate) fn parse_pi_content(
     input: &mut ParserInput<'_>,
 ) -> Result<(String, Option<String>), ParseError> {
@@ -1125,7 +1125,7 @@ pub(crate) struct XmlDeclaration {
 /// The opening `<?xml ` must not have been consumed yet (but should be
 /// verified by the caller via `looking_at`).
 ///
-/// See XML 1.0 §2.8 production [23].
+/// See XML 1.0 §2.8 production `[23]`.
 pub(crate) fn parse_xml_decl(input: &mut ParserInput<'_>) -> Result<XmlDeclaration, ParseError> {
     input.expect_str(b"<?xml")?;
     input.skip_whitespace_required()?;
