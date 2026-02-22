@@ -152,7 +152,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench
 ```
 
-Minimum supported Rust version: **1.80**
+Minimum supported Rust version: **1.81**
 
 ## License
 

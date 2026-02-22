@@ -1,5 +1,7 @@
 #!/bin/sh
-# Pre-commit hook: run cargo fmt and check for formatting issues
+# Pre-commit hook: run cargo fmt, clippy, and tests before committing
+
+set -e
 
 echo "Running cargo fmt..."
 cargo fmt --all -- --check
@@ -8,5 +10,24 @@ if [ $? -ne 0 ]; then
     echo "ERROR: Code is not formatted. Run 'cargo fmt --all' and try again."
     exit 1
 fi
-
 echo "Formatting check passed."
+
+echo ""
+echo "Running cargo clippy..."
+cargo clippy --all-targets --all-features -- -D warnings
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "ERROR: Clippy found warnings. Fix them and try again."
+    exit 1
+fi
+echo "Clippy check passed."
+
+echo ""
+echo "Running cargo test..."
+cargo test --all-features --quiet
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "ERROR: Tests failed. Fix them and try again."
+    exit 1
+fi
+echo "All tests passed."
