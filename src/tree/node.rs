@@ -61,7 +61,7 @@ pub enum NodeKind {
 
     /// A document type declaration node, e.g., `<!DOCTYPE html>`.
     ///
-    /// See XML 1.0 §2.8: [28] doctypedecl
+    /// See XML 1.0 §2.8: `[28]` doctypedecl
     DocumentType {
         /// The root element name declared in the DOCTYPE.
         name: String,

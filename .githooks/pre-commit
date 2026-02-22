@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-commit hook: run cargo fmt and check for formatting issues
+
+echo "Running cargo fmt..."
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "ERROR: Code is not formatted. Run 'cargo fmt --all' and try again."
+    exit 1
+fi
+
+echo "Formatting check passed."

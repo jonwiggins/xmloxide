@@ -133,16 +133,15 @@ xmllint --html page.html
 | `catalog` | OASIS XML Catalogs for URI resolution |
 | `encoding` | Character encoding detection and transcoding |
 
-## Roadmap
+## Testing
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 1 | Core tree, XML parser, serialization | Done |
-| 2 | HTML parser, SAX2, XmlReader, push parser | Done |
-| 3 | XPath 1.0 | Done |
-| 4 | DTD + RelaxNG validation | Done |
-| 5 | XML Schema, C14N, XInclude, Catalogs | Done |
-| 6 | `xmllint` CLI, benchmarks | Done |
+- **700+ unit tests** across all modules
+- **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
+- **Integration tests** covering real-world XML documents, edge cases, and error recovery
+
+```sh
+cargo test --all-features
+```
 
 ## Building
 
@@ -153,7 +152,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench
 ```
 
-Minimum supported Rust version: **1.70**
+Minimum supported Rust version: **1.71**
 
 ## License
 

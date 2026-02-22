@@ -1329,7 +1329,7 @@ impl<'a> DtdParser<'a> {
     }
 
     /// Validates that a public ID string contains only valid `PubidChar`s
-    /// per XML 1.0 §2.3 [13].
+    /// per XML 1.0 §2.3 `[13]`.
     fn validate_public_id(&self, pid: &str) -> Result<(), ParseError> {
         for c in pid.chars() {
             let valid = matches!(c,
