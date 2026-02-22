@@ -1,0 +1,980 @@
+//! Arena-based XML document tree.
+//!
+//! This module implements the core tree representation using arena allocation
+//! with typed indices. All nodes live in a contiguous `Vec<NodeData>` owned by
+//! the `Document`, and are referenced by `NodeId` — a newtype over `NonZeroU32`.
+//!
+//! This design provides O(1) node access, cache-friendly layout, no reference
+//! counting overhead, and safe bulk deallocation (drop the `Document` and
+//! everything is freed).
+//!
+//! # Architecture
+//!
+//! Unlike libxml2's web of raw C pointers, we use arena indices for all
+//! navigation links (parent, first\_child, last\_child, next\_sibling,
+//! prev\_sibling). This avoids borrow checker issues, reference cycles,
+//! and per-node heap allocation.
+
+mod node;
+
+pub use node::NodeKind;
+
+use crate::error::{ParseDiagnostic, ParseError};
+use std::num::NonZeroU32;
+
+/// A typed index into the document's node arena.
+///
+/// `NodeId` is a newtype over `NonZeroU32`, meaning it can never be zero
+/// and `Option<NodeId>` has the same size as `NodeId` (niche optimization).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct NodeId(NonZeroU32);
+
+impl NodeId {
+    /// Creates a `NodeId` from a raw index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is 0.
+    #[allow(clippy::expect_used, clippy::cast_possible_truncation)]
+    fn from_index(index: usize) -> Self {
+        Self(NonZeroU32::new(index as u32).expect("NodeId index must be non-zero"))
+    }
+
+    /// Returns the raw index as a `usize` for indexing into the arena.
+    fn as_index(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// Internal storage for a single node in the arena.
+#[derive(Debug, Clone)]
+pub struct NodeData {
+    /// What kind of node this is (element, text, comment, etc.) and its payload.
+    pub kind: NodeKind,
+    /// Parent node, if any. The document root node has no parent.
+    pub parent: Option<NodeId>,
+    /// First child node.
+    pub first_child: Option<NodeId>,
+    /// Last child node (for O(1) append).
+    pub last_child: Option<NodeId>,
+    /// Next sibling.
+    pub next_sibling: Option<NodeId>,
+    /// Previous sibling.
+    pub prev_sibling: Option<NodeId>,
+}
+
+impl NodeData {
+    fn new(kind: NodeKind) -> Self {
+        Self {
+            kind,
+            parent: None,
+            first_child: None,
+            last_child: None,
+            next_sibling: None,
+            prev_sibling: None,
+        }
+    }
+}
+
+/// An XML attribute on an element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    /// The attribute name (the local part, e.g., `"lang"` for `xml:lang`).
+    pub name: String,
+    /// The attribute value.
+    pub value: String,
+    /// Namespace prefix, if any (e.g., `"xml"` for `xml:lang`).
+    pub prefix: Option<String>,
+    /// Namespace URI after resolution, if any.
+    pub namespace: Option<String>,
+}
+
+/// An XML document.
+///
+/// The `Document` owns all nodes in an arena and provides methods for
+/// tree navigation and mutation. All tree operations go through
+/// `&Document` (navigation) or `&mut Document` (mutation).
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::Document;
+///
+/// let doc = Document::parse_str("<root/>").unwrap();
+/// let root = doc.root_element().unwrap();
+/// assert_eq!(doc.node_name(root), Some("root"));
+/// ```
+#[derive(Debug)]
+pub struct Document {
+    /// The node arena. Index 0 is unused (placeholder for `NonZeroU32`).
+    nodes: Vec<NodeData>,
+    /// The document root node id (the Document node, not the root element).
+    root: NodeId,
+    /// XML version from the XML declaration (e.g., "1.0").
+    pub version: Option<String>,
+    /// Encoding from the XML declaration (e.g., "UTF-8").
+    pub encoding: Option<String>,
+    /// Standalone flag from the XML declaration.
+    pub standalone: Option<bool>,
+    /// Diagnostics collected during parsing (warnings and recovered errors).
+    pub diagnostics: Vec<ParseDiagnostic>,
+}
+
+impl Document {
+    /// Creates a new empty document.
+    ///
+    /// The document contains a single root Document node.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut nodes = Vec::with_capacity(64);
+        // Index 0: placeholder (NodeId uses NonZeroU32)
+        nodes.push(NodeData::new(NodeKind::Document));
+        // Index 1: the document root node
+        nodes.push(NodeData::new(NodeKind::Document));
+        let root = NodeId::from_index(1);
+        Self {
+            nodes,
+            root,
+            version: None,
+            encoding: None,
+            standalone: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Parses an XML string into a `Document`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the input is not well-formed XML.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::Document;
+    ///
+    /// let doc = Document::parse_str("<root><child/></root>").unwrap();
+    /// ```
+    pub fn parse_str(input: &str) -> Result<Self, ParseError> {
+        // Strip leading UTF-8 BOM (U+FEFF) if present — per XML 1.0 §4.3.3,
+        // the BOM is used for encoding detection and should be ignored.
+        let had_bom = input.starts_with('\u{FEFF}');
+        let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+
+        // Check encoding declaration compatibility.
+        if let Some(enc) = Self::extract_encoding_from_decl(input) {
+            let enc_lower = enc.to_ascii_lowercase();
+            if had_bom && enc_lower != "utf-8" {
+                // UTF-8 BOM present but encoding is not UTF-8.
+                return Err(crate::error::ParseError {
+                    message: format!("UTF-8 BOM present but encoding declared as '{enc}'"),
+                    location: crate::error::SourceLocation::default(),
+                    diagnostics: Vec::new(),
+                });
+            }
+            // Reject clearly incompatible encodings (multi-byte or
+            // non-ASCII-compatible). UTF-8, US-ASCII, and single-byte
+            // ISO-8859 variants are compatible with UTF-8 text.
+            let incompatible = enc_lower.starts_with("utf-16")
+                || enc_lower.starts_with("utf-32")
+                || enc_lower.starts_with("ucs")
+                || enc_lower == "ebcdic";
+            if incompatible {
+                return Err(crate::error::ParseError {
+                    message: format!(
+                        "encoding declaration '{enc}' is incompatible with actual encoding"
+                    ),
+                    location: crate::error::SourceLocation::default(),
+                    diagnostics: Vec::new(),
+                });
+            }
+        }
+
+        crate::parser::parse_str(input)
+    }
+
+    /// Extracts the encoding value from an XML declaration, if present.
+    fn extract_encoding_from_decl(input: &str) -> Option<String> {
+        let trimmed = input.trim_start();
+        if !trimmed.starts_with("<?xml") {
+            return None;
+        }
+        // Find the end of the XML declaration
+        let decl_end = trimmed.find("?>")?;
+        let decl = &trimmed[..decl_end];
+
+        // Look for encoding="..." or encoding='...'
+        let enc_pos = decl.find("encoding")?;
+        let after_enc = &decl[enc_pos + 8..].trim_start();
+        let after_eq = after_enc.strip_prefix('=')?.trim_start();
+        let quote = after_eq.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value_start = 1;
+        let value_end = after_eq[value_start..].find(quote)?;
+        Some(after_eq[value_start..value_start + value_end].to_string())
+    }
+
+    /// Parses XML from raw bytes, detecting encoding automatically.
+    ///
+    /// Uses BOM sniffing and XML declaration inspection to determine the
+    /// encoding, then transcodes to UTF-8 before parsing. See
+    /// [`crate::encoding::decode_to_utf8`] for the full detection pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the encoding cannot be determined, the bytes
+    /// cannot be transcoded, or the resulting XML is not well-formed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::Document;
+    ///
+    /// let doc = Document::parse_bytes(b"<root/>").unwrap();
+    /// let root = doc.root_element().unwrap();
+    /// assert_eq!(doc.node_name(root), Some("root"));
+    /// ```
+    pub fn parse_bytes(input: &[u8]) -> Result<Self, ParseError> {
+        use crate::encoding::decode_to_utf8;
+        use crate::error::SourceLocation;
+
+        let utf8 = decode_to_utf8(input).map_err(|e| ParseError {
+            message: e.message,
+            location: SourceLocation::default(),
+            diagnostics: Vec::new(),
+        })?;
+
+        // Skip BOM and encoding checks — decode_to_utf8 already handled
+        // encoding detection and transcoding. Go directly to the parser.
+        let text = utf8.strip_prefix('\u{FEFF}').unwrap_or(&utf8);
+        crate::parser::parse_str(text)
+    }
+
+    /// Returns the document root node id.
+    #[must_use]
+    pub fn root(&self) -> NodeId {
+        self.root
+    }
+
+    /// Returns the root element of the document (the single top-level element).
+    ///
+    /// Returns `None` if the document has no element children.
+    #[must_use]
+    pub fn root_element(&self) -> Option<NodeId> {
+        self.children(self.root)
+            .find(|&id| matches!(self.node(id).kind, NodeKind::Element { .. }))
+    }
+
+    /// Returns a reference to the `NodeData` for the given node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not refer to a valid node.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> &NodeData {
+        &self.nodes[id.as_index()]
+    }
+
+    /// Returns a mutable reference to the `NodeData` for the given node.
+    fn node_mut(&mut self, id: NodeId) -> &mut NodeData {
+        &mut self.nodes[id.as_index()]
+    }
+
+    /// Returns the name of a node, if applicable.
+    ///
+    /// Elements and PIs have names; text, comments, CDATA, and document nodes
+    /// return `None`.
+    #[must_use]
+    pub fn node_name(&self, id: NodeId) -> Option<&str> {
+        match &self.node(id).kind {
+            NodeKind::Element { name, .. }
+            | NodeKind::ProcessingInstruction { target: name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Returns the namespace URI of an element node, if any.
+    ///
+    /// Non-element nodes always return `None`. Elements that have no namespace
+    /// declaration in scope also return `None`.
+    #[must_use]
+    pub fn node_namespace(&self, id: NodeId) -> Option<&str> {
+        match &self.node(id).kind {
+            NodeKind::Element { namespace, .. } => namespace.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the text content of a text, comment, or CDATA node.
+    ///
+    /// For element nodes, returns `None` — use `text_content()` to get the
+    /// concatenated text of all descendant text nodes.
+    #[must_use]
+    pub fn node_text(&self, id: NodeId) -> Option<&str> {
+        match &self.node(id).kind {
+            NodeKind::Text { content }
+            | NodeKind::Comment { content }
+            | NodeKind::CData { content } => Some(content),
+            NodeKind::ProcessingInstruction { data, .. } => data.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the concatenated text content of a node and all its descendants.
+    #[must_use]
+    pub fn text_content(&self, id: NodeId) -> String {
+        let mut result = String::new();
+        self.collect_text(id, &mut result);
+        result
+    }
+
+    fn collect_text(&self, id: NodeId, buf: &mut String) {
+        match &self.node(id).kind {
+            NodeKind::Text { content } | NodeKind::CData { content } => {
+                buf.push_str(content);
+            }
+            _ => {
+                for child in self.children(id) {
+                    self.collect_text(child, buf);
+                }
+            }
+        }
+    }
+
+    /// Returns the attributes of an element node.
+    ///
+    /// Returns an empty slice for non-element nodes.
+    #[must_use]
+    pub fn attributes(&self, id: NodeId) -> &[Attribute] {
+        match &self.node(id).kind {
+            NodeKind::Element { attributes, .. } => attributes,
+            _ => &[],
+        }
+    }
+
+    /// Returns the value of an attribute by name on an element node.
+    #[must_use]
+    pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
+        self.attributes(id)
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.value.as_str())
+    }
+
+    // --- Navigation ---
+
+    /// Returns the parent of a node.
+    #[must_use]
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).parent
+    }
+
+    /// Returns the first child of a node.
+    #[must_use]
+    pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).first_child
+    }
+
+    /// Returns the last child of a node.
+    #[must_use]
+    pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).last_child
+    }
+
+    /// Returns the next sibling of a node.
+    #[must_use]
+    pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).next_sibling
+    }
+
+    /// Returns the previous sibling of a node.
+    #[must_use]
+    pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.node(id).prev_sibling
+    }
+
+    /// Returns an iterator over the children of a node.
+    pub fn children(&self, id: NodeId) -> Children<'_> {
+        Children {
+            doc: self,
+            next: self.node(id).first_child,
+        }
+    }
+
+    /// Returns an iterator over a node and its ancestors (walking up to root).
+    pub fn ancestors(&self, id: NodeId) -> Ancestors<'_> {
+        Ancestors {
+            doc: self,
+            next: Some(id),
+        }
+    }
+
+    /// Returns an iterator over all descendants of a node (depth-first).
+    pub fn descendants(&self, id: NodeId) -> Descendants<'_> {
+        Descendants {
+            doc: self,
+            root: id,
+            next: self.first_child(id),
+        }
+    }
+
+    // --- Mutation ---
+
+    /// Allocates a new node in the arena and returns its `NodeId`.
+    pub fn create_node(&mut self, kind: NodeKind) -> NodeId {
+        let index = self.nodes.len();
+        self.nodes.push(NodeData::new(kind));
+        NodeId::from_index(index)
+    }
+
+    /// Appends a child node to the end of a parent's child list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `child` already has a parent. Detach it first.
+    pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        debug_assert!(
+            self.node(child).parent.is_none(),
+            "child already has a parent; detach it first"
+        );
+
+        self.node_mut(child).parent = Some(parent);
+
+        if let Some(last) = self.node(parent).last_child {
+            self.node_mut(last).next_sibling = Some(child);
+            self.node_mut(child).prev_sibling = Some(last);
+            self.node_mut(parent).last_child = Some(child);
+        } else {
+            self.node_mut(parent).first_child = Some(child);
+            self.node_mut(parent).last_child = Some(child);
+        }
+    }
+
+    /// Inserts `new_child` before `reference` in the parent's child list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reference` has no parent or if `new_child` already has a parent.
+    #[allow(clippy::expect_used)]
+    pub fn insert_before(&mut self, reference: NodeId, new_child: NodeId) {
+        debug_assert!(
+            self.node(new_child).parent.is_none(),
+            "new_child already has a parent; detach it first"
+        );
+
+        let parent = self
+            .node(reference)
+            .parent
+            .expect("reference has no parent");
+        self.node_mut(new_child).parent = Some(parent);
+
+        if let Some(prev) = self.node(reference).prev_sibling {
+            self.node_mut(prev).next_sibling = Some(new_child);
+            self.node_mut(new_child).prev_sibling = Some(prev);
+        } else {
+            self.node_mut(parent).first_child = Some(new_child);
+        }
+
+        self.node_mut(new_child).next_sibling = Some(reference);
+        self.node_mut(reference).prev_sibling = Some(new_child);
+    }
+
+    /// Detaches a node from its parent (but does not free it from the arena).
+    pub fn detach(&mut self, id: NodeId) {
+        let Some(parent) = self.node(id).parent else {
+            return;
+        };
+
+        let prev = self.node(id).prev_sibling;
+        let next = self.node(id).next_sibling;
+
+        match prev {
+            Some(p) => self.node_mut(p).next_sibling = next,
+            None => self.node_mut(parent).first_child = next,
+        }
+
+        match next {
+            Some(n) => self.node_mut(n).prev_sibling = prev,
+            None => self.node_mut(parent).last_child = prev,
+        }
+
+        self.node_mut(id).parent = None;
+        self.node_mut(id).prev_sibling = None;
+        self.node_mut(id).next_sibling = None;
+    }
+
+    /// Returns the total number of nodes in the arena (including placeholder).
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len() - 1 // subtract placeholder at index 0
+    }
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// --- Iterators ---
+
+/// Iterator over the children of a node.
+pub struct Children<'a> {
+    doc: &'a Document,
+    next: Option<NodeId>,
+}
+
+impl Iterator for Children<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        self.next = self.doc.node(current).next_sibling;
+        Some(current)
+    }
+}
+
+/// Iterator over a node and its ancestors.
+pub struct Ancestors<'a> {
+    doc: &'a Document,
+    next: Option<NodeId>,
+}
+
+impl Iterator for Ancestors<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        self.next = self.doc.node(current).parent;
+        Some(current)
+    }
+}
+
+/// Depth-first iterator over all descendants of a node.
+pub struct Descendants<'a> {
+    doc: &'a Document,
+    root: NodeId,
+    next: Option<NodeId>,
+}
+
+impl Iterator for Descendants<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+
+        // Try to go deeper first
+        if let Some(child) = self.doc.first_child(current) {
+            self.next = Some(child);
+            return Some(current);
+        }
+
+        // Try next sibling
+        if let Some(sibling) = self.doc.next_sibling(current) {
+            self.next = Some(sibling);
+            return Some(current);
+        }
+
+        // Walk up to find an ancestor with a next sibling
+        let mut ancestor = self.doc.parent(current);
+        while let Some(anc) = ancestor {
+            if anc == self.root {
+                self.next = None;
+                return Some(current);
+            }
+            if let Some(sibling) = self.doc.next_sibling(anc) {
+                self.next = Some(sibling);
+                return Some(current);
+            }
+            ancestor = self.doc.parent(anc);
+        }
+
+        self.next = None;
+        Some(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_document_has_root() {
+        let doc = Document::new();
+        assert!(matches!(doc.node(doc.root()).kind, NodeKind::Document));
+        assert_eq!(doc.node_count(), 1); // just the root
+    }
+
+    #[test]
+    fn test_create_and_append_element() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.create_node(NodeKind::Element {
+            name: "div".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, elem);
+
+        assert_eq!(doc.first_child(root), Some(elem));
+        assert_eq!(doc.last_child(root), Some(elem));
+        assert_eq!(doc.parent(elem), Some(root));
+        assert_eq!(doc.node_name(elem), Some("div"));
+    }
+
+    #[test]
+    fn test_append_multiple_children() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        assert_eq!(doc.first_child(root), Some(a));
+        assert_eq!(doc.last_child(root), Some(c));
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.next_sibling(b), Some(c));
+        assert_eq!(doc.next_sibling(c), None);
+        assert_eq!(doc.prev_sibling(c), Some(b));
+        assert_eq!(doc.prev_sibling(b), Some(a));
+        assert_eq!(doc.prev_sibling(a), None);
+    }
+
+    #[test]
+    fn test_children_iterator() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, b, c]);
+    }
+
+    #[test]
+    fn test_children_iterator_empty() {
+        let doc = Document::new();
+        let children: Vec<NodeId> = doc.children(doc.root()).collect();
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn test_insert_before() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+        doc.append_child(root, a);
+        doc.append_child(root, c);
+
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        doc.insert_before(c, b);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, b, c]);
+        assert_eq!(doc.parent(b), Some(root));
+    }
+
+    #[test]
+    fn test_insert_before_first_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        doc.append_child(root, b);
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        doc.insert_before(b, a);
+
+        assert_eq!(doc.first_child(root), Some(a));
+        assert_eq!(doc.next_sibling(a), Some(b));
+    }
+
+    #[test]
+    fn test_detach() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        doc.detach(b);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, c]);
+        assert_eq!(doc.parent(b), None);
+        assert_eq!(doc.next_sibling(a), Some(c));
+        assert_eq!(doc.prev_sibling(c), Some(a));
+    }
+
+    #[test]
+    fn test_detach_first_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+
+        doc.detach(a);
+        assert_eq!(doc.first_child(root), Some(b));
+        assert_eq!(doc.prev_sibling(b), None);
+    }
+
+    #[test]
+    fn test_detach_last_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+
+        doc.detach(b);
+        assert_eq!(doc.last_child(root), Some(a));
+        assert_eq!(doc.next_sibling(a), None);
+    }
+
+    #[test]
+    fn test_detach_only_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        doc.append_child(root, a);
+        doc.detach(a);
+
+        assert_eq!(doc.first_child(root), None);
+        assert_eq!(doc.last_child(root), None);
+    }
+
+    #[test]
+    fn test_ancestors_iterator() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let parent = doc.create_node(NodeKind::Element {
+            name: "parent".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        let child = doc.create_node(NodeKind::Element {
+            name: "child".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+
+        doc.append_child(root, parent);
+        doc.append_child(parent, child);
+
+        let ancestors: Vec<NodeId> = doc.ancestors(child).collect();
+        assert_eq!(ancestors, vec![child, parent, root]);
+    }
+
+    #[test]
+    fn test_descendants_iterator() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let p = doc.create_node(NodeKind::Element {
+            name: "p".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        let a = doc.create_node(NodeKind::Text {
+            content: "hello ".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Element {
+            name: "b".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        let b_text = doc.create_node(NodeKind::Text {
+            content: "world".to_string(),
+        });
+
+        doc.append_child(root, p);
+        doc.append_child(p, a);
+        doc.append_child(p, b);
+        doc.append_child(b, b_text);
+
+        let desc: Vec<NodeId> = doc.descendants(root).collect();
+        assert_eq!(desc, vec![p, a, b, b_text]);
+    }
+
+    #[test]
+    fn test_text_content() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let p = doc.create_node(NodeKind::Element {
+            name: "p".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        let text1 = doc.create_node(NodeKind::Text {
+            content: "hello ".to_string(),
+        });
+        let bold = doc.create_node(NodeKind::Element {
+            name: "b".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        let text2 = doc.create_node(NodeKind::Text {
+            content: "world".to_string(),
+        });
+
+        doc.append_child(root, p);
+        doc.append_child(p, text1);
+        doc.append_child(p, bold);
+        doc.append_child(bold, text2);
+
+        assert_eq!(doc.text_content(p), "hello world");
+    }
+
+    #[test]
+    fn test_attributes() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let elem = doc.create_node(NodeKind::Element {
+            name: "div".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![
+                Attribute {
+                    name: "id".to_string(),
+                    value: "main".to_string(),
+                    prefix: None,
+                    namespace: None,
+                },
+                Attribute {
+                    name: "class".to_string(),
+                    value: "container".to_string(),
+                    prefix: None,
+                    namespace: None,
+                },
+            ],
+        });
+        doc.append_child(root, elem);
+
+        assert_eq!(doc.attribute(elem, "id"), Some("main"));
+        assert_eq!(doc.attribute(elem, "class"), Some("container"));
+        assert_eq!(doc.attribute(elem, "style"), None);
+        assert_eq!(doc.attributes(elem).len(), 2);
+    }
+
+    #[test]
+    fn test_root_element() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        // No element children yet
+        assert_eq!(doc.root_element(), None);
+
+        let elem = doc.create_node(NodeKind::Element {
+            name: "root".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, elem);
+
+        assert_eq!(doc.root_element(), Some(elem));
+    }
+
+    #[test]
+    fn test_node_text() {
+        let mut doc = Document::new();
+
+        let text = doc.create_node(NodeKind::Text {
+            content: "hello".to_string(),
+        });
+        assert_eq!(doc.node_text(text), Some("hello"));
+
+        let comment = doc.create_node(NodeKind::Comment {
+            content: "a comment".to_string(),
+        });
+        assert_eq!(doc.node_text(comment), Some("a comment"));
+
+        let cdata = doc.create_node(NodeKind::CData {
+            content: "cdata content".to_string(),
+        });
+        assert_eq!(doc.node_text(cdata), Some("cdata content"));
+
+        let elem = doc.create_node(NodeKind::Element {
+            name: "div".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        assert_eq!(doc.node_text(elem), None);
+    }
+}

@@ -1,0 +1,28 @@
+#!/bin/sh
+# Pre-commit hook for xmloxide.
+# Runs formatting check, clippy, and tests before allowing commits.
+
+set -e
+
+echo "Running cargo fmt --check..."
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo "ERROR: cargo fmt check failed. Run 'cargo fmt --all' to fix."
+    exit 1
+fi
+
+echo "Running cargo clippy..."
+cargo clippy --all-targets --all-features -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "ERROR: clippy found warnings. Fix them before committing."
+    exit 1
+fi
+
+echo "Running cargo test..."
+cargo test --all-features --quiet
+if [ $? -ne 0 ]; then
+    echo "ERROR: tests failed. Fix them before committing."
+    exit 1
+fi
+
+echo "All pre-commit checks passed."
