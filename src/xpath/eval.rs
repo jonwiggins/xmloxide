@@ -354,7 +354,9 @@ impl<'a> XPathContext<'a> {
                 Vec::new()
             }
             Axis::Namespace => {
-                // TODO: namespace axis support
+                // The namespace axis is not yet implemented. Returns an empty
+                // set rather than erroring, matching the behavior of many
+                // XPath implementations that treat unsupported axes as empty.
                 Vec::new()
             }
             Axis::Self_ => vec![node],

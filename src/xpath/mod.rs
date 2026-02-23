@@ -16,6 +16,10 @@
 //! assert_eq!(result.to_number(), 2.0);
 //! ```
 //!
+//! # Known Limitations
+//!
+//! - The `namespace::` axis is not yet implemented and returns empty results.
+//!
 //! # Submodules
 //!
 //! - [`ast`]: Abstract syntax tree types for parsed `XPath` expressions.

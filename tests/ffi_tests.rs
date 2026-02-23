@@ -2,6 +2,7 @@
 //!
 //! These tests call the `extern "C"` functions directly from Rust to verify
 //! correctness before exposing them to actual C consumers.
+#![cfg(feature = "ffi")]
 #![allow(unsafe_code, clippy::unwrap_used)]
 
 use std::ffi::{CStr, CString};

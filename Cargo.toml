@@ -22,6 +22,7 @@ include = [
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
+ffi = []
 bench-libxml2 = ["dep:libxml"]
 
 [dependencies]

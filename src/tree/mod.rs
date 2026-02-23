@@ -64,7 +64,11 @@ impl NodeId {
     }
 }
 
-/// Internal storage for a single node in the arena.
+/// Storage for a single node in the document arena.
+///
+/// Each node stores its kind (element, text, comment, etc.) and links to
+/// parent, children, and siblings for tree navigation. Access individual
+/// nodes via [`Document::node`].
 #[derive(Debug, Clone)]
 pub struct NodeData {
     /// What kind of node this is (element, text, comment, etc.) and its payload.

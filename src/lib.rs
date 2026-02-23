@@ -17,6 +17,7 @@
 pub mod catalog;
 pub mod encoding;
 pub mod error;
+#[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod html;
 pub mod parser;
