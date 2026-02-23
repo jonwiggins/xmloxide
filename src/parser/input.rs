@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 
 use crate::error::{ErrorSeverity, ParseDiagnostic, ParseError, SourceLocation};
+use crate::parser::{EntityResolver, ExternalEntityRequest};
 
 // -------------------------------------------------------------------------
 // Security defaults
@@ -81,6 +82,75 @@ pub(crate) fn is_name_char(c: char) -> bool {
         )
 }
 
+/// Returns `true` if `b` is a valid ASCII `NameStartChar`.
+///
+/// Covers the ASCII subset of XML 1.0 §2.3 `[4]`: `[A-Za-z_:]`.
+fn is_ascii_name_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b':'
+}
+
+/// Returns `true` if `b` is a valid ASCII `NameChar`.
+///
+/// Covers the ASCII subset of XML 1.0 §2.3 `[4a]`: `[A-Za-z0-9_:.-]`.
+fn is_ascii_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'-' || b == b'.'
+}
+
+/// Matches one of the five XML builtin entity references at the byte level.
+///
+/// Given bytes starting after `&`, returns `(replacement_char, bytes_to_skip)`
+/// if the bytes match a builtin entity (`amp;`, `lt;`, `gt;`, `apos;`, `quot;`).
+/// The `bytes_to_skip` includes the semicolon.
+fn match_builtin_entity(bytes: &[u8]) -> Option<(&'static str, usize)> {
+    // Use first byte to narrow the match
+    match bytes.first() {
+        Some(b'a') => {
+            if bytes.starts_with(b"amp;") {
+                return Some(("&", 4));
+            }
+            if bytes.starts_with(b"apos;") {
+                return Some(("'", 5));
+            }
+            None
+        }
+        Some(b'l') => {
+            if bytes.starts_with(b"lt;") {
+                return Some(("<", 3));
+            }
+            None
+        }
+        Some(b'g') => {
+            if bytes.starts_with(b"gt;") {
+                return Some((">", 3));
+            }
+            None
+        }
+        Some(b'q') => {
+            if bytes.starts_with(b"quot;") {
+                return Some(("\"", 5));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Checks whether a chunk of text contains any characters that are not valid
+/// XML `Char`s per XML 1.0 §2.2. Returns the first invalid character found
+/// (if any), or `None` if the chunk is clean.
+fn find_invalid_xml_char(s: &str) -> Option<char> {
+    s.chars().find(|&ch| !is_xml_char(ch))
+}
+
+/// Returns `true` if a byte slice might contain invalid XML characters.
+/// This is a fast pre-check: if all bytes are >= 0x20 (and no DEL 0x7F),
+/// the content is guaranteed valid for the ASCII range.
+fn may_contain_invalid_xml_chars(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F)
+}
+
 /// Splits a qualified name into optional prefix and local part.
 ///
 /// `"foo:bar"` → `(Some("foo"), "bar")`
@@ -92,10 +162,31 @@ pub(crate) fn split_name(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Splits an owned `QName` into `(Option<prefix>, local_name)`, reusing the
+/// original `String` buffer for the prefix portion when possible.
+///
+/// `"foo:bar".to_string()` → `(Some("foo"), "bar")` — prefix reuses the
+/// original allocation (truncated), local is a new `String`.
+///
+/// `"bar".to_string()` → `(None, "bar")` — no allocation, returns the
+/// original `String` as the local name.
+pub(crate) fn split_owned_name(name: String) -> (Option<String>, String) {
+    match name.find(':') {
+        Some(pos) => {
+            let local = name[pos + 1..].to_string();
+            let mut prefix = name;
+            prefix.truncate(pos);
+            (Some(prefix), local)
+        }
+        None => (None, name),
+    }
+}
+
 /// Validates that a name is a legal `QName` per Namespaces in XML 1.0 §4.
 ///
 /// A `QName` has at most one colon, and neither prefix nor local part may be
 /// empty. Returns an error message if invalid, or `None` if valid.
+#[allow(dead_code)]
 pub(crate) fn validate_qname(name: &str) -> Option<&'static str> {
     let colon_count = name.chars().filter(|&c| c == ':').count();
     if colon_count > 1 {
@@ -160,6 +251,15 @@ pub(crate) struct SavedPosition {
 // ParserInput
 // -------------------------------------------------------------------------
 
+/// Information about an externally-declared entity (SYSTEM/PUBLIC).
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalEntityInfo {
+    /// The SYSTEM identifier (URI) from the entity declaration.
+    pub system_id: String,
+    /// The PUBLIC identifier, if any.
+    pub public_id: Option<String>,
+}
+
 /// Shared low-level input state for all parsers.
 ///
 /// Tracks the byte stream, position (line/column/offset), nesting depth,
@@ -189,7 +289,7 @@ pub(crate) struct ParserInput<'a> {
     max_name_length: usize,
 
     /// Number of entity references expanded so far.
-    entity_expansions: u32,
+    pub(crate) entity_expansions: u32,
 
     /// Maximum allowed entity expansions.
     max_entity_expansions: u32,
@@ -204,10 +304,10 @@ pub(crate) struct ParserInput<'a> {
     /// Populated after parsing `<!DOCTYPE root [ ... ]>`.
     pub(crate) entity_map: HashMap<String, String>,
 
-    /// Set of entity names that are external (SYSTEM/PUBLIC without being
-    /// internal). Used to enforce WFC: No External Entity References in
-    /// attribute values.
-    pub(crate) entity_external: std::collections::HashSet<String>,
+    /// External entity declarations keyed by entity name, storing the
+    /// SYSTEM and PUBLIC identifiers. Used for the entity resolver and
+    /// to enforce WFC: No External Entity References in attribute values.
+    pub(crate) entity_external: HashMap<String, ExternalEntityInfo>,
 
     /// Whether the DTD internal subset contained parameter entity references.
     /// Per XML 1.0 §4.1 WFC: Entity Declared, undeclared entity references
@@ -215,9 +315,18 @@ pub(crate) struct ParserInput<'a> {
     /// references in the internal subset.
     pub(crate) has_pe_references: bool,
 
+    /// Whether the document has an external DTD subset (SYSTEM or PUBLIC).
+    /// Per XML 1.0 §4.1 WFC: Entity Declared, undeclared entity references
+    /// are not well-formedness errors when the document references an
+    /// external DTD subset that was not read.
+    pub(crate) has_external_dtd: bool,
+
     /// Entities whose content production has already been validated.
     /// Prevents redundant re-validation on repeated references.
     validated_entities: std::collections::HashSet<String>,
+
+    /// Optional callback for resolving external entities.
+    entity_resolver: Option<EntityResolver>,
 }
 
 impl<'a> ParserInput<'a> {
@@ -236,10 +345,17 @@ impl<'a> ParserInput<'a> {
             recover: false,
             diagnostics: Vec::new(),
             entity_map: HashMap::new(),
-            entity_external: std::collections::HashSet::new(),
+            entity_external: HashMap::new(),
             has_pe_references: false,
+            has_external_dtd: false,
             validated_entities: std::collections::HashSet::new(),
+            entity_resolver: None,
         }
+    }
+
+    /// Sets the external entity resolver.
+    pub fn set_entity_resolver(&mut self, resolver: Option<EntityResolver>) {
+        self.entity_resolver = resolver;
     }
 
     /// Sets the maximum nesting depth.
@@ -304,24 +420,28 @@ impl<'a> ParserInput<'a> {
     }
 
     /// Returns `true` if all input has been consumed.
+    #[inline]
     pub fn at_end(&self) -> bool {
         self.pos >= self.input.len()
     }
 
     /// Returns the current byte offset.
     #[allow(dead_code)]
+    #[inline]
     pub fn pos(&self) -> usize {
         self.pos
     }
 
     /// Returns a slice of the raw input bytes from `start` to `end`.
     #[allow(dead_code)]
+    #[inline]
     pub fn slice(&self, start: usize, end: usize) -> &[u8] {
         &self.input[start..end]
     }
 
     /// Returns the remaining input bytes from the current position.
     #[allow(dead_code)]
+    #[inline]
     pub fn remaining(&self) -> &[u8] {
         &self.input[self.pos..]
     }
@@ -350,6 +470,7 @@ impl<'a> ParserInput<'a> {
     // -- Peek operations --
 
     /// Returns the byte at the current position without consuming it.
+    #[inline]
     pub fn peek(&self) -> Option<u8> {
         self.input.get(self.pos).copied()
     }
@@ -360,12 +481,31 @@ impl<'a> ParserInput<'a> {
     }
 
     /// Returns the character at the current position without consuming it.
+    ///
+    /// Uses an ASCII fast path (single byte check) for the common case,
+    /// and decodes only the minimal 1–4 bytes needed for multi-byte UTF-8.
+    #[inline]
     pub fn peek_char(&self) -> Option<char> {
-        if self.at_end() {
+        if self.pos >= self.input.len() {
             return None;
         }
+        let first = self.input[self.pos];
+        // Fast path: ASCII (covers 95%+ of XML content)
+        if first < 0x80 {
+            return Some(first as char);
+        }
+        // Slow path: multi-byte UTF-8 — decode only the needed bytes
+        let len = match first {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return None, // invalid UTF-8 lead byte
+        };
         let remaining = &self.input[self.pos..];
-        std::str::from_utf8(remaining)
+        if remaining.len() < len {
+            return None;
+        }
+        std::str::from_utf8(&remaining[..len])
             .ok()
             .and_then(|s| s.chars().next())
     }
@@ -373,8 +513,10 @@ impl<'a> ParserInput<'a> {
     // -- Advance operations --
 
     /// Advances the position by `count` bytes, updating line/column.
+    #[inline]
     pub fn advance(&mut self, count: usize) {
-        for _ in 0..count {
+        // Fast path for count == 1 (the most common case from expect_byte, etc.)
+        if count == 1 {
             if self.pos < self.input.len() {
                 if self.input[self.pos] == b'\n' {
                     self.line += 1;
@@ -384,10 +526,13 @@ impl<'a> ParserInput<'a> {
                 }
                 self.pos += 1;
             }
+            return;
         }
+        self.advance_counting_lines(count.min(self.input.len() - self.pos));
     }
 
     /// Advances by one UTF-8 character, updating line/column.
+    #[inline]
     pub fn advance_char(&mut self, ch: char) {
         let len = ch.len_utf8();
         if ch == '\n' {
@@ -400,6 +545,7 @@ impl<'a> ParserInput<'a> {
     }
 
     /// Consumes and returns the next byte, or returns an error at EOF.
+    #[inline]
     pub fn next_byte(&mut self) -> Result<u8, ParseError> {
         if self.at_end() {
             return Err(self.fatal("unexpected end of input"));
@@ -411,18 +557,50 @@ impl<'a> ParserInput<'a> {
 
     /// Consumes and returns the next character with `\r\n` normalization
     /// (XML 1.0 §2.11) and character validation (XML 1.0 §2.2).
+    #[inline]
     pub fn next_char(&mut self) -> Result<char, ParseError> {
+        if self.pos >= self.input.len() {
+            return Err(self.fatal("unexpected end of input"));
+        }
+        let first = self.input[self.pos];
+        // Fast path: ASCII (covers 95%+ of XML content)
+        if first < 0x80 {
+            self.pos += 1;
+            if first == b'\n' {
+                self.line += 1;
+                self.column = 1;
+            } else if first == b'\r' {
+                // \r\n → \n normalization (XML 1.0 §2.11)
+                self.line += 1;
+                self.column = 1;
+                if self.pos < self.input.len() && self.input[self.pos] == b'\n' {
+                    self.pos += 1;
+                }
+                return Ok('\n');
+            } else {
+                self.column += 1;
+                // Validate ASCII control chars (XML 1.0 §2.2: only #x9, #xA, #xD, #x20+ allowed)
+                if first < 0x20 && first != b'\t' {
+                    let ch = first as char;
+                    if self.recover {
+                        self.push_diagnostic(
+                            ErrorSeverity::Error,
+                            format!("invalid XML character: U+{:04X}", ch as u32),
+                        );
+                    } else {
+                        return Err(
+                            self.fatal(format!("invalid XML character: U+{:04X}", ch as u32))
+                        );
+                    }
+                }
+            }
+            return Ok(first as char);
+        }
+        // Slow path: multi-byte UTF-8
         let ch = self
             .peek_char()
             .ok_or_else(|| self.fatal("unexpected end of input"))?;
         self.advance_char(ch);
-        // Handle \r\n → \n normalization (XML 1.0 §2.11)
-        if ch == '\r' {
-            if self.peek() == Some(b'\n') {
-                self.advance(1);
-            }
-            return Ok('\n');
-        }
         // Validate against XML 1.0 §2.2 Char production
         if !is_xml_char(ch) {
             if self.recover {
@@ -437,9 +615,138 @@ impl<'a> ParserInput<'a> {
         Ok(ch)
     }
 
+    // -- Bulk scanning --
+
+    /// Scans forward from the current position to find the next character data
+    /// boundary (`<`, `&`, or `]]>`). Returns the number of safe bytes that
+    /// can be consumed as plain text content.
+    #[inline]
+    pub fn scan_char_data(&self) -> usize {
+        let bytes = &self.input[self.pos..];
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'<' | b'&' => return i,
+                b']' if i + 2 < bytes.len() && bytes[i + 1] == b']' && bytes[i + 2] == b'>' => {
+                    return i;
+                }
+                _ => i += 1,
+            }
+        }
+        bytes.len()
+    }
+
+    /// Scans forward to find the next attribute value delimiter: the given
+    /// `quote` byte, `&`, `<`, or any invalid XML control character.
+    /// Returns the number of safe bytes before the delimiter.
+    /// Avoids the 256-byte lookup table of `scan_until_any`.
+    #[inline]
+    pub fn scan_attr_value(&self, quote: u8) -> usize {
+        let bytes = &self.input[self.pos..];
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == quote || b == b'&' || b == b'<' {
+                return i;
+            }
+            // Stop at invalid XML control characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F)
+            // so they fall through to next_char() which validates and reports errors.
+            if b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r' {
+                return i;
+            }
+            i += 1;
+        }
+        bytes.len()
+    }
+
+    /// Scans forward to find the next occurrence of any of the given marker
+    /// bytes. Returns the number of bytes before the marker.
+    ///
+    /// Uses a 256-byte lookup table for O(1) per-byte matching instead of
+    /// linear `contains()` on the marker slice.
+    #[allow(dead_code)]
+    pub fn scan_until_any(&self, markers: &[u8]) -> usize {
+        let mut marker_set = [false; 256];
+        for &m in markers {
+            marker_set[m as usize] = true;
+        }
+        let bytes = &self.input[self.pos..];
+        for (i, &b) in bytes.iter().enumerate() {
+            if marker_set[b as usize] {
+                return i;
+            }
+        }
+        bytes.len()
+    }
+
+    /// Scans forward to find a 2-byte terminator sequence (e.g., `?>`, `--`).
+    /// Returns the number of bytes before the first byte of the terminator,
+    /// or `None` if not found.
+    pub fn scan_for_2byte_terminator(&self, t0: u8, t1: u8) -> Option<usize> {
+        let bytes = &self.input[self.pos..];
+        if bytes.len() < 2 {
+            return None;
+        }
+        let mut i = 0;
+        let end = bytes.len() - 1;
+        while i < end {
+            if bytes[i] == t0 && bytes[i + 1] == t1 {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Scans forward to find a 3-byte terminator sequence (e.g., `-->`, `]]>`).
+    /// Returns the number of bytes before the first byte of the terminator,
+    /// or `None` if not found.
+    pub fn scan_for_3byte_terminator(&self, t0: u8, t1: u8, t2: u8) -> Option<usize> {
+        let bytes = &self.input[self.pos..];
+        if bytes.len() < 3 {
+            return None;
+        }
+        let mut i = 0;
+        let end = bytes.len() - 2;
+        while i < end {
+            if bytes[i] == t0 && bytes[i + 1] == t1 && bytes[i + 2] == t2 {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Advances the position by `count` bytes, tracking line/column numbers
+    /// in a single pass. More efficient than calling `advance(1)` in a loop
+    /// for bulk text consumption.
+    #[inline]
+    pub fn advance_counting_lines(&mut self, count: usize) {
+        let end = self.pos + count;
+        let slice = &self.input[self.pos..end];
+        // Fast path: if no newlines in the slice, just bump column
+        if slice.contains(&b'\n') {
+            for &b in slice {
+                if b == b'\n' {
+                    self.line += 1;
+                    self.column = 1;
+                } else {
+                    self.column += 1;
+                }
+            }
+        } else {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                self.column += count as u32;
+            }
+        }
+        self.pos = end;
+    }
+
     // -- Expect operations --
 
     /// Consumes the next byte and asserts it matches `expected`.
+    #[inline]
     pub fn expect_byte(&mut self, expected: u8) -> Result<(), ParseError> {
         let b = self.next_byte()?;
         if b != expected {
@@ -452,9 +759,18 @@ impl<'a> ParserInput<'a> {
     }
 
     /// Consumes bytes and asserts they match the `expected` sequence.
+    #[inline]
     pub fn expect_str(&mut self, expected: &[u8]) -> Result<(), ParseError> {
-        for &b in expected {
-            self.expect_byte(b)?;
+        if self.pos + expected.len() > self.input.len() {
+            return Err(self.fatal("unexpected end of input"));
+        }
+        if &self.input[self.pos..self.pos + expected.len()] == expected {
+            self.advance_counting_lines(expected.len());
+        } else {
+            // Fall back to per-byte for precise error reporting
+            for &b in expected {
+                self.expect_byte(b)?;
+            }
         }
         Ok(())
     }
@@ -462,6 +778,7 @@ impl<'a> ParserInput<'a> {
     // -- Lookahead --
 
     /// Returns `true` if the remaining input starts with `s`.
+    #[inline]
     pub fn looking_at(&self, s: &[u8]) -> bool {
         self.input[self.pos..].starts_with(s)
     }
@@ -479,16 +796,47 @@ impl<'a> ParserInput<'a> {
     // -- Whitespace --
 
     /// Skips whitespace characters. Returns `true` if any were consumed.
+    #[inline]
     pub fn skip_whitespace(&mut self) -> bool {
         let start = self.pos;
-        while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
-                self.advance(1);
-            } else {
-                break;
+        while self.pos < self.input.len() {
+            match self.input[self.pos] {
+                b'\n' => {
+                    self.line += 1;
+                    self.column = 1;
+                    self.pos += 1;
+                }
+                b' ' | b'\t' | b'\r' => {
+                    self.column += 1;
+                    self.pos += 1;
+                }
+                _ => break,
             }
         }
         self.pos > start
+    }
+
+    /// Consumes and returns any whitespace characters at the current position.
+    ///
+    /// Returns the consumed whitespace as a `&str` (empty if no whitespace).
+    pub fn consume_whitespace(&mut self) -> &str {
+        let start = self.pos;
+        while self.pos < self.input.len() {
+            match self.input[self.pos] {
+                b'\n' => {
+                    self.line += 1;
+                    self.column = 1;
+                    self.pos += 1;
+                }
+                b' ' | b'\t' | b'\r' => {
+                    self.column += 1;
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        // Whitespace bytes are valid ASCII/UTF-8, so this conversion is safe.
+        std::str::from_utf8(&self.input[start..self.pos]).unwrap_or_default()
     }
 
     /// Skips whitespace, returning an error if none is found.
@@ -504,14 +852,20 @@ impl<'a> ParserInput<'a> {
     /// Consumes bytes while `pred` returns `true` and returns the string.
     pub fn take_while(&mut self, pred: impl Fn(u8) -> bool) -> String {
         let start = self.pos;
-        while let Some(b) = self.peek() {
-            if pred(b) {
-                self.advance(1);
+        while self.pos < self.input.len() && pred(self.input[self.pos]) {
+            if self.input[self.pos] == b'\n' {
+                self.line += 1;
+                self.column = 1;
             } else {
-                break;
+                self.column += 1;
             }
+            self.pos += 1;
         }
-        String::from_utf8_lossy(&self.input[start..self.pos]).to_string()
+        // The predicates used (ascii_digit, ascii_hexdigit) only match ASCII,
+        // so the consumed range is always valid UTF-8.
+        std::str::from_utf8(&self.input[start..self.pos])
+            .unwrap_or("")
+            .to_string()
     }
 
     // -- Name parsing (XML 1.0 §2.3) --
@@ -521,20 +875,55 @@ impl<'a> ParserInput<'a> {
     /// A `Name` starts with a `NameStartChar` followed by zero or more
     /// `NameChar`s. Returns an error if the name is empty or starts with
     /// an invalid character.
+    ///
+    /// Uses an ASCII fast path that scans name characters as bytes,
+    /// avoiding per-character UTF-8 decoding for the common case.
+    #[inline]
     pub fn parse_name(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
-        if self.at_end() {
+        if self.pos >= self.input.len() {
             return Err(self.fatal("expected name, found end of input"));
         }
 
-        let first = self
-            .peek_char()
-            .ok_or_else(|| self.fatal("expected name"))?;
-        if !is_name_start_char(first) {
-            return Err(self.fatal(format!("invalid name start character: '{first}'")));
-        }
-        self.advance_char(first);
+        let first = self.input[self.pos];
 
+        // ASCII fast path: most XML names are pure ASCII
+        if is_ascii_name_start(first) {
+            self.pos += 1;
+            self.column += 1;
+            while self.pos < self.input.len() && is_ascii_name_char(self.input[self.pos]) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            // Check if we stopped at a non-ASCII byte (need slow path)
+            if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
+                let len = self.pos - start;
+                if len > self.max_name_length {
+                    return Err(self.fatal(format!(
+                        "name length ({len}) exceeds maximum ({})",
+                        self.max_name_length
+                    )));
+                }
+                // Input is guaranteed valid UTF-8 and we only consumed ASCII bytes
+                let name = std::str::from_utf8(&self.input[start..self.pos])
+                    .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                return Ok(name.to_string());
+            }
+            // Fall through: hit a non-ASCII continuation byte, continue
+            // with the char-by-char path below.
+        } else {
+            // Non-ASCII first byte or invalid ASCII start char —
+            // use the standard char-by-char path.
+            let ch = self
+                .peek_char()
+                .ok_or_else(|| self.fatal("expected name"))?;
+            if !is_name_start_char(ch) {
+                return Err(self.fatal(format!("invalid name start character: '{ch}'")));
+            }
+            self.advance_char(ch);
+        }
+
+        // Slow path: handles non-ASCII name characters
         while let Some(ch) = self.peek_char() {
             if is_name_char(ch) {
                 self.advance_char(ch);
@@ -556,6 +945,179 @@ impl<'a> ParserInput<'a> {
         Ok(name.to_string())
     }
 
+    /// Parses a name from the input and checks whether it matches `expected`.
+    ///
+    /// Advances past the parsed name in all cases. Returns `Ok(None)` if the
+    /// name matches, or `Ok(Some(parsed_name))` if it doesn't (the caller
+    /// gets the actual name for error messages). This avoids allocating a
+    /// `String` in the happy path (matching names).
+    #[allow(dead_code)]
+    pub fn parse_name_eq(&mut self, expected: &str) -> Result<Option<String>, ParseError> {
+        let start = self.pos;
+        if self.pos >= self.input.len() {
+            return Err(self.fatal("expected name, found end of input"));
+        }
+
+        let first = self.input[self.pos];
+
+        // ASCII fast path
+        if is_ascii_name_start(first) {
+            self.pos += 1;
+            self.column += 1;
+            while self.pos < self.input.len() && is_ascii_name_char(self.input[self.pos]) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
+                let len = self.pos - start;
+                if len > self.max_name_length {
+                    return Err(self.fatal(format!(
+                        "name length ({len}) exceeds maximum ({})",
+                        self.max_name_length
+                    )));
+                }
+                // Compare directly against input bytes — no allocation needed
+                if len == expected.len() && &self.input[start..self.pos] == expected.as_bytes() {
+                    return Ok(None); // match — no allocation
+                }
+                let name = std::str::from_utf8(&self.input[start..self.pos])
+                    .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                return Ok(Some(name.to_string()));
+            }
+            // Fall through to slow path for non-ASCII
+        } else {
+            let ch = self
+                .peek_char()
+                .ok_or_else(|| self.fatal("expected name"))?;
+            if !is_name_start_char(ch) {
+                return Err(self.fatal(format!("invalid name start character: '{ch}'")));
+            }
+            self.advance_char(ch);
+        }
+
+        // Slow path for non-ASCII names
+        while let Some(ch) = self.peek_char() {
+            if is_name_char(ch) {
+                self.advance_char(ch);
+            } else {
+                break;
+            }
+        }
+
+        let len = self.pos - start;
+        if len > self.max_name_length {
+            return Err(self.fatal(format!(
+                "name length ({len}) exceeds maximum ({})",
+                self.max_name_length
+            )));
+        }
+
+        if len == expected.len() && &self.input[start..self.pos] == expected.as_bytes() {
+            return Ok(None);
+        }
+        let name = std::str::from_utf8(&self.input[start..self.pos])
+            .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+        Ok(Some(name.to_string()))
+    }
+
+    /// Parses a name and checks whether it matches the given prefix + local
+    /// name parts. This avoids needing the full `"prefix:local"` `String` for
+    /// end tag matching — the caller can pass already-split owned parts.
+    ///
+    /// Returns `Ok(None)` on match, or `Ok(Some(parsed_name))` on mismatch.
+    pub fn parse_name_eq_parts(
+        &mut self,
+        prefix: Option<&str>,
+        local: &str,
+    ) -> Result<Option<String>, ParseError> {
+        let start = self.pos;
+        if self.pos >= self.input.len() {
+            return Err(self.fatal("expected name, found end of input"));
+        }
+
+        let first = self.input[self.pos];
+
+        // ASCII fast path
+        if is_ascii_name_start(first) {
+            self.pos += 1;
+            self.column += 1;
+            while self.pos < self.input.len() && is_ascii_name_char(self.input[self.pos]) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
+                let len = self.pos - start;
+                if len > self.max_name_length {
+                    return Err(self.fatal(format!(
+                        "name length ({len}) exceeds maximum ({})",
+                        self.max_name_length
+                    )));
+                }
+                let parsed = &self.input[start..self.pos];
+                // Compare against prefix:local parts
+                let matches = match prefix {
+                    Some(pfx) => {
+                        let expected_len = pfx.len() + 1 + local.len();
+                        len == expected_len
+                            && parsed[..pfx.len()] == *pfx.as_bytes()
+                            && parsed[pfx.len()] == b':'
+                            && parsed[pfx.len() + 1..] == *local.as_bytes()
+                    }
+                    None => len == local.len() && parsed == local.as_bytes(),
+                };
+                if matches {
+                    return Ok(None);
+                }
+                let name =
+                    std::str::from_utf8(parsed).map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                return Ok(Some(name.to_string()));
+            }
+            // Fall through to slow path for non-ASCII
+        } else {
+            let ch = self
+                .peek_char()
+                .ok_or_else(|| self.fatal("expected name"))?;
+            if !is_name_start_char(ch) {
+                return Err(self.fatal(format!("invalid name start character: '{ch}'")));
+            }
+            self.advance_char(ch);
+        }
+
+        // Slow path for non-ASCII names
+        while let Some(ch) = self.peek_char() {
+            if is_name_char(ch) {
+                self.advance_char(ch);
+            } else {
+                break;
+            }
+        }
+
+        let len = self.pos - start;
+        if len > self.max_name_length {
+            return Err(self.fatal(format!(
+                "name length ({len}) exceeds maximum ({})",
+                self.max_name_length
+            )));
+        }
+
+        let parsed = &self.input[start..self.pos];
+        let matches = match prefix {
+            Some(pfx) => {
+                let expected_len = pfx.len() + 1 + local.len();
+                len == expected_len
+                    && parsed[..pfx.len()] == *pfx.as_bytes()
+                    && parsed[pfx.len()] == b':'
+                    && parsed[pfx.len() + 1..] == *local.as_bytes()
+            }
+            None => len == local.len() && parsed == local.as_bytes(),
+        };
+        if matches {
+            return Ok(None);
+        }
+        let name = std::str::from_utf8(parsed).map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+        Ok(Some(name.to_string()))
+    }
+
     // -- Reference parsing (XML 1.0 §4.1) --
 
     /// Parses an entity or character reference (`&...;`).
@@ -567,7 +1129,23 @@ impl<'a> ParserInput<'a> {
     ///
     /// Increments the entity expansion counter and returns an error if the
     /// limit is exceeded.
+    #[cfg(test)]
     pub fn parse_reference(&mut self) -> Result<String, ParseError> {
+        let mut buf = String::new();
+        self.parse_reference_into(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Parses an entity or character reference and appends the result
+    /// directly into `buf`, avoiding an intermediate `String` allocation.
+    ///
+    /// For builtin entities (`&amp;`, `&lt;`, etc.) and character references
+    /// (`&#65;`, `&#x41;`), pushes the resolved character directly. For
+    /// general entities, appends the expanded replacement text.
+    ///
+    /// Returns the resolved text as a `&str` slice of `buf` (the portion
+    /// that was appended), which callers can use for validation.
+    pub fn parse_reference_into<'b>(&mut self, buf: &'b mut String) -> Result<&'b str, ParseError> {
         self.entity_expansions += 1;
         if self.entity_expansions > self.max_entity_expansions {
             return Err(self.fatal(format!(
@@ -578,11 +1156,20 @@ impl<'a> ParserInput<'a> {
 
         self.expect_byte(b'&')?;
 
+        // Fast path: recognize builtin entities at byte level
+        let remaining = &self.input[self.pos..];
+        if let Some(result) = match_builtin_entity(remaining) {
+            let advance_len = result.1;
+            self.advance_counting_lines(advance_len);
+            let start = buf.len();
+            buf.push_str(result.0);
+            return Ok(&buf[start..]);
+        }
+
         if self.peek() == Some(b'#') {
             // Character reference
             self.advance(1);
             let value = if self.peek() == Some(b'x') {
-                // Hexadecimal
                 self.advance(1);
                 let hex = self.take_while(|b| b.is_ascii_hexdigit());
                 if hex.is_empty() {
@@ -591,7 +1178,6 @@ impl<'a> ParserInput<'a> {
                 u32::from_str_radix(&hex, 16)
                     .map_err(|_| self.fatal("invalid hex character reference"))?
             } else {
-                // Decimal
                 let dec = self.take_while(|b| b.is_ascii_digit());
                 if dec.is_empty() {
                     return Err(self.fatal("empty decimal character reference"));
@@ -604,61 +1190,65 @@ impl<'a> ParserInput<'a> {
             let ch = char::from_u32(value)
                 .ok_or_else(|| self.fatal(format!("invalid character reference: U+{value:04X}")))?;
 
-            // Validate against XML 1.0 §2.2 Char production —
-            // character references must also resolve to valid XML characters.
             if !is_xml_char(ch) {
                 return Err(self.fatal(format!(
                     "character reference &#x{value:X}; does not refer to a valid XML character"
                 )));
             }
 
-            Ok(ch.to_string())
+            let start = buf.len();
+            buf.push(ch);
+            Ok(&buf[start..])
         } else {
-            // Entity reference
+            // General entity reference — delegate to parse_reference logic
+            // (rare path, allocation is acceptable)
             let name = self.parse_name()?;
             self.expect_byte(b';')?;
 
-            match name.as_str() {
-                "amp" => Ok("&".to_string()),
-                "lt" => Ok("<".to_string()),
-                "gt" => Ok(">".to_string()),
-                "apos" => Ok("'".to_string()),
-                "quot" => Ok("\"".to_string()),
+            let expanded = match name.as_str() {
+                "amp" | "lt" | "gt" | "apos" | "quot" => {
+                    unreachable!("builtin entity should be caught by fast path")
+                }
                 _ => {
-                    // Check external entity reference
-                    if self.entity_external.contains(&name) {
-                        return Err(self.fatal(format!(
-                            "reference to external entity '{name}' is not supported"
-                        )));
-                    }
-                    // Look up in DTD-declared entities
-                    if let Some(value) = self.entity_map.get(&name).cloned() {
-                        // Validate entity replacement text matches the
-                        // content production (XML 1.0 §4.3.2 WFC: Parsed
-                        // Entity). Only checked when the entity is actually
-                        // referenced, and only once per entity.
+                    if let Some(info) = self.entity_external.get(&name).cloned() {
+                        if let Some(ref resolver) = self.entity_resolver.clone() {
+                            let request = ExternalEntityRequest {
+                                name: &name,
+                                system_id: &info.system_id,
+                                public_id: info.public_id.as_deref(),
+                            };
+                            if let Some(resolved) = resolver(request) {
+                                self.expand_entity_text(&resolved)?
+                            } else {
+                                return Err(self.fatal(format!(
+                                    "reference to external entity '{name}' is not supported"
+                                )));
+                            }
+                        } else {
+                            return Err(self.fatal(format!(
+                                "reference to external entity '{name}' is not supported"
+                            )));
+                        }
+                    } else if let Some(value) = self.entity_map.get(&name).cloned() {
                         if !self.validated_entities.contains(&name) {
                             self.validated_entities.insert(name.clone());
                             self.validate_entity_content(&name, &value)?;
                         }
-                        // Recursively expand entity references in the
-                        // replacement text (XML 1.0 §4.4)
-                        self.expand_entity_text(&value)
-                    } else if self.recover || self.has_pe_references {
-                        // Per XML 1.0 §4.1 WFC: Entity Declared, undeclared
-                        // entities are not WF errors when the internal subset
-                        // contains parameter entity references (the PE could
-                        // have declared additional entities).
+                        self.expand_entity_text(&value)?
+                    } else if self.recover || self.has_pe_references || self.has_external_dtd {
                         self.push_diagnostic(
                             ErrorSeverity::Warning,
                             format!("unknown entity reference: &{name};"),
                         );
-                        Ok(String::new())
+                        String::new()
                     } else {
-                        Err(self.fatal(format!("unknown entity reference: &{name};")))
+                        return Err(self.fatal(format!("unknown entity reference: &{name};")));
                     }
                 }
-            }
+            };
+            let start = buf.len();
+            buf.push_str(&expanded);
+            Ok(&buf[start..])
         }
     }
 
@@ -754,32 +1344,60 @@ impl<'a> ParserInput<'a> {
                         )));
                     }
 
-                    let expanded = match name {
-                        "amp" => "&".to_string(),
-                        "lt" => "<".to_string(),
-                        "gt" => ">".to_string(),
-                        "apos" => "'".to_string(),
-                        "quot" => "\"".to_string(),
-                        _ => {
-                            if self.entity_external.contains(name) {
+                    // Fast path: builtin entities push directly, no allocation
+                    match name {
+                        "amp" => {
+                            result.push('&');
+                            continue;
+                        }
+                        "lt" => {
+                            result.push('<');
+                            continue;
+                        }
+                        "gt" => {
+                            result.push('>');
+                            continue;
+                        }
+                        "apos" => {
+                            result.push('\'');
+                            continue;
+                        }
+                        "quot" => {
+                            result.push('"');
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    let expanded = if let Some(info) = self.entity_external.get(name).cloned() {
+                        if let Some(ref resolver) = self.entity_resolver.clone() {
+                            let request = ExternalEntityRequest {
+                                name,
+                                system_id: &info.system_id,
+                                public_id: info.public_id.as_deref(),
+                            };
+                            if let Some(resolved) = resolver(request) {
+                                self.expand_entity_text(&resolved)?
+                            } else {
                                 return Err(self.fatal(format!(
                                     "reference to external entity '{name}' is not supported"
                                 )));
                             }
-                            if let Some(value) = self.entity_map.get(name).cloned() {
-                                self.expand_entity_text(&value)?
-                            } else if self.recover || self.has_pe_references {
-                                self.push_diagnostic(
-                                    ErrorSeverity::Warning,
-                                    format!("unknown entity reference: &{name};"),
-                                );
-                                String::new()
-                            } else {
-                                return Err(
-                                    self.fatal(format!("unknown entity reference: &{name};"))
-                                );
-                            }
+                        } else {
+                            return Err(self.fatal(format!(
+                                "reference to external entity '{name}' is not supported"
+                            )));
                         }
+                    } else if let Some(value) = self.entity_map.get(name).cloned() {
+                        self.expand_entity_text(&value)?
+                    } else if self.recover || self.has_pe_references || self.has_external_dtd {
+                        self.push_diagnostic(
+                            ErrorSeverity::Warning,
+                            format!("unknown entity reference: &{name};"),
+                        );
+                        String::new()
+                    } else {
+                        return Err(self.fatal(format!("unknown entity reference: &{name};")));
                     };
                     result.push_str(&expanded);
                 }
@@ -832,6 +1450,10 @@ impl<'a> ParserInput<'a> {
 
     /// Parses a quoted attribute value with entity resolution and
     /// whitespace normalization.
+    ///
+    /// Uses bulk scanning to find the next `&`, `<`, or quote character,
+    /// then extracts safe chunks with a single `push_str()` instead of
+    /// processing character by character.
     pub fn parse_attribute_value(&mut self) -> Result<String, ParseError> {
         let quote = self.next_byte()?;
         if quote != b'"' && quote != b'\'' {
@@ -840,10 +1462,35 @@ impl<'a> ParserInput<'a> {
 
         let mut value = String::new();
         loop {
+            // Bulk scan for the next interesting byte
+            let safe_len = self.scan_attr_value(quote);
+            if safe_len > 0 {
+                let start = self.pos;
+                let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
+                    .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
+                // Normalize whitespace in chunk (XML 1.0 §3.3.3)
+                if chunk
+                    .as_bytes()
+                    .iter()
+                    .any(|&b| b == b'\t' || b == b'\n' || b == b'\r')
+                {
+                    for ch in chunk.chars() {
+                        match ch {
+                            '\t' | '\n' | '\r' => value.push(' '),
+                            _ => value.push(ch),
+                        }
+                    }
+                } else {
+                    value.push_str(chunk);
+                }
+                self.advance_counting_lines(safe_len);
+            }
+
             if self.at_end() {
                 return Err(self.fatal("unexpected end of input in attribute value"));
             }
-            let b = self.peek().ok_or_else(|| self.fatal("unexpected end"))?;
+
+            let b = self.input[self.pos];
             if b == quote {
                 self.advance(1);
                 break;
@@ -857,7 +1504,7 @@ impl<'a> ParserInput<'a> {
                     && !self.input[self.pos + 1..].starts_with(b"amp;")
                     && !self.input[self.pos + 1..].starts_with(b"apos;")
                     && !self.input[self.pos + 1..].starts_with(b"quot;");
-                let resolved = self.parse_reference()?;
+                let resolved = self.parse_reference_into(&mut value)?;
                 // WFC: No < in Attribute Values — entity replacement text
                 // must not contain '<' (XML 1.0 §3.1). Built-in entity
                 // &lt; is explicitly excluded from this constraint.
@@ -866,7 +1513,6 @@ impl<'a> ParserInput<'a> {
                         self.fatal("'<' not allowed in attribute values (from entity expansion)")
                     );
                 }
-                value.push_str(&resolved);
             } else if b == b'<' {
                 return Err(self.fatal("'<' not allowed in attribute values"));
             } else {
@@ -930,12 +1576,18 @@ impl<'a> ParserInput<'a> {
 ///
 /// Maintains a stack of namespace binding frames that mirrors the element
 /// nesting. Each frame contains the `xmlns` declarations introduced on
-/// that element. Namespace resolution walks the stack from top to bottom.
+/// that element. A `HashMap` cache provides O(1) namespace resolution
+/// instead of walking the stack.
 pub(crate) struct NamespaceResolver {
     /// Stack of namespace binding frames. Each frame is a `Vec` of
     /// `(prefix, uri)` pairs where a `None` prefix represents the
     /// default namespace.
     stack: Vec<Vec<(Option<String>, String)>>,
+    /// O(1) lookup cache for the default namespace (prefix = None).
+    default_ns: Option<String>,
+    /// O(1) lookup cache for prefixed namespaces. Uses `String` keys so
+    /// lookups with `&str` work via the `Borrow` trait without allocation.
+    prefixed_ns: HashMap<String, String>,
 }
 
 /// The well-known XML namespace URI, pre-bound to the `xml` prefix.
@@ -945,8 +1597,12 @@ impl NamespaceResolver {
     /// Creates a new resolver with the `xml` prefix pre-bound.
     pub fn new() -> Self {
         let initial = vec![(Some("xml".to_string()), XML_NAMESPACE.to_string())];
+        let mut prefixed_ns = HashMap::new();
+        prefixed_ns.insert("xml".to_string(), XML_NAMESPACE.to_string());
         Self {
             stack: vec![initial],
+            default_ns: None,
+            prefixed_ns,
         }
     }
 
@@ -955,9 +1611,32 @@ impl NamespaceResolver {
         self.stack.push(Vec::new());
     }
 
-    /// Pops the current namespace scope.
+    /// Pops the current namespace scope, restoring previous bindings.
     pub fn pop_scope(&mut self) {
-        self.stack.pop();
+        if let Some(bindings) = self.stack.pop() {
+            for (prefix, _uri) in bindings.iter().rev() {
+                // Find previous binding in remaining stack
+                let prev = self
+                    .stack
+                    .iter()
+                    .rev()
+                    .flat_map(|frame| frame.iter().rev())
+                    .find(|(p, _)| p == prefix)
+                    .map(|(_, u)| u.clone());
+                match prefix {
+                    None => {
+                        self.default_ns = prev;
+                    }
+                    Some(pfx) => {
+                        if let Some(prev_uri) = prev {
+                            self.prefixed_ns.insert(pfx.clone(), prev_uri);
+                        } else {
+                            self.prefixed_ns.remove(pfx);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Binds a namespace prefix to a URI in the current scope.
@@ -965,32 +1644,30 @@ impl NamespaceResolver {
     /// Use `prefix = None` for the default namespace (`xmlns="..."`).
     pub fn bind(&mut self, prefix: Option<String>, uri: String) {
         if let Some(frame) = self.stack.last_mut() {
-            frame.push((prefix, uri));
+            frame.push((prefix.clone(), uri.clone()));
+        }
+        match prefix {
+            None => {
+                self.default_ns = Some(uri);
+            }
+            Some(pfx) => {
+                self.prefixed_ns.insert(pfx, uri);
+            }
         }
     }
 
-    /// Resolves a namespace prefix to its URI.
+    /// Resolves a namespace prefix to its URI in O(1) time.
     ///
-    /// Walks the stack from top to bottom, returning the first match.
     /// Use `prefix = None` to resolve the default namespace.
     pub fn resolve(&self, prefix: Option<&str>) -> Option<&str> {
-        for frame in self.stack.iter().rev() {
-            for (p, uri) in frame.iter().rev() {
-                let matches = match (prefix, p.as_deref()) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                };
-                if matches {
-                    if uri.is_empty() {
-                        // xmlns="" undeclares the default namespace
-                        return None;
-                    }
-                    return Some(uri.as_str());
-                }
-            }
+        match prefix {
+            None => self.default_ns.as_deref().filter(|s| !s.is_empty()),
+            Some(pfx) => self
+                .prefixed_ns
+                .get(pfx)
+                .map(String::as_str)
+                .filter(|s| !s.is_empty()),
         }
-        None
     }
 }
 
@@ -1005,31 +1682,59 @@ impl NamespaceResolver {
 /// See XML 1.0 §2.5 production `[15]`.
 pub(crate) fn parse_comment_content(input: &mut ParserInput<'_>) -> Result<String, ParseError> {
     input.expect_str(b"<!--")?;
-    let mut content = String::new();
 
+    // Bulk scan for `--` (which is either `-->` end or illegal `--`)
+    let mut content = String::new();
     loop {
-        if input.at_end() {
-            return Err(input.fatal("unexpected end of input in comment"));
-        }
-        if input.looking_at(b"-->") {
-            input.advance(3);
-            break;
-        }
-        // XML 1.0 forbids -- inside comments
-        if input.looking_at(b"--") {
-            if input.recover() {
-                input.push_diagnostic(
-                    ErrorSeverity::Error,
-                    "'--' not allowed inside comments".to_string(),
-                );
-                content.push_str("--");
-                input.advance(2);
-            } else {
-                return Err(input.fatal("'--' not allowed inside comments"));
+        match input.scan_for_2byte_terminator(b'-', b'-') {
+            Some(safe_len) => {
+                // Copy everything before the `--`
+                if safe_len > 0 {
+                    let start = input.pos();
+                    // Validate XML chars using byte-level pre-check
+                    let has_bad =
+                        may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
+                    let chunk = std::str::from_utf8(input.slice(start, start + safe_len))
+                        .map_err(|_| input.fatal("invalid UTF-8 in comment"))?
+                        .to_string();
+                    if has_bad {
+                        if let Some(bad) = find_invalid_xml_char(&chunk) {
+                            if input.recover() {
+                                input.push_diagnostic(
+                                    ErrorSeverity::Error,
+                                    format!("invalid XML character: U+{:04X}", bad as u32),
+                                );
+                            } else {
+                                return Err(input.fatal(format!(
+                                    "invalid XML character: U+{:04X}",
+                                    bad as u32
+                                )));
+                            }
+                        }
+                    }
+                    content.push_str(&chunk);
+                    input.advance_counting_lines(safe_len);
+                }
+                // Check if it's `-->` (end of comment) or just `--`
+                if input.looking_at(b"-->") {
+                    input.advance_counting_lines(3);
+                    break;
+                }
+                // Bare `--` inside comment
+                if input.recover() {
+                    input.push_diagnostic(
+                        ErrorSeverity::Error,
+                        "'--' not allowed inside comments".to_string(),
+                    );
+                    content.push_str("--");
+                    input.advance_counting_lines(2);
+                } else {
+                    return Err(input.fatal("'--' not allowed inside comments"));
+                }
             }
-        } else {
-            let ch = input.next_char()?;
-            content.push(ch);
+            None => {
+                return Err(input.fatal("unexpected end of input in comment"));
+            }
         }
     }
 
@@ -1043,21 +1748,34 @@ pub(crate) fn parse_comment_content(input: &mut ParserInput<'_>) -> Result<Strin
 /// See XML 1.0 §2.7 production `[18]`.
 pub(crate) fn parse_cdata_content(input: &mut ParserInput<'_>) -> Result<String, ParseError> {
     input.expect_str(b"<![CDATA[")?;
-    let mut content = String::new();
 
-    loop {
-        if input.at_end() {
-            return Err(input.fatal("unexpected end of input in CDATA section"));
+    // Bulk scan for `]]>` terminator
+    match input.scan_for_3byte_terminator(b']', b']', b'>') {
+        Some(safe_len) => {
+            let start = input.pos();
+            let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
+            let content = std::str::from_utf8(input.slice(start, start + safe_len))
+                .map_err(|_| input.fatal("invalid UTF-8 in CDATA section"))?
+                .to_string();
+            if has_bad {
+                if let Some(bad) = find_invalid_xml_char(&content) {
+                    if input.recover() {
+                        input.push_diagnostic(
+                            ErrorSeverity::Error,
+                            format!("invalid XML character: U+{:04X}", bad as u32),
+                        );
+                    } else {
+                        return Err(
+                            input.fatal(format!("invalid XML character: U+{:04X}", bad as u32))
+                        );
+                    }
+                }
+            }
+            input.advance_counting_lines(safe_len + 3); // skip content + ]]>
+            Ok(content)
         }
-        if input.looking_at(b"]]>") {
-            input.advance(3);
-            break;
-        }
-        let ch = input.next_char()?;
-        content.push(ch);
+        None => Err(input.fatal("unexpected end of input in CDATA section")),
     }
-
-    Ok(content)
 }
 
 /// Parses a processing instruction (`<?target data?>`), returning
@@ -1083,22 +1801,38 @@ pub(crate) fn parse_pi_content(
     }
 
     let data = if input.skip_whitespace() {
-        let mut data = String::new();
-        loop {
-            if input.at_end() {
+        // Bulk scan for `?>` terminator
+        match input.scan_for_2byte_terminator(b'?', b'>') {
+            Some(data_len) => {
+                let start = input.pos();
+                let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + data_len));
+                let data = std::str::from_utf8(input.slice(start, start + data_len))
+                    .map_err(|_| input.fatal("invalid UTF-8 in processing instruction"))?
+                    .to_string();
+                if has_bad {
+                    if let Some(bad) = find_invalid_xml_char(&data) {
+                        if input.recover() {
+                            input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                format!("invalid XML character: U+{:04X}", bad as u32),
+                            );
+                        } else {
+                            return Err(
+                                input.fatal(format!("invalid XML character: U+{:04X}", bad as u32))
+                            );
+                        }
+                    }
+                }
+                input.advance_counting_lines(data_len + 2); // skip data + ?>
+                if data.is_empty() {
+                    None
+                } else {
+                    Some(data)
+                }
+            }
+            None => {
                 return Err(input.fatal("unexpected end of input in processing instruction"));
             }
-            if input.looking_at(b"?>") {
-                input.advance(2);
-                break;
-            }
-            let ch = input.next_char()?;
-            data.push(ch);
-        }
-        if data.is_empty() {
-            None
-        } else {
-            Some(data)
         }
     } else {
         input.expect_str(b"?>")?;

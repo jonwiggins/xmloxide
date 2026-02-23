@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+<head>
+  <title>XHTML Benchmark Page - Technical Documentation</title>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+  <meta name="description" content="A comprehensive XHTML page for benchmarking XML parsers"/>
+  <meta name="keywords" content="xml, parsing, benchmark, xhtml"/>
+  <meta name="author" content="xmloxide benchmark suite"/>
+  <link rel="stylesheet" type="text/css" href="styles/main.css"/>
+  <link rel="stylesheet" type="text/css" href="styles/code.css"/>
+  <link rel="icon" type="image/x-icon" href="favicon.ico"/>
+</head>
+<body>
+  <div id="header">
+    <h1>Technical Documentation Portal</h1>
+    <p class="subtitle">Comprehensive reference for the XML parsing library</p>
+    <div id="nav">
+      <ul>
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#getting-started">Getting Started</a></li>
+        <li><a href="#api-reference">API Reference</a></li>
+        <li><a href="#examples">Examples</a></li>
+        <li><a href="#performance">Performance</a></li>
+        <li><a href="#faq">FAQ</a></li>
+      </ul>
+    </div>
+  </div>
+
+  <div id="content">
+    <div id="overview" class="section">
+      <h2>Overview</h2>
+      <p>This library provides a complete XML 1.0 parser implementation with support
+      for namespaces, DTD validation, XPath queries, and multiple parsing modes
+      including DOM, SAX, and pull parsing.</p>
+
+      <h3>Key Features</h3>
+      <table class="features">
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th>Status</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>XML 1.0 Parsing</td>
+            <td class="status-complete">Complete</td>
+            <td>Full W3C XML 1.0 Fifth Edition compliance</td>
+          </tr>
+          <tr>
+            <td>Namespace Support</td>
+            <td class="status-complete">Complete</td>
+            <td>Namespaces in XML 1.0 Third Edition</td>
+          </tr>
+          <tr>
+            <td>DTD Validation</td>
+            <td class="status-complete">Complete</td>
+            <td>Document Type Definition validation</td>
+          </tr>
+          <tr>
+            <td>XPath 1.0</td>
+            <td class="status-complete">Complete</td>
+            <td>Full XPath 1.0 query language support</td>
+          </tr>
+          <tr>
+            <td>SAX2 Parsing</td>
+            <td class="status-complete">Complete</td>
+            <td>Event-driven streaming parser</td>
+          </tr>
+          <tr>
+            <td>HTML Parsing</td>
+            <td class="status-complete">Complete</td>
+            <td>Error-tolerant HTML 4.01 parsing</td>
+          </tr>
+          <tr>
+            <td>RelaxNG</td>
+            <td class="status-partial">Partial</td>
+            <td>RelaxNG schema validation</td>
+          </tr>
+          <tr>
+            <td>XML Schema</td>
+            <td class="status-partial">Partial</td>
+            <td>W3C XML Schema validation</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="getting-started" class="section">
+      <h2>Getting Started</h2>
+      <h3>Installation</h3>
+      <pre class="code"><code>cargo add xmloxide</code></pre>
+
+      <h3>Basic Usage</h3>
+      <pre class="code"><code>use xmloxide::Document;
+
+fn main() {
+    let xml = "&lt;root&gt;&lt;child&gt;Hello&lt;/child&gt;&lt;/root&gt;";
+    let doc = Document::parse_str(xml).unwrap();
+    let root = doc.root_element().unwrap();
+    println!("Root element: {}", doc.node_name(root).unwrap());
+}</code></pre>
+
+      <h3>Parsing Options</h3>
+      <p>The parser supports various configuration options through the
+      <code>ParseOptions</code> builder:</p>
+      <pre class="code"><code>use xmloxide::{Document, ParseOptions};
+
+let opts = ParseOptions::default()
+    .recover(true)
+    .no_blanks(true);
+let doc = Document::parse_str_with_options(xml, &amp;opts).unwrap();</code></pre>
+    </div>
+
+    <div id="api-reference" class="section">
+      <h2>API Reference</h2>
+
+      <div class="api-section">
+        <h3>Document</h3>
+        <dl>
+          <dt><code>Document::parse_str(s: &amp;str) -&gt; Result&lt;Document, ParseError&gt;</code></dt>
+          <dd>Parses an XML string into a document tree.</dd>
+
+          <dt><code>Document::parse_bytes(data: &amp;[u8]) -&gt; Result&lt;Document, ParseError&gt;</code></dt>
+          <dd>Parses raw bytes with automatic encoding detection.</dd>
+
+          <dt><code>doc.root() -&gt; NodeId</code></dt>
+          <dd>Returns the document root node.</dd>
+
+          <dt><code>doc.root_element() -&gt; Option&lt;NodeId&gt;</code></dt>
+          <dd>Returns the root element of the document.</dd>
+        </dl>
+      </div>
+
+      <div class="api-section">
+        <h3>Navigation</h3>
+        <dl>
+          <dt><code>doc.parent(node: NodeId) -&gt; Option&lt;NodeId&gt;</code></dt>
+          <dd>Returns the parent node.</dd>
+
+          <dt><code>doc.first_child(node: NodeId) -&gt; Option&lt;NodeId&gt;</code></dt>
+          <dd>Returns the first child node.</dd>
+
+          <dt><code>doc.next_sibling(node: NodeId) -&gt; Option&lt;NodeId&gt;</code></dt>
+          <dd>Returns the next sibling node.</dd>
+
+          <dt><code>doc.children(node: NodeId) -&gt; impl Iterator</code></dt>
+          <dd>Iterates over all child nodes.</dd>
+
+          <dt><code>doc.descendants(node: NodeId) -&gt; impl Iterator</code></dt>
+          <dd>Iterates over all descendant nodes in document order.</dd>
+        </dl>
+      </div>
+
+      <div class="api-section">
+        <h3>XPath</h3>
+        <dl>
+          <dt><code>evaluate(doc: &amp;Document, ctx: NodeId, expr: &amp;str) -&gt; Result&lt;XPathValue, XPathError&gt;</code></dt>
+          <dd>Evaluates an XPath expression against a context node.</dd>
+        </dl>
+        <p>The XPath implementation supports the complete XPath 1.0 specification including
+        all axes, node tests, predicates, and core functions.</p>
+      </div>
+    </div>
+
+    <div id="examples" class="section">
+      <h2>Examples</h2>
+
+      <div class="example">
+        <h3>Parsing and Navigating</h3>
+        <pre class="code"><code>let doc = Document::parse_str(xml)?;
+let root = doc.root_element().unwrap();
+for child in doc.children(root) {
+    if let Some(name) = doc.node_name(child) {
+        println!("Child element: {}", name);
+    }
+}</code></pre>
+      </div>
+
+      <div class="example">
+        <h3>XPath Queries</h3>
+        <pre class="code"><code>let result = evaluate(&amp;doc, root, "//book[@genre='fiction']/title")?;
+match result {
+    XPathValue::NodeSet(nodes) =&gt; {
+        for node in &amp;nodes {
+            println!("Title: {}", doc.text_content(*node));
+        }
+    }
+    _ =&gt; {}
+}</code></pre>
+      </div>
+
+      <div class="example">
+        <h3>SAX Parsing</h3>
+        <pre class="code"><code>struct MyHandler;
+impl SaxHandler for MyHandler {
+    fn start_element(&amp;mut self, name: &amp;str, ...) {
+        println!("Start: {}", name);
+    }
+}
+let mut handler = MyHandler;
+parse_sax(xml, &amp;ParseOptions::default(), &amp;mut handler)?;</code></pre>
+      </div>
+    </div>
+
+    <div id="performance" class="section">
+      <h2>Performance</h2>
+      <p>The parser is designed for high throughput with minimal memory overhead.</p>
+
+      <table class="benchmarks">
+        <thead>
+          <tr>
+            <th>Operation</th>
+            <th>Throughput</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Parse (small document, ~1KB)</td>
+            <td>~500 MB/s</td>
+            <td>In-memory, warm cache</td>
+          </tr>
+          <tr>
+            <td>Parse (medium document, ~10KB)</td>
+            <td>~450 MB/s</td>
+            <td>In-memory, warm cache</td>
+          </tr>
+          <tr>
+            <td>Parse (large document, ~100KB)</td>
+            <td>~400 MB/s</td>
+            <td>In-memory, warm cache</td>
+          </tr>
+          <tr>
+            <td>Serialize</td>
+            <td>~600 MB/s</td>
+            <td>From in-memory tree</td>
+          </tr>
+          <tr>
+            <td>XPath (simple path)</td>
+            <td>~1M queries/s</td>
+            <td>On medium document</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="faq" class="section">
+      <h2>Frequently Asked Questions</h2>
+
+      <div class="faq-item">
+        <h3>Is this a drop-in replacement for libxml2?</h3>
+        <p>Not yet. While the core parsing functionality is compatible, the API
+        is designed to be idiomatic Rust rather than matching libxml2's C API.
+        A C FFI compatibility layer is planned for a future release.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Does it support XML 1.1?</h3>
+        <p>No. XML 1.1 is rarely used in practice and is not currently planned.
+        If you need XML 1.1 support, please file a feature request.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>How does error recovery work?</h3>
+        <p>When <code>ParseOptions::recover(true)</code> is set, the parser will
+        attempt to continue parsing after encountering errors. Diagnostics are
+        collected and can be inspected after parsing completes. This matches
+        libxml2's recovery behavior.</p>
+      </div>
+
+      <div class="faq-item">
+        <h3>Is it thread-safe?</h3>
+        <p>Yes. <code>Document</code> is <code>Send + Sync</code>. There is no
+        global state. Multiple documents can be parsed and queried concurrently
+        without any synchronization.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="footer">
+    <p>Copyright 2024 xmloxide contributors. Licensed under MIT.</p>
+    <p>
+      <a href="https://github.com/example/xmloxide">GitHub</a> |
+      <a href="https://docs.rs/xmloxide">Documentation</a> |
+      <a href="https://crates.io/crates/xmloxide">crates.io</a>
+    </p>
+  </div>
+</body>
+</html>

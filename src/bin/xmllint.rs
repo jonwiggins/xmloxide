@@ -485,7 +485,7 @@ fn serialize_node_recursive(doc: &Document, id: NodeId, out: &mut String) {
             }
             out.push_str("?>");
         }
-        NodeKind::EntityRef { name } => {
+        NodeKind::EntityRef { name, .. } => {
             out.push('&');
             out.push_str(name);
             out.push(';');
@@ -776,7 +776,7 @@ fn format_debug_node(doc: &Document, id: NodeId, depth: usize, out: &mut String)
             }
             out.push('\n');
         }
-        NodeKind::EntityRef { name } => {
+        NodeKind::EntityRef { name, .. } => {
             out.push_str(&indent);
             out.push_str("ENTITY_REF ");
             out.push_str(name);
@@ -786,6 +786,7 @@ fn format_debug_node(doc: &Document, id: NodeId, depth: usize, out: &mut String)
             name,
             system_id,
             public_id,
+            ..
         } => {
             out.push_str(&indent);
             out.push_str("DOCTYPE ");

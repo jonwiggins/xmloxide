@@ -133,9 +133,31 @@ xmllint --html page.html
 | `catalog` | OASIS XML Catalogs for URI resolution |
 | `encoding` | Character encoding detection and transcoding |
 
+## Performance
+
+xmloxide **matches or beats libxml2** in parsing throughput across a range of document sizes and styles:
+
+| Document | Size | xmloxide | libxml2 | Result |
+|----------|------|----------|---------|--------|
+| Atom feed | 4.9 KB | 29.5 µs | 31.7 µs | **7% faster** |
+| SVG drawing | 6.3 KB | 69.7 µs | 82.0 µs | **15% faster** |
+| Maven POM | 11.5 KB | 91.2 µs | 93.2 µs | **2% faster** |
+| XHTML page | 10.2 KB | 78.4 µs | 76.6 µs | ~3% slower |
+| Large (400 KB) | 400 KB | 2.52 ms | 2.57 ms | **2% faster** |
+
+Serialization is **1.5-2.3x faster** than libxml2 thanks to the arena-based tree design.
+
+Key optimizations: O(1) character peek (vs libxml2's O(n) in some paths), bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, and inline entity resolution.
+
+```sh
+# Run benchmarks (requires libxml2 system library)
+cargo bench --features bench-libxml2 --bench comparison_bench
+```
+
 ## Testing
 
-- **700+ unit tests** across all modules
+- **609 unit tests** across all modules
+- **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **Integration tests** covering real-world XML documents, edge cases, and error recovery
 

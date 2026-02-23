@@ -212,7 +212,7 @@ impl<'a> C14nContext<'a> {
             NodeKind::ProcessingInstruction { target, data } => {
                 write_c14n_pi(&mut self.output, target, data.as_deref());
             }
-            NodeKind::EntityRef { name } => {
+            NodeKind::EntityRef { name, .. } => {
                 // Entity references are expanded. We output the entity
                 // reference's children (the expansion). If there are no
                 // children (unexpanded), output the reference as text.
@@ -671,6 +671,7 @@ mod tests {
                 value: "a&b<c\"d\te\nf\rg".to_string(),
                 prefix: None,
                 namespace: None,
+                raw_value: None,
             }],
         });
         doc.append_child(root, elem);
@@ -732,6 +733,7 @@ mod tests {
             name: "html".to_string(),
             system_id: None,
             public_id: None,
+            internal_subset: None,
         });
         let elem = doc.create_node(NodeKind::Element {
             name: "html".to_string(),
@@ -845,12 +847,14 @@ mod tests {
                     value: "1".to_string(),
                     prefix: None,
                     namespace: None,
+                    raw_value: None,
                 },
                 Attribute {
                     name: "a".to_string(),
                     value: "2".to_string(),
                     prefix: None,
                     namespace: None,
+                    raw_value: None,
                 },
             ],
         });

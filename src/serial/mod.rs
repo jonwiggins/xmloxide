@@ -6,6 +6,7 @@
 //! producing deterministic byte sequences required by XML digital signatures.
 
 pub mod c14n;
+pub mod html;
 pub mod xml;
 
 pub use xml::serialize;

@@ -45,6 +45,23 @@ impl NodeId {
     fn as_index(self) -> usize {
         self.0.get() as usize
     }
+
+    /// Converts this `NodeId` to a raw `u32` for FFI interop.
+    ///
+    /// The returned value is always non-zero (valid `NodeId`s start at 1).
+    /// Use 0 to represent "no node" in FFI code.
+    #[must_use]
+    pub fn into_raw(self) -> u32 {
+        self.0.get()
+    }
+
+    /// Creates a `NodeId` from a raw `u32`, if non-zero.
+    ///
+    /// Returns `None` if `raw` is 0 (which represents "no node" in FFI code).
+    #[must_use]
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        NonZeroU32::new(raw).map(Self)
+    }
 }
 
 /// Internal storage for a single node in the arena.
@@ -82,12 +99,16 @@ impl NodeData {
 pub struct Attribute {
     /// The attribute name (the local part, e.g., `"lang"` for `xml:lang`).
     pub name: String,
-    /// The attribute value.
+    /// The attribute value (fully expanded — entity references resolved).
     pub value: String,
     /// Namespace prefix, if any (e.g., `"xml"` for `xml:lang`).
     pub prefix: Option<String>,
     /// Namespace URI after resolution, if any.
     pub namespace: Option<String>,
+    /// The original attribute value text before entity expansion, if it
+    /// contained entity references. Used for serialization to preserve
+    /// entity references in the output (matching libxml2 behavior).
+    pub raw_value: Option<String>,
 }
 
 /// An XML document.
@@ -189,6 +210,19 @@ impl Document {
                     diagnostics: Vec::new(),
                 });
             }
+            // Reject encoding names that are not recognized by encoding_rs
+            // (excluding UTF-8 and ASCII which are always valid for Rust strings).
+            if enc_lower != "utf-8"
+                && enc_lower != "us-ascii"
+                && enc_lower != "ascii"
+                && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
+            {
+                return Err(crate::error::ParseError {
+                    message: format!("unsupported encoding '{enc}'"),
+                    location: crate::error::SourceLocation::default(),
+                    diagnostics: Vec::new(),
+                });
+            }
         }
 
         crate::parser::parse_str(input)
@@ -279,7 +313,7 @@ impl Document {
     }
 
     /// Returns a mutable reference to the `NodeData` for the given node.
-    fn node_mut(&mut self, id: NodeId) -> &mut NodeData {
+    pub(crate) fn node_mut(&mut self, id: NodeId) -> &mut NodeData {
         &mut self.nodes[id.as_index()]
     }
 
@@ -335,6 +369,11 @@ impl Document {
         match &self.node(id).kind {
             NodeKind::Text { content } | NodeKind::CData { content } => {
                 buf.push_str(content);
+            }
+            NodeKind::EntityRef { value, .. } => {
+                if let Some(val) = value {
+                    buf.push_str(val);
+                }
             }
             _ => {
                 for child in self.children(id) {
@@ -480,6 +519,22 @@ impl Document {
 
         self.node_mut(new_child).next_sibling = Some(reference);
         self.node_mut(reference).prev_sibling = Some(new_child);
+    }
+
+    /// Prepends a child node as the first child of a parent.
+    pub fn prepend_child(&mut self, parent: NodeId, child: NodeId) {
+        if let Some(first) = self.first_child(parent) {
+            self.insert_before(first, child);
+        } else {
+            self.append_child(parent, child);
+        }
+    }
+
+    /// Detaches a node from its parent and removes it from the tree.
+    ///
+    /// The node remains allocated in the arena but is unreachable.
+    pub fn remove_node(&mut self, id: NodeId) {
+        self.detach(id);
     }
 
     /// Detaches a node from its parent (but does not free it from the arena).
@@ -914,12 +969,14 @@ mod tests {
                     value: "main".to_string(),
                     prefix: None,
                     namespace: None,
+                    raw_value: None,
                 },
                 Attribute {
                     name: "class".to_string(),
                     value: "container".to_string(),
                     prefix: None,
                     namespace: None,
+                    raw_value: None,
                 },
             ],
         });

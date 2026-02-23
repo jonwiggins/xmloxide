@@ -17,6 +17,7 @@
 pub mod catalog;
 pub mod encoding;
 pub mod error;
+pub mod ffi;
 pub mod html;
 pub mod parser;
 pub mod reader;

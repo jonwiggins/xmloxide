@@ -9,9 +9,14 @@ repository = "https://github.com/jondot/xmloxide"
 keywords = ["xml", "html", "parser", "dom", "xpath"]
 categories = ["parser-implementations", "web-programming"]
 
+[features]
+default = []
+bench-libxml2 = ["dep:libxml"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 encoding_rs = "0.8"
+libxml = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -31,10 +36,22 @@ missing_panics_doc = "allow"        # we don't panic in library code anyway
 unwrap_used = "warn"
 expect_used = "warn"
 
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [[bin]]
 name = "xmllint"
 path = "src/bin/xmllint.rs"
 
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
 [[bench]]
 name = "parser_bench"
 harness = false
+
+[[bench]]
+name = "comparison_bench"
+harness = false
+required-features = ["bench-libxml2"]

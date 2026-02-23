@@ -260,6 +260,7 @@ impl<'a> XmlReader<'a> {
         pi.set_max_depth(options.max_depth);
         pi.set_max_name_length(options.max_name_length);
         pi.set_max_entity_expansions(options.max_entity_expansions);
+        pi.set_entity_resolver(options.entity_resolver.clone());
 
         Self {
             parser_input: pi,
@@ -926,11 +927,24 @@ impl<'a> XmlReader<'a> {
                 }
                 if let Ok(dtd) = crate::validation::dtd::parse_dtd(&subset_text) {
                     for (ent_name, ent_decl) in &dtd.entities {
-                        if let crate::validation::dtd::EntityKind::Internal(value) = &ent_decl.kind
-                        {
-                            self.parser_input
-                                .entity_map
-                                .insert(ent_name.clone(), value.clone());
+                        match &ent_decl.kind {
+                            crate::validation::dtd::EntityKind::Internal(value) => {
+                                self.parser_input
+                                    .entity_map
+                                    .insert(ent_name.clone(), value.clone());
+                            }
+                            crate::validation::dtd::EntityKind::External {
+                                system_id,
+                                public_id,
+                            } => {
+                                self.parser_input.entity_external.insert(
+                                    ent_name.clone(),
+                                    crate::parser::input::ExternalEntityInfo {
+                                        system_id: system_id.clone(),
+                                        public_id: public_id.clone(),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -1103,8 +1117,7 @@ impl<'a> XmlReader<'a> {
             }
 
             if self.parser_input.peek() == Some(b'&') {
-                let resolved = self.parser_input.parse_reference()?;
-                text.push_str(&resolved);
+                self.parser_input.parse_reference_into(&mut text)?;
             } else {
                 let ch = self.parser_input.next_char()?;
                 text.push(ch);

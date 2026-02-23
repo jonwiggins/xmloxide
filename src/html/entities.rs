@@ -32,6 +32,35 @@ pub fn lookup_entity(name: &str) -> Option<&'static str> {
         .map(|i| ENTITIES[i].1)
 }
 
+/// Looks up the HTML named entity for a given character (reverse lookup).
+///
+/// Returns `None` if no named entity exists for the character, or if the
+/// character is one of the XML builtins (`&`, `<`, `>`, `'`, `"`) which
+/// are handled separately by the escaping logic.
+///
+/// Used by the HTML serializer to re-encode non-ASCII characters as their
+/// named entity form (e.g., `©` → `&copy;`, `\u{00A0}` → `&nbsp;`).
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::html::entities::reverse_lookup_entity;
+///
+/// assert_eq!(reverse_lookup_entity('\u{00A9}'), Some("copy"));
+/// assert_eq!(reverse_lookup_entity('\u{00A0}'), Some("nbsp"));
+/// assert_eq!(reverse_lookup_entity('A'), None);
+/// ```
+pub fn reverse_lookup_entity(ch: char) -> Option<&'static str> {
+    let mut buf = [0u8; 4];
+    let target = ch.encode_utf8(&mut buf);
+    for &(name, value) in ENTITIES {
+        if value == target {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// The HTML 4.01 named character reference table, sorted by name for binary
 /// search. Each entry is `(entity_name, replacement_str)`.
 ///
@@ -324,6 +353,18 @@ mod tests {
         assert_eq!(lookup_entity("Omega"), Some("\u{03A9}"));
         assert_eq!(lookup_entity("omega"), Some("\u{03C9}"));
         assert_eq!(lookup_entity("pi"), Some("\u{03C0}"));
+    }
+
+    #[test]
+    fn test_reverse_lookup() {
+        assert_eq!(reverse_lookup_entity('\u{00A9}'), Some("copy"));
+        assert_eq!(reverse_lookup_entity('\u{00A0}'), Some("nbsp"));
+        assert_eq!(reverse_lookup_entity('\u{0161}'), Some("scaron"));
+        assert_eq!(reverse_lookup_entity('\u{00E8}'), Some("egrave"));
+        assert_eq!(reverse_lookup_entity('\u{20AC}'), Some("euro"));
+        // ASCII characters should not have reverse lookups (handled separately)
+        assert_eq!(reverse_lookup_entity('A'), None);
+        assert_eq!(reverse_lookup_entity(' '), None);
     }
 
     #[test]

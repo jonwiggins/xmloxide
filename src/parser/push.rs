@@ -470,7 +470,11 @@ mod tests {
         parser.push(&input[25..]);
         let doc = parser.finish().unwrap();
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, std::str::from_utf8(input).unwrap());
+        let expected = format!(
+            "<?xml version=\"1.0\"?>\n{}\n",
+            std::str::from_utf8(input).unwrap()
+        );
+        assert_eq!(output, expected);
     }
 
     #[test]

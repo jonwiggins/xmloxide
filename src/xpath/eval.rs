@@ -1145,7 +1145,7 @@ impl<'a> XPathContext<'a> {
             NodeKind::ProcessingInstruction { data, .. } => {
                 data.as_deref().unwrap_or("").to_owned()
             }
-            NodeKind::EntityRef { name } => name.clone(),
+            NodeKind::EntityRef { name, .. } => name.clone(),
             NodeKind::DocumentType { .. } => String::new(),
         }
     }

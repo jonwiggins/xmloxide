@@ -1,0 +1,25 @@
+name: libxml2 Compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run weekly on Sundays at midnight UTC
+    - cron: '0 0 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compat:
+    name: libxml2 regression suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download libxml2 test data
+        run: ./scripts/download-libxml2-tests.sh
+
+      - name: Run compatibility tests
+        run: cargo test --test libxml2_compat -- --nocapture

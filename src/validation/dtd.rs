@@ -41,8 +41,30 @@ pub struct Dtd {
     pub attributes: HashMap<String, Vec<AttributeDecl>>,
     /// General entity declarations, keyed by entity name.
     pub entities: HashMap<String, EntityDecl>,
+    /// Parameter entity declarations, keyed by entity name.
+    pub param_entities: HashMap<String, EntityDecl>,
     /// Notation declarations, keyed by notation name.
     pub notations: HashMap<String, NotationDecl>,
+    /// Ordered list of all declarations (preserving source order and comments).
+    pub declarations: Vec<DtdDeclaration>,
+}
+
+/// A single DTD declaration, preserving source order for re-serialization.
+#[derive(Debug, Clone)]
+pub enum DtdDeclaration {
+    /// An element declaration.
+    Element(ElementDecl),
+    /// A single attribute declaration (one per attribute, even if the source
+    /// used a multi-attribute ATTLIST).
+    Attlist(AttributeDecl),
+    /// A general entity declaration.
+    Entity(EntityDecl),
+    /// A notation declaration.
+    Notation(NotationDecl),
+    /// A comment.
+    Comment(String),
+    /// A processing instruction.
+    Pi(String, Option<String>),
 }
 
 /// An element declaration from `<!ELEMENT name content-model>`.
@@ -239,7 +261,7 @@ impl fmt::Display for ContentSpec {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
-                        write!(f, ",")?;
+                        write!(f, " , ")?;
                     }
                     write!(f, "{item}")?;
                 }
@@ -249,7 +271,7 @@ impl fmt::Display for ContentSpec {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
-                        write!(f, "|")?;
+                        write!(f, " | ")?;
                     }
                     write!(f, "{item}")?;
                 }
@@ -264,6 +286,321 @@ impl fmt::Display for ContentSpec {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// DTD Serializer
+// ---------------------------------------------------------------------------
+
+/// Serializes a parsed DTD's declarations into the internal subset format
+/// used by libxml2.
+///
+/// Each declaration appears on its own line. The output does NOT include
+/// the surrounding `[` and `]>` — the caller adds those.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn serialize_dtd(dtd: &Dtd) -> String {
+    let mut out = String::new();
+    let mut last_was_comment = false;
+
+    for decl in &dtd.declarations {
+        // Don't add a newline before declarations that immediately follow
+        // a comment — the comment text already contains any needed whitespace.
+        // libxml2 concatenates the comment closing `-->` and the next
+        // declaration on the same line.
+        if !last_was_comment {
+            out.push('\n');
+        }
+        match decl {
+            DtdDeclaration::Element(e) => {
+                out.push_str("<!ELEMENT ");
+                out.push_str(&e.name);
+                out.push(' ');
+                write_content_model(&mut out, &e.content_model);
+                out.push('>');
+                last_was_comment = false;
+            }
+            DtdDeclaration::Attlist(a) => {
+                out.push_str("<!ATTLIST ");
+                out.push_str(&a.element_name);
+                out.push(' ');
+                out.push_str(&a.attribute_name);
+                out.push(' ');
+                write_attribute_type(&mut out, &a.attribute_type);
+                out.push(' ');
+                write_attribute_default(&mut out, &a.default);
+                out.push('>');
+                last_was_comment = false;
+            }
+            DtdDeclaration::Entity(e) => {
+                out.push_str("<!ENTITY ");
+                out.push_str(&e.name);
+                match &e.kind {
+                    EntityKind::Internal(value) => {
+                        out.push(' ');
+                        write_entity_value(&mut out, value);
+                    }
+                    EntityKind::External {
+                        system_id,
+                        public_id,
+                    } => {
+                        if let Some(pub_id) = public_id {
+                            out.push_str(" PUBLIC \"");
+                            out.push_str(pub_id);
+                            out.push_str("\" \"");
+                            out.push_str(system_id);
+                            out.push('"');
+                        } else {
+                            out.push_str(" SYSTEM \"");
+                            out.push_str(system_id);
+                            out.push('"');
+                        }
+                    }
+                }
+                out.push('>');
+                last_was_comment = false;
+            }
+            DtdDeclaration::Notation(n) => {
+                out.push_str("<!NOTATION ");
+                out.push_str(&n.name);
+                match (&n.public_id, &n.system_id) {
+                    (Some(pub_id), Some(sys_id)) => {
+                        out.push_str(" PUBLIC \"");
+                        out.push_str(pub_id);
+                        out.push_str("\" \"");
+                        out.push_str(sys_id);
+                        out.push('"');
+                    }
+                    (Some(pub_id), None) => {
+                        out.push_str(" PUBLIC \"");
+                        out.push_str(pub_id);
+                        out.push('"');
+                    }
+                    (None, Some(sys_id)) => {
+                        out.push_str(" SYSTEM \"");
+                        out.push_str(sys_id);
+                        out.push('"');
+                    }
+                    (None, None) => {}
+                }
+                out.push('>');
+                last_was_comment = false;
+            }
+            DtdDeclaration::Comment(text) => {
+                out.push_str("<!--");
+                out.push_str(text);
+                out.push_str("-->");
+                last_was_comment = true;
+            }
+            DtdDeclaration::Pi(target, data) => {
+                out.push_str("<?");
+                out.push_str(target);
+                if let Some(d) = data {
+                    out.push(' ');
+                    out.push_str(d);
+                }
+                out.push_str("?>");
+                last_was_comment = false;
+            }
+        }
+    }
+
+    // libxml2 adds a newline before ]> unless the last item was a comment.
+    if !last_was_comment && !dtd.declarations.is_empty() {
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Writes a content model in libxml2's format.
+fn write_content_model(out: &mut String, model: &ContentModel) {
+    match model {
+        ContentModel::Empty => out.push_str("EMPTY"),
+        ContentModel::Any => out.push_str("ANY"),
+        ContentModel::Mixed(names) => {
+            if names.is_empty() {
+                out.push_str("(#PCDATA)");
+            } else {
+                out.push_str("(#PCDATA");
+                for name in names {
+                    out.push_str(" | ");
+                    out.push_str(name);
+                }
+                out.push_str(")*");
+            }
+        }
+        ContentModel::Children(spec) => {
+            use std::fmt::Write;
+            let _ = write!(out, "{spec}");
+        }
+    }
+}
+
+/// Writes an attribute type in libxml2's format.
+fn write_attribute_type(out: &mut String, attr_type: &AttributeType) {
+    match attr_type {
+        AttributeType::CData => out.push_str("CDATA"),
+        AttributeType::Id => out.push_str("ID"),
+        AttributeType::IdRef => out.push_str("IDREF"),
+        AttributeType::IdRefs => out.push_str("IDREFS"),
+        AttributeType::Entity => out.push_str("ENTITY"),
+        AttributeType::Entities => out.push_str("ENTITIES"),
+        AttributeType::NmToken => out.push_str("NMTOKEN"),
+        AttributeType::NmTokens => out.push_str("NMTOKENS"),
+        AttributeType::Notation(values) | AttributeType::Enumeration(values) => {
+            if matches!(attr_type, AttributeType::Notation(_)) {
+                out.push_str("NOTATION ");
+            }
+            out.push('(');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(" | ");
+                }
+                out.push_str(v);
+            }
+            out.push(')');
+        }
+    }
+}
+
+/// Writes an attribute default in libxml2's format.
+fn write_attribute_default(out: &mut String, default: &AttributeDefault) {
+    match default {
+        AttributeDefault::Required => out.push_str("#REQUIRED"),
+        AttributeDefault::Implied => out.push_str("#IMPLIED"),
+        AttributeDefault::Fixed(value) => {
+            out.push_str("#FIXED \"");
+            out.push_str(value);
+            out.push('"');
+        }
+        AttributeDefault::Default(value) => {
+            out.push('"');
+            out.push_str(value);
+            out.push('"');
+        }
+    }
+}
+
+/// Escapes an entity value for DTD serialization.
+///
+/// Entity references (`&name;`) and character references (`&#...;`) within
+/// the value are preserved as-is (matching libxml2 behavior). Only standalone
+/// `&` characters are escaped. The quote character is chosen to minimize
+/// escaping: single quotes when the value contains double quotes.
+fn write_entity_value(out: &mut String, value: &str) {
+    // Choose quote character: use single quotes if value contains double quotes
+    // but not single quotes (avoids escaping). Otherwise use double quotes.
+    let quote = if value.contains('"') && !value.contains('\'') {
+        '\''
+    } else {
+        '"'
+    };
+    out.push(quote);
+
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'&' {
+            // Check if this is a valid entity or character reference — if so, pass through.
+            if let Some(ref_end) = find_reference_end(bytes, i) {
+                // Copy the reference as-is
+                let ref_str = std::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
+                out.push_str(ref_str);
+                i = ref_end + 1;
+            } else {
+                out.push_str("&amp;");
+                i += 1;
+            }
+        } else if bytes[i] == b'%' {
+            out.push_str("&#37;");
+            i += 1;
+        } else if bytes[i] == quote as u8 {
+            if quote == '"' {
+                out.push_str("&quot;");
+            } else {
+                out.push_str("&apos;");
+            }
+            i += 1;
+        } else {
+            // Push the char (may be multi-byte UTF-8)
+            let ch = &value[i..];
+            if let Some(c) = ch.chars().next() {
+                out.push(c);
+                i += c.len_utf8();
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    out.push(quote);
+}
+
+/// Finds the end position (inclusive, the `;`) of an entity or character
+/// reference starting at `start` in `bytes`. Returns `None` if the `&` at
+/// `start` is not the beginning of a valid reference.
+fn find_reference_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if start >= bytes.len() || bytes[start] != b'&' {
+        return None;
+    }
+    let mut i = start + 1;
+    if i >= bytes.len() {
+        return None;
+    }
+
+    if bytes[i] == b'#' {
+        // Character reference: &#digits; or &#xhexdigits;
+        i += 1;
+        if i >= bytes.len() {
+            return None;
+        }
+        if bytes[i] == b'x' {
+            i += 1;
+            let digit_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i == digit_start || i >= bytes.len() || bytes[i] != b';' {
+                return None;
+            }
+        } else {
+            let digit_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == digit_start || i >= bytes.len() || bytes[i] != b';' {
+                return None;
+            }
+        }
+        Some(i)
+    } else {
+        // Named entity reference: &name;
+        // Name must start with a name start char (letter or _)
+        if !is_name_start_byte(bytes[i]) {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() && is_name_byte(bytes[i]) {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b';' {
+            return None;
+        }
+        Some(i)
+    }
+}
+
+/// Checks if a byte is valid as the start of an XML name.
+fn is_name_start_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b':'
+}
+
+/// Checks if a byte is valid within an XML name.
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'-' || b == b'.'
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +657,7 @@ impl<'a> DtdParser<'a> {
             }
 
             if self.looking_at(b"<!--") {
-                self.skip_comment()?;
+                self.parse_comment_decl()?;
             } else if self.looking_at(b"<!ELEMENT") {
                 self.parse_element_decl()?;
             } else if self.looking_at(b"<!ATTLIST") {
@@ -330,7 +667,7 @@ impl<'a> DtdParser<'a> {
             } else if self.looking_at(b"<!NOTATION") {
                 self.parse_notation_decl()?;
             } else if self.looking_at(b"<?") {
-                self.skip_pi()?;
+                self.parse_pi_decl()?;
             } else if self.peek() == Some(b'%') {
                 // Parameter entity reference — skip it since we don't expand
                 self.skip_pe_reference()?;
@@ -362,6 +699,19 @@ impl<'a> DtdParser<'a> {
             }
         }
 
+        // Check for parameter entity recursion (WFC: No Recursion, XML 1.0 §4.1).
+        // PE values may contain encoded PE references via &#37; (which is '%').
+        // After char ref expansion, if %name; appears in its own value, that's
+        // direct or indirect recursion.
+        for (name, decl) in &self.dtd.param_entities {
+            if let EntityKind::Internal(ref value) = decl.kind {
+                let expanded = expand_char_refs_only(value);
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(name.clone());
+                self.check_pe_recursion(&expanded, &mut visited)?;
+            }
+        }
+
         // Validate entity replacement text after character reference
         // expansion (XML 1.0 §4.5). Character references in entity
         // values are expanded at declaration time. The resulting
@@ -371,6 +721,11 @@ impl<'a> DtdParser<'a> {
                 self.validate_replacement_text(name, value)?;
             }
         }
+
+        // Validate predefined entity redeclarations (XML 1.0 §4.6).
+        // If lt, gt, amp, apos, or quot are declared, their replacement
+        // text must be a character reference to the respective character.
+        self.validate_predefined_entities()?;
 
         // Note: content production validation (XML 1.0 §4.3.2) is
         // performed at entity expansion time in the XML parser, not
@@ -389,6 +744,58 @@ impl<'a> DtdParser<'a> {
             }
         }
 
+        // Check for duplicate attribute declarations on the same element.
+        for attrs in self.dtd.attributes.values() {
+            let mut seen = HashSet::new();
+            for attr in attrs {
+                if !seen.insert(&attr.attribute_name) {
+                    return Err(self.fatal(format!(
+                        "duplicate attribute declaration '{}' on element '{}'",
+                        attr.attribute_name, attr.element_name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates that predefined entity redeclarations (lt, gt, amp, apos,
+    /// quot) use the correct character reference as replacement text.
+    ///
+    /// Per XML 1.0 §4.6: "If the entities lt or amp are declared, they MUST
+    /// be declared as internal entities whose replacement text is a character
+    /// reference to the respective character."
+    fn validate_predefined_entities(&self) -> Result<(), ParseError> {
+        let expected: &[(&str, &str, &[&str])] = &[
+            ("lt", "<", &["&#60;", "&#x3C;", "&#x3c;"]),
+            ("gt", ">", &["&#62;", "&#x3E;", "&#x3e;"]),
+            ("amp", "&", &["&#38;", "&#x26;"]),
+            ("apos", "'", &["&#39;", "&#x27;"]),
+            ("quot", "\"", &["&#34;", "&#x22;"]),
+        ];
+        for &(name, _char_val, valid_refs) in expected {
+            if let Some(decl) = self.dtd.entities.get(name) {
+                match &decl.kind {
+                    EntityKind::Internal(value) => {
+                        // Check if the value is a valid character reference
+                        // for this predefined entity.
+                        if !valid_refs.iter().any(|r| r == value) {
+                            return Err(self.fatal(format!(
+                                "predefined entity '{name}' must be declared as \
+                                 a character reference (e.g., '{}')",
+                                valid_refs[0]
+                            )));
+                        }
+                    }
+                    EntityKind::External { .. } => {
+                        return Err(self.fatal(format!(
+                            "predefined entity '{name}' must be an internal entity"
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -497,6 +904,59 @@ impl<'a> DtdParser<'a> {
         Ok(())
     }
 
+    /// Recursively checks for parameter entity reference cycles.
+    ///
+    /// Examines the char-ref-expanded replacement text for `%name;` patterns.
+    fn check_pe_recursion(
+        &self,
+        value: &str,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Result<(), ParseError> {
+        for ref_name in Self::extract_pe_refs(value) {
+            if visited.contains(&ref_name) {
+                return Err(self.fatal(format!(
+                    "recursive parameter entity reference: '%{ref_name}'"
+                )));
+            }
+            if let Some(decl) = self.dtd.param_entities.get(&ref_name) {
+                if let EntityKind::Internal(ref inner_value) = decl.kind {
+                    let expanded = expand_char_refs_only(inner_value);
+                    visited.insert(ref_name.clone());
+                    self.check_pe_recursion(&expanded, visited)?;
+                    visited.remove(&ref_name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Extracts parameter entity reference names (`%name;`) from a string.
+    fn extract_pe_refs(value: &str) -> Vec<String> {
+        let mut refs = Vec::new();
+        let bytes = value.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                i += 1;
+                if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != b';' && !bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == b';' && i > start {
+                        if let Ok(name) = std::str::from_utf8(&bytes[start..i]) {
+                            refs.push(name.to_string());
+                        }
+                        i += 1;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        refs
+    }
+
     /// Validates entity references in attribute default values.
     ///
     /// Checks WFC: No External Entity References (§3.1) and
@@ -590,13 +1050,14 @@ impl<'a> DtdParser<'a> {
         self.skip_whitespace();
         self.expect_byte(b'>')?;
 
-        self.dtd.elements.insert(
-            name.clone(),
-            ElementDecl {
-                name,
-                content_model,
-            },
-        );
+        let decl = ElementDecl {
+            name: name.clone(),
+            content_model,
+        };
+        self.dtd
+            .declarations
+            .push(DtdDeclaration::Element(decl.clone()));
+        self.dtd.elements.insert(name, decl);
         Ok(())
     }
 
@@ -654,7 +1115,7 @@ impl<'a> DtdParser<'a> {
     /// Parses a content spec starting after the opening '(' has been consumed
     /// and the first item is NOT `#PCDATA`.
     fn parse_content_spec_group(&mut self) -> Result<ContentSpec, ParseError> {
-        let first = self.parse_content_particle()?;
+        let mut first = self.parse_content_particle()?;
         self.skip_whitespace();
 
         // Determine if this is a sequence (,) or choice (|)
@@ -691,17 +1152,29 @@ impl<'a> DtdParser<'a> {
                 occurrence,
             })
         } else {
-            // Single item group
+            // Single item group: (item)?/*
             self.expect_byte(b')')?;
-            let occurrence = self.parse_occurrence();
-            // If the single item is just a name, preserve the group's occurrence
-            if occurrence == Occurrence::Once {
-                Ok(first)
-            } else {
+            let group_occurrence = self.parse_occurrence();
+
+            if group_occurrence != Occurrence::Once {
+                // Group has occurrence: (X)+ → wrap in Seq
                 Ok(ContentSpec {
-                    kind: first.kind,
-                    occurrence,
+                    kind: ContentSpecKind::Seq(vec![first]),
+                    occurrence: group_occurrence,
                 })
+            } else if first.occurrence != Occurrence::Once {
+                // Inner particle has occurrence but group doesn't.
+                // libxml2 normalizes (X+) → (X)+ by moving occurrence
+                // to the outer group.
+                let inner_occ = first.occurrence;
+                first.occurrence = Occurrence::Once;
+                Ok(ContentSpec {
+                    kind: ContentSpecKind::Seq(vec![first]),
+                    occurrence: inner_occ,
+                })
+            } else {
+                // No occurrence on either — unwrap the group
+                Ok(first)
             }
         }
     }
@@ -767,6 +1240,9 @@ impl<'a> DtdParser<'a> {
                 default,
             };
 
+            self.dtd
+                .declarations
+                .push(DtdDeclaration::Attlist(decl.clone()));
             self.dtd
                 .attributes
                 .entry(element_name.clone())
@@ -861,11 +1337,12 @@ impl<'a> DtdParser<'a> {
     // --- ENTITY declaration ---
     // See XML 1.0 §4.2: [70] EntityDecl
 
+    #[allow(clippy::too_many_lines)]
     fn parse_entity_decl(&mut self) -> Result<(), ParseError> {
         self.expect_str(b"<!ENTITY")?;
         self.skip_whitespace_required()?;
 
-        // Skip parameter entities (% name)
+        // Parameter entities (% name)
         if self.peek() == Some(b'%') {
             self.advance(1);
             self.skip_whitespace_required()?;
@@ -876,25 +1353,34 @@ impl<'a> DtdParser<'a> {
             }
             self.skip_whitespace_required()?;
 
-            if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
+            let pe_kind = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
                 // Internal PE — parse and validate the value
                 let value = self.parse_quoted_value()?;
                 self.validate_entity_value(&value, true)?;
+                Some(EntityKind::Internal(value))
             } else if self.looking_at(b"SYSTEM") {
                 // External PE — parse external ID
                 self.expect_str(b"SYSTEM")?;
                 self.skip_whitespace_required()?;
-                let _system_id = self.parse_quoted_value()?;
+                let system_id = self.parse_quoted_value()?;
+                Some(EntityKind::External {
+                    system_id,
+                    public_id: None,
+                })
             } else if self.looking_at(b"PUBLIC") {
                 self.expect_str(b"PUBLIC")?;
                 self.skip_whitespace_required()?;
                 let public_id = self.parse_quoted_value()?;
                 self.validate_public_id(&public_id)?;
                 self.skip_whitespace_required()?;
-                let _system_id = self.parse_quoted_value()?;
+                let system_id = self.parse_quoted_value()?;
+                Some(EntityKind::External {
+                    system_id,
+                    public_id: Some(public_id),
+                })
             } else {
                 return Err(self.fatal("expected entity value or external ID"));
-            }
+            };
 
             self.skip_whitespace();
             // Reject NDATA on parameter entities (XML 1.0 §4.2.2)
@@ -902,6 +1388,17 @@ impl<'a> DtdParser<'a> {
                 return Err(self.fatal("NDATA annotation is not allowed on parameter entities"));
             }
             self.expect_byte(b'>')?;
+
+            // Store PE declaration (first declaration wins per XML 1.0 §4.2)
+            if let Some(kind) = pe_kind {
+                self.dtd
+                    .param_entities
+                    .entry(pe_name)
+                    .or_insert(EntityDecl {
+                        name: String::new(),
+                        kind,
+                    });
+            }
             return Ok(());
         }
 
@@ -963,10 +1460,14 @@ impl<'a> DtdParser<'a> {
 
         // Per XML 1.0 §4.2, the first entity declaration is binding;
         // subsequent declarations of the same entity are ignored.
+        let decl = EntityDecl {
+            name: name.clone(),
+            kind,
+        };
         self.dtd
-            .entities
-            .entry(name.clone())
-            .or_insert(EntityDecl { name, kind });
+            .declarations
+            .push(DtdDeclaration::Entity(decl.clone()));
+        self.dtd.entities.entry(name).or_insert(decl);
         Ok(())
     }
 
@@ -1008,34 +1509,42 @@ impl<'a> DtdParser<'a> {
         self.skip_whitespace();
         self.expect_byte(b'>')?;
 
-        self.dtd.notations.insert(
-            name.clone(),
-            NotationDecl {
-                name,
-                system_id,
-                public_id,
-            },
-        );
+        let decl = NotationDecl {
+            name: name.clone(),
+            system_id,
+            public_id,
+        };
+        self.dtd
+            .declarations
+            .push(DtdDeclaration::Notation(decl.clone()));
+        self.dtd.notations.insert(name, decl);
         Ok(())
     }
 
     // --- Skip helpers ---
 
-    fn skip_comment(&mut self) -> Result<(), ParseError> {
+    /// Parses a comment and stores it as a `DtdDeclaration::Comment`.
+    fn parse_comment_decl(&mut self) -> Result<(), ParseError> {
         self.expect_str(b"<!--")?;
+        let start = self.pos;
         loop {
             if self.at_end() {
                 return Err(self.fatal("unexpected end of input in comment"));
             }
             if self.looking_at(b"-->") {
+                let text = std::str::from_utf8(&self.input[start..self.pos])
+                    .unwrap_or("")
+                    .to_string();
                 self.advance(3);
+                self.dtd.declarations.push(DtdDeclaration::Comment(text));
                 return Ok(());
             }
             self.advance(1);
         }
     }
 
-    fn skip_pi(&mut self) -> Result<(), ParseError> {
+    /// Parses a processing instruction and stores it as a `DtdDeclaration::Pi`.
+    fn parse_pi_decl(&mut self) -> Result<(), ParseError> {
         self.expect_str(b"<?")?;
 
         // Parse and validate the PI target name (XML 1.0 §2.6)
@@ -1049,6 +1558,7 @@ impl<'a> DtdParser<'a> {
         // If we're immediately at ?>, no data — that's fine
         if self.looking_at(b"?>") {
             self.advance(2);
+            self.dtd.declarations.push(DtdDeclaration::Pi(target, None));
             return Ok(());
         }
 
@@ -1060,12 +1570,19 @@ impl<'a> DtdParser<'a> {
             return Err(self.fatal("space required between PI target and data"));
         }
 
+        let start = self.pos;
         loop {
             if self.at_end() {
                 return Err(self.fatal("unexpected end of input in processing instruction"));
             }
             if self.looking_at(b"?>") {
+                let data = std::str::from_utf8(&self.input[start..self.pos])
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 self.advance(2);
+                let data = if data.is_empty() { None } else { Some(data) };
+                self.dtd.declarations.push(DtdDeclaration::Pi(target, data));
                 return Ok(());
             }
             self.advance(1);
@@ -1083,18 +1600,36 @@ impl<'a> DtdParser<'a> {
     // --- Name / token parsing ---
 
     fn parse_name(&mut self) -> Result<String, ParseError> {
-        if self.at_end() {
+        if self.pos >= self.input.len() {
             return Err(self.fatal("expected name, found end of input"));
         }
 
         let start = self.pos;
-        let first = self
-            .peek_char()
-            .ok_or_else(|| self.fatal("expected name"))?;
-        if !is_name_start_char(first) {
-            return Err(self.fatal(format!("invalid name start character: '{first}'")));
+        let first = self.input[self.pos];
+
+        // ASCII fast path
+        if is_ascii_name_start(first) {
+            self.pos += 1;
+            self.column += 1;
+            while self.pos < self.input.len() && is_ascii_name_char(self.input[self.pos]) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
+                let name = std::str::from_utf8(&self.input[start..self.pos])
+                    .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                return Ok(name.to_string());
+            }
+            // Fall through to slow path for non-ASCII continuation
+        } else {
+            let ch = self
+                .peek_char()
+                .ok_or_else(|| self.fatal("expected name"))?;
+            if !is_name_start_char(ch) {
+                return Err(self.fatal(format!("invalid name start character: '{ch}'")));
+            }
+            self.advance_char(ch);
         }
-        self.advance_char(first);
 
         while let Some(ch) = self.peek_char() {
             if is_name_char(ch) {
@@ -1110,18 +1645,36 @@ impl<'a> DtdParser<'a> {
     }
 
     fn parse_nmtoken(&mut self) -> Result<String, ParseError> {
-        if self.at_end() {
+        if self.pos >= self.input.len() {
             return Err(self.fatal("expected NMTOKEN, found end of input"));
         }
 
         let start = self.pos;
-        let first = self
-            .peek_char()
-            .ok_or_else(|| self.fatal("expected NMTOKEN"))?;
-        if !is_name_char(first) {
-            return Err(self.fatal(format!("invalid NMTOKEN character: '{first}'")));
+        let first = self.input[self.pos];
+
+        // ASCII fast path
+        if is_ascii_name_char(first) {
+            self.pos += 1;
+            self.column += 1;
+            while self.pos < self.input.len() && is_ascii_name_char(self.input[self.pos]) {
+                self.pos += 1;
+                self.column += 1;
+            }
+            if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
+                let token = std::str::from_utf8(&self.input[start..self.pos])
+                    .map_err(|_| self.fatal("invalid UTF-8 in NMTOKEN"))?;
+                return Ok(token.to_string());
+            }
+            // Fall through to slow path
+        } else {
+            let ch = self
+                .peek_char()
+                .ok_or_else(|| self.fatal("expected NMTOKEN"))?;
+            if !is_name_char(ch) {
+                return Err(self.fatal(format!("invalid NMTOKEN character: '{ch}'")));
+            }
+            self.advance_char(ch);
         }
-        self.advance_char(first);
 
         while let Some(ch) = self.peek_char() {
             if is_name_char(ch) {
@@ -1386,11 +1939,26 @@ impl<'a> DtdParser<'a> {
     }
 
     fn peek_char(&self) -> Option<char> {
-        if self.at_end() {
+        if self.pos >= self.input.len() {
             return None;
         }
+        let first = self.input[self.pos];
+        // Fast path: ASCII
+        if first < 0x80 {
+            return Some(first as char);
+        }
+        // Slow path: multi-byte UTF-8 — decode only the needed bytes
+        let len = match first {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return None,
+        };
         let remaining = &self.input[self.pos..];
-        std::str::from_utf8(remaining)
+        if remaining.len() < len {
+            return None;
+        }
+        std::str::from_utf8(&remaining[..len])
             .ok()
             .and_then(|s| s.chars().next())
     }
@@ -1577,6 +2145,14 @@ pub(crate) fn replace_entity_refs(text: &str) -> String {
 // ---------------------------------------------------------------------------
 // XML Name character classes (shared with parser/xml.rs)
 // ---------------------------------------------------------------------------
+
+fn is_ascii_name_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b':'
+}
+
+fn is_ascii_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'-' || b == b'.'
+}
 
 fn is_name_start_char(c: char) -> bool {
     matches!(c,
@@ -2924,7 +3500,7 @@ mod tests {
             ]),
             occurrence: Occurrence::Once,
         };
-        assert_eq!(ContentModel::Children(spec).to_string(), "(a,b*)");
+        assert_eq!(ContentModel::Children(spec).to_string(), "(a , b*)");
     }
 
     #[test]

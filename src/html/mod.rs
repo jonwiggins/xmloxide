@@ -151,7 +151,7 @@ pub fn parse_html_with_options(
 
 /// Returns true if the given tag name (lowercase) is a void element that
 /// must not have content.
-fn is_void_element(tag: &str) -> bool {
+pub(crate) fn is_void_element(tag: &str) -> bool {
     matches!(
         tag,
         "area"
@@ -215,7 +215,7 @@ fn auto_closes(open_tag: &str, tag: &str) -> bool {
         ),
         "li" => tag == "li",
         "dt" => matches!(tag, "dt" | "dd"),
-        "dd" => matches!(tag, "dt" | "dd"),
+        "dd" => tag == "dt",
         "tr" => tag == "tr",
         "td" => matches!(tag, "td" | "th" | "tr"),
         "th" => matches!(tag, "td" | "th" | "tr"),
@@ -228,15 +228,23 @@ fn auto_closes(open_tag: &str, tag: &str) -> bool {
             // colgroup is auto-closed by most things that are not col
             tag != "col" && matches!(tag, "thead" | "tbody" | "tfoot" | "tr" | "colgroup")
         }
-        "head" => matches!(tag, "body"),
+        "head" => matches!(tag, "body" | "frameset"),
         _ => false,
     }
 }
 
 /// Returns true if `tag` is a raw text element whose content is not parsed
 /// as HTML (script, style).
-fn is_raw_text_element(tag: &str) -> bool {
+pub(crate) fn is_raw_text_element(tag: &str) -> bool {
     matches!(tag, "script" | "style")
+}
+
+/// Returns true if `tag` is an element that belongs in `<head>`.
+fn is_head_content_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "title" | "meta" | "link" | "base" | "style" | "script" | "noscript"
+    )
 }
 
 // --- The HTML Parser ---
@@ -282,15 +290,14 @@ impl<'a> HtmlParser<'a> {
     fn parse(&mut self) -> Result<Document, ParseError> {
         self.input.skip_whitespace();
 
+        // Track whether a DOCTYPE was found in the input
+        let mut has_doctype = false;
+
         // Parse optional DOCTYPE
         if self.input.looking_at_ci(b"<!doctype") {
             self.parse_doctype();
             self.input.skip_whitespace();
-        }
-
-        // Ensure implied html/head/body structure if not disabled.
-        if !self.options.no_implied {
-            self.ensure_html_structure();
+            has_doctype = true;
         }
 
         // Parse the body content
@@ -306,45 +313,114 @@ impl<'a> HtmlParser<'a> {
             self.push_warning(format!("unclosed element <{tag}> at end of document"));
         }
 
+        // Add default DOCTYPE if none was in the input and not disabled
+        if !has_doctype && !self.options.no_implied {
+            let doctype_id = self.doc.create_node(NodeKind::DocumentType {
+                name: "html".to_string(),
+                public_id: Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_string()),
+                system_id: Some("http://www.w3.org/TR/REC-html40/loose.dtd".to_string()),
+                internal_subset: None,
+            });
+            // Prepend DOCTYPE before the first child of the document root
+            let root = self.doc.root();
+            self.doc.prepend_child(root, doctype_id);
+        }
+
+        // Remove empty <head> elements (libxml2 doesn't output empty <head>)
+        self.remove_empty_heads();
+
         Ok(std::mem::take(&mut self.doc))
     }
 
-    /// Ensures the implied html > head + body structure exists.
-    fn ensure_html_structure(&mut self) {
+    /// Ensures an implied `<html>` element exists at the document root.
+    /// Returns its `NodeId`.
+    fn ensure_html(&mut self) -> NodeId {
         let root = self.doc.root();
-
-        // Check if there's already an html element
-        let has_html = self.doc.children(root).any(|id| {
-            matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "html")
+        // Look for existing html element
+        for id in self.doc.children(root) {
+            if matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "html") {
+                return id;
+            }
+        }
+        // Create implied html
+        let html_id = self.doc.create_node(NodeKind::Element {
+            name: "html".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
         });
+        self.doc.append_child(root, html_id);
+        self.open_elements.push((html_id, "html".to_string()));
+        html_id
+    }
 
-        if !has_html {
-            let html_id = self.doc.create_node(NodeKind::Element {
-                name: "html".to_string(),
-                prefix: None,
-                namespace: None,
-                attributes: vec![],
-            });
-            self.doc.append_child(root, html_id);
-            self.open_elements.push((html_id, "html".to_string()));
+    /// Ensures an implied `<body>` element exists under `<html>`.
+    /// Returns its `NodeId`.
+    fn ensure_body(&mut self) -> NodeId {
+        let html_id = self.ensure_html();
+        // Look for existing body element
+        for id in self.doc.children(html_id) {
+            if matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "body") {
+                return id;
+            }
+        }
+        // Create implied body
+        let body_id = self.doc.create_node(NodeKind::Element {
+            name: "body".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        self.doc.append_child(html_id, body_id);
+        self.open_elements.push((body_id, "body".to_string()));
+        body_id
+    }
 
-            let head_id = self.doc.create_node(NodeKind::Element {
-                name: "head".to_string(),
-                prefix: None,
-                namespace: None,
-                attributes: vec![],
-            });
+    /// Ensures an implied `<head>` element exists under `<html>`.
+    /// Returns its `NodeId`.
+    fn ensure_head(&mut self) -> NodeId {
+        let html_id = self.ensure_html();
+        // Look for existing head element
+        for id in self.doc.children(html_id) {
+            if matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "head") {
+                return id;
+            }
+        }
+        // Create implied head. Insert before body if body exists,
+        // otherwise append to html.
+        let head_id = self.doc.create_node(NodeKind::Element {
+            name: "head".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        // Find body — if it exists, insert head before it
+        let body_id = self.doc.children(html_id).find(|&id| {
+            matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "body")
+        });
+        if let Some(body) = body_id {
+            self.doc.insert_before(body, head_id);
+        } else {
             self.doc.append_child(html_id, head_id);
-            // head is immediately closed (not pushed to open_elements)
+        }
+        head_id
+    }
 
-            let body_id = self.doc.create_node(NodeKind::Element {
-                name: "body".to_string(),
-                prefix: None,
-                namespace: None,
-                attributes: vec![],
-            });
-            self.doc.append_child(html_id, body_id);
-            self.open_elements.push((body_id, "body".to_string()));
+    /// Removes empty `<head>` elements from the document tree.
+    fn remove_empty_heads(&mut self) {
+        let root = self.doc.root();
+        for html_id in self.doc.children(root).collect::<Vec<_>>() {
+            if !matches!(&self.doc.node(html_id).kind, NodeKind::Element { name, .. } if name == "html")
+            {
+                continue;
+            }
+            for child_id in self.doc.children(html_id).collect::<Vec<_>>() {
+                if matches!(&self.doc.node(child_id).kind, NodeKind::Element { name, .. } if name == "head")
+                    && self.doc.first_child(child_id).is_none()
+                {
+                    self.doc.remove_node(child_id);
+                }
+            }
         }
     }
 
@@ -374,9 +450,13 @@ impl<'a> HtmlParser<'a> {
             {
                 self.parse_start_tag();
             } else if self.input.peek() == Some(b'<') && self.input.peek_at(1) == Some(b'!') {
-                // Malformed markup — skip it
-                self.push_warning("malformed markup".to_string());
-                self.input.advance(1);
+                // Could be <![if ...]> (IE conditional comment) or other malformed markup
+                if self.input.peek_at(2) == Some(b'[') {
+                    self.skip_conditional_comment();
+                } else {
+                    self.push_warning("malformed markup".to_string());
+                    self.input.advance(1);
+                }
             } else if self.input.peek() == Some(b'<') && self.input.peek_at(1) == Some(b'?') {
                 self.parse_processing_instruction();
             } else {
@@ -426,6 +506,7 @@ impl<'a> HtmlParser<'a> {
             name,
             system_id,
             public_id,
+            internal_subset: None,
         });
         self.doc.append_child(self.doc.root(), doctype_id);
     }
@@ -468,9 +549,67 @@ impl<'a> HtmlParser<'a> {
             self.skip_to_gt();
         }
 
+        // Handle structural elements by merging with existing implied elements
+        if !self.options.no_implied {
+            if lower_tag == "html" {
+                let html_id = self.ensure_html();
+                self.merge_attributes(html_id, attributes);
+                // Ensure html is on the open_elements stack
+                if !self.open_elements.iter().any(|(_, t)| t == "html") {
+                    self.open_elements.push((html_id, "html".to_string()));
+                }
+                self.input.decrement_depth();
+                return;
+            }
+            if lower_tag == "head" {
+                let head_id = self.ensure_head();
+                self.merge_attributes(head_id, attributes);
+                // Push head to open_elements so child elements go inside it
+                if !self.open_elements.iter().any(|(_, t)| t == "head") {
+                    self.open_elements.push((head_id, "head".to_string()));
+                }
+                self.input.decrement_depth();
+                return;
+            }
+            if lower_tag == "body" && !self.is_in_frameset() {
+                // Close head if open
+                self.close_head_if_open();
+                let body_id = self.ensure_body();
+                self.merge_attributes(body_id, attributes);
+                if !self.open_elements.iter().any(|(_, t)| t == "body") {
+                    self.open_elements.push((body_id, "body".to_string()));
+                }
+                self.input.decrement_depth();
+                return;
+            }
+        }
+
         // Handle auto-closing: if the new element auto-closes an open one,
         // pop the stack accordingly.
         self.handle_auto_close(&lower_tag);
+
+        // For non-structural elements, ensure proper containment
+        if !self.options.no_implied {
+            if lower_tag == "frameset" {
+                // <frameset> replaces <body> in HTML 4.01 — place it
+                // directly under <html>, not inside <body>
+                self.close_head_if_open();
+                self.ensure_html();
+            } else if is_head_content_element(&lower_tag) && !self.is_in_body() {
+                // Head-content elements go under <head>
+                let head_id = self.ensure_head();
+                if !self.open_elements.iter().any(|(_, t)| t == "head") {
+                    self.open_elements.push((head_id, "head".to_string()));
+                }
+            } else if self.is_in_frameset() {
+                // Inside a frameset context, don't auto-create body.
+                // Elements like <frame>, <noframes> stay inside frameset.
+            } else {
+                // Body-content elements: close head, ensure body exists
+                self.close_head_if_open();
+                self.ensure_body();
+            }
+        }
 
         let parent = self.current_parent();
 
@@ -499,6 +638,37 @@ impl<'a> HtmlParser<'a> {
         }
 
         self.open_elements.push((elem_id, lower_tag));
+    }
+
+    /// Merges attributes from a parsed tag into an existing element node.
+    fn merge_attributes(&mut self, elem_id: NodeId, attrs: Vec<Attribute>) {
+        if attrs.is_empty() {
+            return;
+        }
+        if let NodeKind::Element { attributes, .. } = &mut self.doc.node_mut(elem_id).kind {
+            for attr in attrs {
+                if !attributes.iter().any(|a| a.name == attr.name) {
+                    attributes.push(attr);
+                }
+            }
+        }
+    }
+
+    /// Closes `<head>` if it's currently open on the element stack.
+    fn close_head_if_open(&mut self) {
+        if self.open_elements.last().is_some_and(|(_, t)| t == "head") {
+            self.open_elements.pop();
+        }
+    }
+
+    /// Returns true if the parser is currently inside `<body>`.
+    fn is_in_body(&self) -> bool {
+        self.open_elements.iter().any(|(_, t)| t == "body")
+    }
+
+    /// Returns true if the parser is currently inside a `<frameset>`.
+    fn is_in_frameset(&self) -> bool {
+        self.open_elements.iter().any(|(_, t)| t == "frameset")
     }
 
     /// Handles auto-closing of open elements when a new element is encountered.
@@ -618,6 +788,7 @@ impl<'a> HtmlParser<'a> {
                 value,
                 prefix: None,
                 namespace: None,
+                raw_value: None,
             });
         }
 
@@ -683,10 +854,22 @@ impl<'a> HtmlParser<'a> {
                     || b == b'\n'
                     || b == b'>'
                     || b == b'<'
-                    || b == b'"'
-                    || b == b'\''
                     || b == b'`'
                 {
+                    break;
+                }
+                // Backslash escaping: \c includes both chars literally
+                // (libxml2 treats \" as literal backslash+quote)
+                if b == b'\\' {
+                    let c1 = self.next_char_html();
+                    value.push(c1);
+                    if !self.input.at_end() {
+                        let c2 = self.next_char_html();
+                        value.push(c2);
+                    }
+                    continue;
+                }
+                if b == b'"' || b == b'\'' {
                     break;
                 }
                 if b == b'&' {
@@ -724,6 +907,15 @@ impl<'a> HtmlParser<'a> {
             // Strip blank text nodes if configured
             if self.options.no_blanks && text.chars().all(char::is_whitespace) {
                 return;
+            }
+            // Ensure body exists for text content (unless whitespace between
+            // structural elements or we're already inside an element)
+            if !self.options.no_implied && self.open_elements.is_empty() {
+                // Whitespace-only text before any elements is ignored
+                if text.chars().all(char::is_whitespace) {
+                    return;
+                }
+                self.ensure_body();
             }
             let parent = self.current_parent();
             let text_id = self.doc.create_node(NodeKind::Text { content: text });
@@ -765,19 +957,54 @@ impl<'a> HtmlParser<'a> {
 
     fn parse_comment(&mut self) {
         self.input.advance(4); // consume '<!--'
+
+        // Handle abrupt closing: <!-->  and <!--->
+        if self.input.peek() == Some(b'>') {
+            self.input.advance(1);
+            let parent = self.current_parent();
+            let comment_id = self.doc.create_node(NodeKind::Comment {
+                content: String::new(),
+            });
+            self.doc.append_child(parent, comment_id);
+            return;
+        }
+        if self.input.looking_at(b"->") {
+            self.input.advance(2);
+            let parent = self.current_parent();
+            let comment_id = self.doc.create_node(NodeKind::Comment {
+                content: String::new(),
+            });
+            self.doc.append_child(parent, comment_id);
+            return;
+        }
+
         let mut content = String::new();
+        let mut terminated = false;
 
         loop {
             if self.input.at_end() {
                 self.push_warning("unterminated comment".to_string());
                 break;
             }
+            // Standard comment end: -->
             if self.input.looking_at(b"-->") {
                 self.input.advance(3);
+                terminated = true;
+                break;
+            }
+            // Quirky comment end: --!> (libxml2 treats this as -->)
+            if self.input.looking_at(b"--!>") {
+                self.input.advance(4);
+                terminated = true;
                 break;
             }
             let ch = self.next_char_html();
             content.push(ch);
+        }
+
+        // libxml2 drops unterminated comments (those that reach EOF)
+        if !terminated {
+            return;
         }
 
         let parent = self.current_parent();
@@ -793,16 +1020,14 @@ impl<'a> HtmlParser<'a> {
         self.input.skip_whitespace();
 
         let mut data = String::new();
+        // In HTML mode, libxml2 reads PI content up to '>' only.
+        // The '?' before '>' (if present) is included in the content,
+        // so <?pi data?> stores data as "data?" and serializes as "<?pi data?>".
         loop {
             if self.input.at_end() {
                 self.push_warning("unterminated processing instruction".to_string());
                 break;
             }
-            if self.input.looking_at(b"?>") {
-                self.input.advance(2);
-                break;
-            }
-            // Also accept '>' as PI terminator for error tolerance
             if self.input.peek() == Some(b'>') {
                 self.input.advance(1);
                 break;
@@ -955,6 +1180,16 @@ impl<'a> HtmlParser<'a> {
         }
     }
 
+    /// Skips an IE conditional comment marker (`<![if ...]>` or `<![endif]>`).
+    ///
+    /// These are Microsoft extensions to HTML. Each `<![...>` marker is
+    /// individually consumed, but the content between them flows as normal
+    /// text, matching libxml2 behavior.
+    fn skip_conditional_comment(&mut self) {
+        self.push_warning("incorrectly opened comment".to_string());
+        self.skip_to_gt();
+    }
+
     /// Skips forward to and past the next `>` character.
     fn skip_to_gt(&mut self) {
         while !self.input.at_end() {
@@ -1024,9 +1259,12 @@ mod tests {
         let html = doc.root_element().unwrap();
         assert_eq!(doc.node_name(html), Some("html"));
 
-        // Should have head and body children
+        // Should have body child (empty head is removed)
         let children: Vec<_> = doc.children(html).collect();
-        assert!(children.len() >= 2);
+        assert!(!children.is_empty());
+        // Body should contain the <p>
+        let body = children.last().unwrap();
+        assert_eq!(doc.node_name(*body), Some("body"));
     }
 
     #[test]

@@ -3,17 +3,25 @@
 //! Implements a hand-rolled recursive descent parser for XML 1.0 (Fifth Edition).
 //! See <https://www.w3.org/TR/xml/> for the specification.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::error::{ErrorSeverity, ParseError};
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
-use crate::validation::dtd::{parse_dtd, AttributeType, EntityKind};
+use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
 
 use super::input::{
     parse_cdata_content, parse_comment_content, parse_pi_content, parse_xml_decl, split_name,
-    validate_pubid, validate_qname, NamespaceResolver, ParserInput, XMLNS_NAMESPACE, XML_NAMESPACE,
+    split_owned_name, validate_pubid, ExternalEntityInfo, NamespaceResolver, ParserInput,
+    XMLNS_NAMESPACE, XML_NAMESPACE,
 };
 use super::ParseOptions;
+
+/// Default maximum amplification factor for entity/attribute expansion.
+///
+/// libxml2 uses a factor of 5 — if the expanded output exceeds 5x the input
+/// size due to default attribute application or entity expansion, the document
+/// is rejected as a potential denial-of-service attack.
+const DEFAULT_MAX_AMPLIFICATION: usize = 5;
 
 /// The core XML parser.
 pub(crate) struct XmlParser<'a> {
@@ -28,6 +36,13 @@ pub(crate) struct XmlParser<'a> {
     /// DTD attribute type declarations, keyed by `(element_name, attr_name)`.
     /// Used for attribute value normalization of namespace URIs.
     attr_types: HashMap<(String, String), AttributeType>,
+    /// DTD attribute default value declarations, keyed by element name.
+    /// Used for applying default/fixed attributes from ATTLIST.
+    attr_defaults: HashMap<String, Vec<AttributeDecl>>,
+    /// Total input size in bytes, used for amplification factor checking.
+    input_size: usize,
+    /// Running total of bytes added through default attribute expansion.
+    expansion_size: usize,
 }
 
 impl<'a> XmlParser<'a> {
@@ -37,6 +52,7 @@ impl<'a> XmlParser<'a> {
         pi.set_max_depth(options.max_depth);
         pi.set_max_name_length(options.max_name_length);
         pi.set_max_entity_expansions(options.max_entity_expansions);
+        pi.set_entity_resolver(options.entity_resolver.clone());
 
         Self {
             input: pi,
@@ -44,6 +60,9 @@ impl<'a> XmlParser<'a> {
             options: options.clone(),
             ns: NamespaceResolver::new(),
             attr_types: HashMap::new(),
+            attr_defaults: HashMap::new(),
+            input_size: input.len(),
+            expansion_size: 0,
         }
     }
 
@@ -56,6 +75,9 @@ impl<'a> XmlParser<'a> {
             || self.input.looking_at(b"<?xml\r")
         {
             self.parse_xml_declaration()?;
+            // Skip whitespace immediately after the XML declaration — the
+            // serializer always emits its own newline after the declaration.
+            self.input.skip_whitespace();
         } else if !self.input.at_end() {
             // If there's no XML declaration, skip any leading whitespace.
             // Leading whitespace before a non-declaration is tolerated
@@ -126,7 +148,16 @@ impl<'a> XmlParser<'a> {
 
     fn parse_misc(&mut self, parent: NodeId) -> Result<(), ParseError> {
         loop {
-            self.input.skip_whitespace();
+            // Preserve document-level whitespace as text nodes (matches libxml2).
+            // libxml2 normalizes prolog/epilog whitespace to a single `\n`
+            // regardless of how many blank lines appear in the source.
+            let ws = self.input.consume_whitespace();
+            if !ws.is_empty() {
+                let ws_node = self.doc.create_node(NodeKind::Text {
+                    content: "\n".to_string(),
+                });
+                self.doc.append_child(parent, ws_node);
+            }
             if self.input.at_end() {
                 break;
             }
@@ -182,7 +213,15 @@ impl<'a> XmlParser<'a> {
             self.input.skip_whitespace();
         }
 
+        // Flag whether there's an external DTD subset. Per XML 1.0 §4.1 WFC:
+        // Entity Declared, undeclared entities are not WF errors when the
+        // document references an unread external DTD subset.
+        if system_id.is_some() || public_id.is_some() {
+            self.input.has_external_dtd = true;
+        }
+
         // Parse optional internal subset: [ ... ]
+        let mut internal_subset = None;
         if self.input.peek() == Some(b'[') {
             self.input.advance(1);
             let start = self.input.pos();
@@ -251,8 +290,17 @@ impl<'a> XmlParser<'a> {
                                         .entity_map
                                         .insert(ent_name.clone(), value.clone());
                                 }
-                                EntityKind::External { .. } => {
-                                    self.input.entity_external.insert(ent_name.clone());
+                                EntityKind::External {
+                                    system_id,
+                                    public_id,
+                                } => {
+                                    self.input.entity_external.insert(
+                                        ent_name.clone(),
+                                        ExternalEntityInfo {
+                                            system_id: system_id.clone(),
+                                            public_id: public_id.clone(),
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -266,6 +314,23 @@ impl<'a> XmlParser<'a> {
                                     attr_decl.attribute_type.clone(),
                                 );
                             }
+                        }
+
+                        // Store attribute default values for later application.
+                        for (element_name, attrs) in &dtd.attributes {
+                            for attr_decl in attrs {
+                                self.attr_defaults
+                                    .entry(element_name.clone())
+                                    .or_default()
+                                    .push(attr_decl.clone());
+                            }
+                        }
+
+                        // Re-serialize the DTD from parsed structures for
+                        // consistent formatting (matches libxml2 behavior).
+                        let serialized = serialize_dtd(&dtd);
+                        if !serialized.is_empty() {
+                            internal_subset = Some(serialized);
                         }
                     }
                     Err(e) => {
@@ -292,6 +357,7 @@ impl<'a> XmlParser<'a> {
             name,
             system_id,
             public_id,
+            internal_subset,
         });
         self.doc.append_child(parent, doctype_id);
         Ok(())
@@ -321,36 +387,123 @@ impl<'a> XmlParser<'a> {
         }
 
         // Check for duplicate attributes (XML 1.0 §3.1 WFC: Unique Att Spec)
-        {
-            let mut seen = HashSet::new();
-            for attr in &attributes {
-                let full_name = if let Some(ref pfx) = attr.prefix {
-                    format!("{pfx}:{}", attr.name)
-                } else {
-                    attr.name.clone()
-                };
-                if !seen.insert(full_name.clone()) {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            format!("duplicate attribute: '{full_name}'"),
-                        );
-                    } else {
-                        return Err(self
-                            .input
-                            .fatal(format!("duplicate attribute: '{full_name}'")));
+        // Skip for 0 or 1 attributes (no duplicates possible).
+        if attributes.len() >= 2 {
+            // O(n²) comparison avoids HashSet allocation for small attribute lists.
+            let mut found_dup = false;
+            'outer: for i in 1..attributes.len() {
+                for j in 0..i {
+                    if attributes[i].name == attributes[j].name
+                        && attributes[i].prefix == attributes[j].prefix
+                    {
+                        let full_name = if let Some(ref pfx) = attributes[i].prefix {
+                            format!("{pfx}:{}", attributes[i].name)
+                        } else {
+                            attributes[i].name.clone()
+                        };
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                format!("duplicate attribute: '{full_name}'"),
+                            );
+                            found_dup = true;
+                        } else {
+                            return Err(self
+                                .input
+                                .fatal(format!("duplicate attribute: '{full_name}'")));
+                        }
+                        break 'outer;
                     }
                 }
+            }
+            let _ = found_dup; // suppress unused warning
+        }
+
+        // --- Apply #FIXED default attributes from DTD ATTLIST declarations ---
+        // Per XML 1.0 §3.3.2, if an attribute declared with #FIXED is not
+        // present on the element, the parser must add it with the declared
+        // default value. #DEFAULT attributes are tracked for amplification
+        // factor checking but not inserted into the tree (matching libxml2).
+        // Namespace declarations (xmlns, xmlns:prefix) are inserted before
+        // other attributes to match libxml2's attribute ordering.
+        if let Some(defaults) = if self.attr_defaults.is_empty() {
+            None
+        } else {
+            self.attr_defaults.get(&name).cloned()
+        } {
+            let mut insert_pos = 0; // insertion point for namespace declarations
+            for attr_decl in &defaults {
+                let (default_value, is_fixed) = match &attr_decl.default {
+                    crate::validation::dtd::AttributeDefault::Fixed(v) => (Some(v.clone()), true),
+                    crate::validation::dtd::AttributeDefault::Default(v) => {
+                        (Some(v.clone()), false)
+                    }
+                    _ => (None, false),
+                };
+                if let Some(value) = default_value {
+                    // Check if the attribute is already present by comparing
+                    // prefix:local components directly, avoiding format!/clone.
+                    let attr_name = &attr_decl.attribute_name;
+                    let (decl_pfx, decl_local) = split_name(attr_name);
+                    let already_present = attributes
+                        .iter()
+                        .any(|a| a.name == decl_local && a.prefix.as_deref() == decl_pfx);
+                    if !already_present {
+                        // Track expansion for amplification factor check
+                        // (both #FIXED and #DEFAULT contribute to expansion)
+                        self.expansion_size += attr_name.len() + value.len();
+
+                        // Only insert #FIXED attributes into the tree
+                        if is_fixed {
+                            let (decl_prefix, decl_local) = split_name(attr_name);
+                            let attr = Attribute {
+                                name: decl_local.to_string(),
+                                value,
+                                prefix: decl_prefix.map(String::from),
+                                namespace: None,
+                                raw_value: None,
+                            };
+                            let is_ns_decl =
+                                attr_name == "xmlns" || attr_name.starts_with("xmlns:");
+                            if is_ns_decl {
+                                attributes.insert(insert_pos, attr);
+                                insert_pos += 1;
+                            } else {
+                                attributes.push(attr);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check amplification factor: reject if default attribute
+            // expansion would exceed the input size by more than the
+            // maximum factor (matching libxml2's xmlCtxtSetMaxAmplification).
+            if self.expansion_size > self.input_size.saturating_mul(DEFAULT_MAX_AMPLIFICATION) {
+                return Err(self
+                    .input
+                    .fatal("maximum entity amplification factor exceeded"));
             }
         }
 
         // --- Namespace processing (Namespaces in XML 1.0 section 3) ---
 
-        // Push a new namespace scope for this element.
-        self.ns.push_scope();
+        // Check for namespace declarations to skip namespace scope push/pop
+        // when not needed. Uses short-circuiting .any() for fast exit.
+        let has_ns_decls = attributes.iter().any(|a| {
+            a.prefix.as_deref() == Some("xmlns") || (a.prefix.is_none() && a.name == "xmlns")
+        });
+        if has_ns_decls {
+            self.ns.push_scope();
+        }
 
-        // Validate QName syntax for element name.
-        if let Some(msg) = validate_qname(&name) {
+        // Split into prefix and local name for namespace processing.
+        let (prefix, local_name) = split_name(&name);
+
+        // Validate QName syntax: check for multiple colons (the local part
+        // should not contain a colon after split_name).
+        if prefix.is_some() && local_name.contains(':') {
+            let msg = "QName contains multiple colons";
             if self.options.recover {
                 self.input
                     .push_diagnostic(ErrorSeverity::Error, msg.to_string());
@@ -360,7 +513,6 @@ impl<'a> XmlParser<'a> {
         }
 
         // Reject element names with "xmlns" prefix (Namespaces in XML 1.0 §3).
-        let (prefix, local_name) = split_name(&name);
         if prefix == Some("xmlns") {
             if self.options.recover {
                 self.input.push_diagnostic(
@@ -376,14 +528,154 @@ impl<'a> XmlParser<'a> {
 
         // Scan attributes for namespace declarations and bind them,
         // with validation of namespace constraints.
-        for attr in &attributes {
-            if attr.prefix.as_deref() == Some("xmlns") {
-                // Prefixed namespace declaration: xmlns:prefix="uri"
-                let declared_prefix = &attr.name;
+        // In recovery mode, some invalid attributes may be stripped.
+        let mut strip_attr_indices: Vec<usize> = Vec::new();
+        if has_ns_decls {
+            for (attr_idx, attr) in attributes.iter().enumerate() {
+                if attr.prefix.as_deref() == Some("xmlns") {
+                    // Prefixed namespace declaration: xmlns:prefix="uri"
+                    let declared_prefix = &attr.name;
 
-                // Validate QName of the attribute itself.
-                let attr_qname = format!("xmlns:{declared_prefix}");
-                if let Some(msg) = validate_qname(&attr_qname) {
+                    // Validate QName: the local part (declared_prefix) must not
+                    // contain a colon (which would mean multiple colons in the
+                    // full xmlns:prefix name).
+                    if declared_prefix.contains(':') {
+                        let msg = "QName contains multiple colons";
+                        if self.options.recover {
+                            self.input
+                                .push_diagnostic(ErrorSeverity::Error, msg.to_string());
+                        } else {
+                            return Err(self.input.fatal(msg));
+                        }
+                    }
+
+                    // Normalize namespace URI based on DTD-declared attribute
+                    // type. For non-CDATA types (e.g., NMTOKEN), whitespace is
+                    // collapsed per XML 1.0 §3.3.3. Construct the full attribute
+                    // name only when attr_types is non-empty (DTD present).
+                    let ns_value = if self.attr_types.is_empty() {
+                        attr.value.clone()
+                    } else {
+                        let attr_qname = format!("xmlns:{declared_prefix}");
+                        self.normalize_attr_value_by_type(&name, &attr_qname, &attr.value)
+                    };
+
+                    // XML 1.0 Namespaces: cannot unbind a prefix (xmlns:prefix="").
+                    if ns_value.is_empty() {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                format!("namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"),
+                            );
+                        } else {
+                            return Err(self.input.fatal(format!(
+                                "namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"
+                            )));
+                        }
+                    }
+
+                    // Cannot declare the 'xmlns' prefix itself.
+                    if declared_prefix == "xmlns" {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                "the 'xmlns' prefix must not be declared".to_string(),
+                            );
+                        } else {
+                            return Err(self
+                                .input
+                                .fatal("the 'xmlns' prefix must not be declared"));
+                        }
+                    }
+
+                    // 'xml' prefix must map to the XML namespace URI and vice versa.
+                    if declared_prefix == "xml" && ns_value != XML_NAMESPACE {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                "the 'xml' prefix must be bound to the XML namespace".to_string(),
+                            );
+                            // In recovery mode, strip the invalid rebinding
+                            // (matches libxml2: output is <tst/> not <tst xmlns:xml="..."/>).
+                            strip_attr_indices.push(attr_idx);
+                            continue;
+                        }
+                        return Err(self
+                            .input
+                            .fatal("the 'xml' prefix must be bound to the XML namespace"));
+                    }
+
+                    // No other prefix may be bound to the XML namespace URI.
+                    if declared_prefix != "xml" && ns_value == XML_NAMESPACE {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                "only the 'xml' prefix may be bound to the XML namespace"
+                                    .to_string(),
+                            );
+                        } else {
+                            return Err(self
+                                .input
+                                .fatal("only the 'xml' prefix may be bound to the XML namespace"));
+                        }
+                    }
+
+                    // No prefix may be bound to the xmlns namespace URI.
+                    if ns_value == XMLNS_NAMESPACE {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                "the xmlns namespace must not be bound to any prefix".to_string(),
+                            );
+                        } else {
+                            return Err(self
+                                .input
+                                .fatal("the xmlns namespace must not be bound to any prefix"));
+                        }
+                    }
+
+                    self.ns.bind(Some(attr.name.clone()), ns_value);
+                } else if attr.prefix.is_none() && attr.name == "xmlns" {
+                    // Default namespace declaration: xmlns="uri"
+
+                    // Normalize namespace URI based on DTD-declared attribute type.
+                    let ns_value = if self.attr_types.is_empty() {
+                        attr.value.clone()
+                    } else {
+                        self.normalize_attr_value_by_type(&name, "xmlns", &attr.value)
+                    };
+
+                    // Cannot bind default namespace to the XML or xmlns namespace URIs.
+                    if ns_value == XML_NAMESPACE {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                "the xml namespace must not be declared as the default namespace"
+                                    .to_string(),
+                            );
+                        } else {
+                            return Err(self.input.fatal(
+                                "the xml namespace must not be declared as the default namespace",
+                            ));
+                        }
+                    }
+                    if ns_value == XMLNS_NAMESPACE {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                "the xmlns namespace must not be declared as the default namespace"
+                                    .to_string(),
+                            );
+                        } else {
+                            return Err(self.input.fatal(
+                                "the xmlns namespace must not be declared as the default namespace",
+                            ));
+                        }
+                    }
+                    self.ns.bind(None, ns_value);
+                } else if attr.prefix.is_some() && attr.name.contains(':') {
+                    // Validate QName syntax for prefixed non-namespace attributes.
+                    let msg = "QName contains multiple colons";
                     if self.options.recover {
                         self.input
                             .push_diagnostic(ErrorSeverity::Error, msg.to_string());
@@ -391,123 +683,13 @@ impl<'a> XmlParser<'a> {
                         return Err(self.input.fatal(msg));
                     }
                 }
-
-                // Normalize namespace URI based on DTD-declared attribute
-                // type. For non-CDATA types (e.g., NMTOKEN), whitespace is
-                // collapsed per XML 1.0 §3.3.3.
-                let ns_value = self.normalize_attr_value_by_type(&name, &attr_qname, &attr.value);
-
-                // XML 1.0 Namespaces: cannot unbind a prefix (xmlns:prefix="").
-                if ns_value.is_empty() {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            format!("namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"),
-                        );
-                    } else {
-                        return Err(self.input.fatal(format!(
-                            "namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"
-                        )));
-                    }
-                }
-
-                // Cannot declare the 'xmlns' prefix itself.
-                if declared_prefix == "xmlns" {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            "the 'xmlns' prefix must not be declared".to_string(),
-                        );
-                    } else {
-                        return Err(self.input.fatal("the 'xmlns' prefix must not be declared"));
-                    }
-                }
-
-                // 'xml' prefix must map to the XML namespace URI and vice versa.
-                if declared_prefix == "xml" && ns_value != XML_NAMESPACE {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            "the 'xml' prefix must be bound to the XML namespace".to_string(),
-                        );
-                    } else {
-                        return Err(self
-                            .input
-                            .fatal("the 'xml' prefix must be bound to the XML namespace"));
-                    }
-                }
-
-                // No other prefix may be bound to the XML namespace URI.
-                if declared_prefix != "xml" && ns_value == XML_NAMESPACE {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            "only the 'xml' prefix may be bound to the XML namespace".to_string(),
-                        );
-                    } else {
-                        return Err(self
-                            .input
-                            .fatal("only the 'xml' prefix may be bound to the XML namespace"));
-                    }
-                }
-
-                // No prefix may be bound to the xmlns namespace URI.
-                if ns_value == XMLNS_NAMESPACE {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            "the xmlns namespace must not be bound to any prefix".to_string(),
-                        );
-                    } else {
-                        return Err(self
-                            .input
-                            .fatal("the xmlns namespace must not be bound to any prefix"));
-                    }
-                }
-
-                self.ns.bind(Some(attr.name.clone()), ns_value);
-            } else if attr.prefix.is_none() && attr.name == "xmlns" {
-                // Default namespace declaration: xmlns="uri"
-
-                // Normalize namespace URI based on DTD-declared attribute type.
-                let ns_value = self.normalize_attr_value_by_type(&name, "xmlns", &attr.value);
-
-                // Cannot bind default namespace to the XML or xmlns namespace URIs.
-                if ns_value == XML_NAMESPACE {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            "the xml namespace must not be declared as the default namespace"
-                                .to_string(),
-                        );
-                    } else {
-                        return Err(self.input.fatal(
-                            "the xml namespace must not be declared as the default namespace",
-                        ));
-                    }
-                }
-                if ns_value == XMLNS_NAMESPACE {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            "the xmlns namespace must not be declared as the default namespace"
-                                .to_string(),
-                        );
-                    } else {
-                        return Err(self.input.fatal(
-                            "the xmlns namespace must not be declared as the default namespace",
-                        ));
-                    }
-                }
-                self.ns.bind(None, ns_value);
-            } else {
-                // Validate QName syntax for non-namespace attributes.
-                let attr_full = if let Some(ref pfx) = attr.prefix {
-                    format!("{pfx}:{}", attr.name)
-                } else {
-                    attr.name.clone()
-                };
-                if let Some(msg) = validate_qname(&attr_full) {
+            }
+        } else {
+            // No namespace declarations — only validate QName syntax for
+            // prefixed attributes (checking for multiple colons).
+            for attr in &attributes {
+                if attr.prefix.is_some() && attr.name.contains(':') {
+                    let msg = "QName contains multiple colons";
                     if self.options.recover {
                         self.input
                             .push_diagnostic(ErrorSeverity::Error, msg.to_string());
@@ -537,69 +719,94 @@ impl<'a> XmlParser<'a> {
             }
         }
 
-        // Resolve namespace URIs for non-xmlns attributes.
+        // Resolve namespace URIs for non-xmlns prefixed attributes.
         // Unprefixed attributes do NOT inherit the default namespace (per spec).
-        for attr in &mut attributes {
-            if attr.prefix.as_deref() == Some("xmlns")
-                || (attr.prefix.is_none() && attr.name == "xmlns")
-            {
-                // Namespace declarations don't get a namespace URI themselves
-                // (we keep them as attributes to match libxml2 behavior).
-            } else if let Some(pfx) = &attr.prefix {
-                let resolved = self.ns.resolve(Some(pfx.as_str())).map(String::from);
-                // Check for unbound attribute prefix.
-                if pfx != "xml" && resolved.is_none() {
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            format!("unbound namespace prefix '{pfx}' on attribute"),
-                        );
-                    } else {
-                        return Err(self
-                            .input
-                            .fatal(format!("unbound namespace prefix '{pfx}' on attribute")));
+        // Skip entirely when there are no prefixed non-xmlns attributes.
+        let has_prefixed_attrs = attributes
+            .iter()
+            .any(|a| a.prefix.is_some() && a.prefix.as_deref() != Some("xmlns"));
+        if has_prefixed_attrs {
+            for attr in &mut attributes {
+                if let Some(pfx) = &attr.prefix {
+                    if pfx == "xmlns" {
+                        continue; // namespace declaration, not a real attribute prefix
                     }
+                    let resolved = self.ns.resolve(Some(pfx.as_str())).map(String::from);
+                    if pfx != "xml" && resolved.is_none() {
+                        if self.options.recover {
+                            self.input.push_diagnostic(
+                                ErrorSeverity::Error,
+                                format!("unbound namespace prefix '{pfx}' on attribute"),
+                            );
+                        } else {
+                            return Err(self
+                                .input
+                                .fatal(format!("unbound namespace prefix '{pfx}' on attribute")));
+                        }
+                    }
+                    attr.namespace = resolved;
                 }
-                attr.namespace = resolved;
             }
-            // Unprefixed attributes have no namespace (per Namespaces in XML 1.0 section 6.2).
         }
 
         // Namespace-aware attribute uniqueness: two attributes with the same
         // namespace URI and local name are duplicates, even if they use different
         // prefixes (Namespaces in XML 1.0 §6.3).
-        {
-            let mut ns_seen: HashSet<(Option<&str>, &str)> = HashSet::new();
-            for attr in &attributes {
-                if attr.prefix.as_deref() == Some("xmlns")
-                    || (attr.prefix.is_none() && attr.name == "xmlns")
-                {
-                    continue;
-                }
-                let key = (attr.namespace.as_deref(), attr.name.as_str());
-                if !ns_seen.insert(key) {
-                    let display = if let Some(ns) = &attr.namespace {
-                        format!("{{{}}}:{}", ns, attr.name)
-                    } else {
-                        attr.name.clone()
-                    };
-                    if self.options.recover {
-                        self.input.push_diagnostic(
-                            ErrorSeverity::Error,
-                            format!("namespace-aware duplicate attribute: '{display}'"),
-                        );
-                    } else {
-                        return Err(self
-                            .input
-                            .fatal(format!("namespace-aware duplicate attribute: '{display}'")));
+        // Only meaningful when there are 2+ namespaced (non-xmlns) attributes.
+        // Skip entirely when no prefixed attributes exist (no namespaces were
+        // resolved, so ns_attr_count is guaranteed to be 0).
+        if has_prefixed_attrs {
+            let ns_attr_count = attributes.iter().filter(|a| a.namespace.is_some()).count();
+            if ns_attr_count >= 2 {
+                // O(n²) comparison avoids HashSet allocation
+                'ns_outer: for i in 1..attributes.len() {
+                    if attributes[i].namespace.is_none() {
+                        continue;
+                    }
+                    for j in 0..i {
+                        if attributes[j].namespace.is_none() {
+                            continue;
+                        }
+                        if attributes[i].namespace == attributes[j].namespace
+                            && attributes[i].name == attributes[j].name
+                        {
+                            let display = if let Some(ns) = &attributes[i].namespace {
+                                format!("{{{}}}:{}", ns, attributes[i].name)
+                            } else {
+                                attributes[i].name.clone()
+                            };
+                            if self.options.recover {
+                                self.input.push_diagnostic(
+                                    ErrorSeverity::Error,
+                                    format!("namespace-aware duplicate attribute: '{display}'"),
+                                );
+                            } else {
+                                return Err(self.input.fatal(format!(
+                                    "namespace-aware duplicate attribute: '{display}'"
+                                )));
+                            }
+                            break 'ns_outer;
+                        }
                     }
                 }
             }
         }
 
+        // Remove stripped attributes (e.g., invalid xmlns:xml rebindings).
+        if !strip_attr_indices.is_empty() {
+            // Remove in reverse order to preserve indices.
+            for &idx in strip_attr_indices.iter().rev() {
+                attributes.remove(idx);
+            }
+        }
+
+        // Consume the original name String via split_owned_name, avoiding a
+        // re-allocation for unprefixed names (the common case). For unprefixed
+        // names, split_owned_name returns (None, name) — just a move, zero copy.
+        let (elem_prefix_owned, elem_local_owned) = split_owned_name(name);
         let elem_id = self.doc.create_node(NodeKind::Element {
-            name: local_name.to_string(),
-            prefix: prefix.map(String::from),
+            name: elem_local_owned,
+            prefix: elem_prefix_owned,
             namespace: elem_ns,
             attributes,
         });
@@ -608,7 +815,9 @@ impl<'a> XmlParser<'a> {
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {
             self.input.advance(2);
-            self.ns.pop_scope();
+            if has_ns_decls {
+                self.ns.pop_scope();
+            }
             self.input.decrement_depth();
             return Ok(elem_id);
         }
@@ -619,26 +828,39 @@ impl<'a> XmlParser<'a> {
         // Parse element content
         self.parse_content(elem_id)?;
 
-        // Parse end tag
+        // Parse end tag — read back the stored name from the tree node
+        // for matching, since the original name was consumed by split_owned_name.
         self.input.expect_str(b"</")?;
-        let end_name = self.input.parse_name()?;
-        if end_name != name {
+        let (match_prefix, match_local) = {
+            let node = self.doc.node(elem_id);
+            match &node.kind {
+                NodeKind::Element { name, prefix, .. } => (prefix.as_deref(), name.as_str()),
+                _ => unreachable!(),
+            }
+        };
+        if let Some(end_name) = self.input.parse_name_eq_parts(match_prefix, match_local)? {
+            let expected = match match_prefix {
+                Some(pfx) => format!("{pfx}:{match_local}"),
+                None => match_local.to_string(),
+            };
             if self.options.recover {
                 self.input.push_diagnostic(
                     ErrorSeverity::Error,
-                    format!("mismatched end tag: expected </{name}>, found </{end_name}>"),
+                    format!("mismatched end tag: expected </{expected}>, found </{end_name}>"),
                 );
             } else {
                 return Err(self.input.fatal(format!(
-                    "mismatched end tag: expected </{name}>, found </{end_name}>"
+                    "mismatched end tag: expected </{expected}>, found </{end_name}>"
                 )));
             }
         }
         self.input.skip_whitespace();
         self.input.expect_byte(b'>')?;
 
-        // Pop the namespace scope when leaving this element.
-        self.ns.pop_scope();
+        // Pop the namespace scope when leaving this element (only if we pushed).
+        if has_ns_decls {
+            self.ns.pop_scope();
+        }
         self.input.decrement_depth();
 
         Ok(elem_id)
@@ -655,10 +877,14 @@ impl<'a> XmlParser<'a> {
         attr_name: &str,
         value: &str,
     ) -> String {
-        let key = (element_name.to_string(), attr_name.to_string());
-        if let Some(attr_type) = self.attr_types.get(&key) {
-            if !matches!(attr_type, AttributeType::CData) {
-                return value.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Fast path: skip lookup when no DTD attribute types are declared
+        // (the common case for documents without a DTD).
+        if !self.attr_types.is_empty() {
+            let key = (element_name.to_string(), attr_name.to_string());
+            if let Some(attr_type) = self.attr_types.get(&key) {
+                if !matches!(attr_type, AttributeType::CData) {
+                    return value.split_whitespace().collect::<Vec<_>>().join(" ");
+                }
             }
         }
         value.to_string()
@@ -705,6 +931,37 @@ impl<'a> XmlParser<'a> {
         let mut text = String::new();
 
         while !self.input.at_end() {
+            // Bulk scan: find the next `<`, `&`, or `]]>` boundary and
+            // consume all safe bytes in one go.
+            let safe_len = self.input.scan_char_data();
+            if safe_len > 0 {
+                let start = self.input.pos();
+                let chunk_bytes = self.input.slice(start, start + safe_len);
+                // Check if CR normalization is needed (rare in practice)
+                if chunk_bytes.contains(&b'\r') {
+                    let chunk = std::str::from_utf8(chunk_bytes)
+                        .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                    let mut chars = chunk.chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\r' {
+                            // \r\n → \n, bare \r → \n (XML 1.0 §2.11)
+                            if chars.peek() == Some(&'\n') {
+                                chars.next();
+                            }
+                            text.push('\n');
+                        } else {
+                            text.push(ch);
+                        }
+                    }
+                } else {
+                    let chunk = std::str::from_utf8(chunk_bytes)
+                        .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                    text.push_str(chunk);
+                }
+                self.input.advance_counting_lines(safe_len);
+                continue;
+            }
+
             if self.input.peek() == Some(b'<') {
                 break;
             }
@@ -724,8 +981,55 @@ impl<'a> XmlParser<'a> {
             }
 
             if self.input.peek() == Some(b'&') {
-                let resolved = self.input.parse_reference()?;
-                text.push_str(&resolved);
+                // Check if this is a named entity reference (not char ref, not builtin)
+                // whose replacement text is plain text (no '<'). If so, preserve
+                // it as an EntityRef node rather than expanding. Entities that
+                // contain XML markup ('<') must still be expanded so that the
+                // markup is validated (e.g., namespace prefix checking).
+                // Skip the peek for builtins at byte level to avoid String allocation.
+                if self.input.peek_at(1) != Some(b'#') && !self.is_looking_at_builtin_entity_ref() {
+                    if let Some(entity_name) = self.peek_entity_ref_name() {
+                        // entity_name is guaranteed non-builtin at this point.
+                        // Preserve as EntityRef node if:
+                        // 1. The entity is internally declared and text-only (no '<'), OR
+                        // 2. The entity is undeclared but we're in tolerant mode
+                        //    (external DTD or PE refs make undeclared entities non-fatal)
+                        let is_text_only = self
+                            .input
+                            .entity_map
+                            .get(&entity_name)
+                            .is_some_and(|v| !v.contains('<'));
+                        let is_undeclared_tolerant =
+                            !self.input.entity_map.contains_key(&entity_name)
+                                && !self.input.entity_external.contains_key(&entity_name)
+                                && (self.input.has_pe_references || self.input.has_external_dtd);
+                        let should_preserve = is_text_only || is_undeclared_tolerant;
+
+                        if should_preserve {
+                            // Flush accumulated text before the entity ref
+                            if !text.is_empty() {
+                                let text_id = self.doc.create_node(NodeKind::Text {
+                                    content: std::mem::take(&mut text),
+                                });
+                                self.doc.append_child(parent, text_id);
+                            }
+                            // Consume &name;
+                            self.input.advance(1); // &
+                            let name = self.input.parse_name()?;
+                            self.input.expect_byte(b';')?;
+                            // Count entity expansion for limit tracking
+                            self.input.entity_expansions += 1;
+                            let entity_value = self.input.entity_map.get(&name).cloned();
+                            let ref_id = self.doc.create_node(NodeKind::EntityRef {
+                                name,
+                                value: entity_value,
+                            });
+                            self.doc.append_child(parent, ref_id);
+                            continue;
+                        }
+                    }
+                }
+                self.input.parse_reference_into(&mut text)?;
             } else {
                 let ch = self.input.next_char()?;
                 text.push(ch);
@@ -744,6 +1048,87 @@ impl<'a> XmlParser<'a> {
         Ok(())
     }
 
+    /// Checks if the input is positioned at a builtin entity reference
+    /// (`&amp;`, `&lt;`, `&gt;`, `&apos;`, `&quot;`) using byte-level
+    /// checks. This avoids the `String` allocation of `peek_entity_ref_name`.
+    #[inline]
+    fn is_looking_at_builtin_entity_ref(&self) -> bool {
+        let remaining = self.input.remaining();
+        if remaining.len() < 4 || remaining[0] != b'&' {
+            return false;
+        }
+        let after_amp = &remaining[1..];
+        after_amp.starts_with(b"lt;")
+            || after_amp.starts_with(b"gt;")
+            || after_amp.starts_with(b"amp;")
+            || after_amp.starts_with(b"apos;")
+            || after_amp.starts_with(b"quot;")
+    }
+
+    /// Peeks ahead to extract the entity name from `&name;` without consuming
+    /// any input. Returns `None` if the next bytes don't form a valid entity
+    /// reference pattern.
+    fn peek_entity_ref_name(&self) -> Option<String> {
+        // We're at `&` — look ahead past it to find the name and `;`
+        let remaining = self.input.remaining();
+        if remaining.len() < 2 || remaining[0] != b'&' {
+            return None;
+        }
+        let mut i = 1;
+        // Collect name bytes
+        let name_start = i;
+        while i < remaining.len()
+            && (remaining[i].is_ascii_alphanumeric()
+                || remaining[i] == b'_'
+                || remaining[i] == b':'
+                || remaining[i] == b'-'
+                || remaining[i] == b'.')
+        {
+            i += 1;
+        }
+        if i == name_start || i >= remaining.len() || remaining[i] != b';' {
+            return None;
+        }
+        std::str::from_utf8(&remaining[name_start..i])
+            .ok()
+            .map(String::from)
+    }
+
+    /// Checks if all entity references (`&name;`) in a raw attribute value
+    /// text are declared in the entity map. Returns false if any undeclared
+    /// entity ref is found (these should not be preserved via `raw_value`).
+    fn all_entity_refs_declared(&self, raw: &str) -> bool {
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'&' && i + 1 < bytes.len() && bytes[i + 1] != b'#' {
+                // Named entity reference — extract the name
+                let mut j = i + 1;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric()
+                        || bytes[j] == b'_'
+                        || bytes[j] == b':'
+                        || bytes[j] == b'-'
+                        || bytes[j] == b'.')
+                {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b';' {
+                    let name = std::str::from_utf8(&bytes[i + 1..j]).unwrap_or("");
+                    if !is_builtin_entity(name) && !self.input.entity_map.contains_key(name) {
+                        return false;
+                    }
+                    i = j + 1;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        true
+    }
+
     // --- Attributes ---
     // See XML 1.0 §3.1: [41] Attribute
 
@@ -752,15 +1137,40 @@ impl<'a> XmlParser<'a> {
         self.input.skip_whitespace();
         self.input.expect_byte(b'=')?;
         self.input.skip_whitespace();
-        let value = self.input.parse_attribute_value()?;
 
-        let (prefix, local_name) = split_name(&name);
+        // Capture raw attribute value text (before entity expansion) so we
+        // can preserve entity references during serialization.
+        let raw_start = self.input.pos();
+        let value = self.input.parse_attribute_value()?;
+        let raw_end = self.input.pos();
+
+        // Extract raw value (between quotes) — the raw slice includes the
+        // outer quote chars, so trim them. Skip entirely when the raw bytes
+        // contain no '&' (most attributes have no entity references).
+        let raw_value = if raw_end > raw_start + 2 {
+            let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
+            if raw_bytes.contains(&b'&') {
+                let raw_str = std::str::from_utf8(raw_bytes).ok().map(str::to_string);
+                // Only store raw_value if it differs from the expanded value
+                // (i.e., it contained entity references that got expanded) AND
+                // all entity references in the raw value are declared (not
+                // undeclared entities that expanded to empty string).
+                raw_str.filter(|raw| *raw != value && self.all_entity_refs_declared(raw))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (prefix, local_name) = split_owned_name(name);
 
         Ok(Attribute {
-            name: local_name.to_string(),
+            name: local_name,
             value,
-            prefix: prefix.map(String::from),
+            prefix,
             namespace: None,
+            raw_value,
         })
     }
 
@@ -795,6 +1205,11 @@ impl<'a> XmlParser<'a> {
         self.doc.append_child(parent, pi_id);
         Ok(())
     }
+}
+
+/// Returns true if the entity name is one of the five XML builtin entities.
+fn is_builtin_entity(name: &str) -> bool {
+    matches!(name, "amp" | "lt" | "gt" | "apos" | "quot")
 }
 
 #[cfg(test)]
@@ -966,12 +1381,15 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The XML declaration prefix that `serialize()` always emits.
+    const DECL: &str = "<?xml version=\"1.0\"?>\n";
+
     #[test]
     fn test_roundtrip_simple() {
         let input = "<root><child>text</child></root>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(output, format!("{DECL}{input}\n"));
     }
 
     #[test]
@@ -979,7 +1397,7 @@ mod tests {
         let input = "<root attr=\"value\"><child id=\"1\"/></root>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(output, format!("{DECL}{input}\n"));
     }
 
     #[test]
@@ -989,7 +1407,7 @@ mod tests {
         let output = crate::serial::serialize(&doc);
         // After parsing, entities are resolved to characters.
         // Serialization re-escapes them.
-        assert_eq!(output, "<root>&amp; &lt; &gt;</root>");
+        assert_eq!(output, format!("{DECL}<root>&amp; &lt; &gt;</root>\n"));
     }
 
     #[test]
@@ -997,7 +1415,7 @@ mod tests {
         let input = "<root><!-- comment --></root>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(output, format!("{DECL}{input}\n"));
     }
 
     #[test]
@@ -1005,7 +1423,7 @@ mod tests {
         let input = "<root><![CDATA[data & stuff]]></root>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(output, format!("{DECL}{input}\n"));
     }
 
     #[test]
@@ -1013,7 +1431,7 @@ mod tests {
         let input = "<?target data?><root/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(output, format!("{DECL}{input}\n"));
     }
 
     #[test]
@@ -1021,7 +1439,10 @@ mod tests {
         let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(
+            output,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root/>\n"
+        );
     }
 
     #[test]
@@ -1062,6 +1483,7 @@ mod tests {
                 name,
                 system_id,
                 public_id,
+                ..
             } => {
                 assert_eq!(name, "html");
                 assert_eq!(*system_id, None);
@@ -1085,6 +1507,7 @@ mod tests {
                 name,
                 system_id,
                 public_id,
+                ..
             } => {
                 assert_eq!(name, "root");
                 assert_eq!(system_id.as_deref(), Some("root.dtd"));
@@ -1109,6 +1532,7 @@ mod tests {
                 name,
                 system_id,
                 public_id,
+                ..
             } => {
                 assert_eq!(name, "html");
                 assert_eq!(public_id.as_deref(), Some("-//W3C//DTD XHTML 1.0//EN"));
@@ -1133,6 +1557,7 @@ mod tests {
                 name,
                 system_id,
                 public_id,
+                ..
             } => {
                 assert_eq!(name, "root");
                 assert_eq!(*system_id, None);
@@ -1198,24 +1623,33 @@ mod tests {
 
     #[test]
     fn test_roundtrip_doctype() {
-        // Simple DOCTYPE
+        // Simple DOCTYPE (no whitespace between DOCTYPE and root in input)
         let input = "<!DOCTYPE html><html/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(output, format!("{DECL}<!DOCTYPE html><html/>\n"));
 
         // DOCTYPE with SYSTEM
         let input = "<!DOCTYPE root SYSTEM \"root.dtd\"><root/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(
+            output,
+            format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\"><root/>\n")
+        );
 
         // DOCTYPE with PUBLIC
         let input = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
                       \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, input);
+        assert_eq!(
+            output,
+            format!(
+                "{DECL}<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
+                 \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>\n"
+            )
+        );
     }
 
     // --- Namespace resolution tests ---

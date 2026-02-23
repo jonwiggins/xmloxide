@@ -1,0 +1,128 @@
+//! Document parsing and lifecycle FFI functions.
+#![allow(unsafe_code, clippy::missing_safety_doc)]
+
+use std::ffi::CStr;
+use std::os::raw::c_char;
+
+use crate::tree::Document;
+
+use super::strings::to_c_string;
+use super::{clear_last_error, set_last_error};
+
+/// Parses a null-terminated UTF-8 XML string into a document.
+///
+/// Returns a pointer to the document on success, or null on failure.
+/// On failure, call [`xmloxide_last_error`](super::xmloxide_last_error) for details.
+///
+/// The returned document must be freed with [`xmloxide_free_doc`].
+///
+/// # Safety
+///
+/// `input` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_parse_str(input: *const c_char) -> *mut Document {
+    clear_last_error();
+    if input.is_null() {
+        set_last_error("null input pointer");
+        return std::ptr::null_mut();
+    }
+    let c_str = unsafe { CStr::from_ptr(input) };
+    let s = match c_str.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(&format!("invalid UTF-8: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    match Document::parse_str(s) {
+        Ok(doc) => Box::into_raw(Box::new(doc)),
+        Err(e) => {
+            set_last_error(&e.message);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Parses raw bytes as XML, with automatic encoding detection.
+///
+/// Returns a pointer to the document on success, or null on failure.
+/// On failure, call [`xmloxide_last_error`](super::xmloxide_last_error) for details.
+///
+/// The returned document must be freed with [`xmloxide_free_doc`].
+///
+/// # Safety
+///
+/// `data` must point to `len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_parse_bytes(data: *const u8, len: usize) -> *mut Document {
+    clear_last_error();
+    if data.is_null() {
+        set_last_error("null data pointer");
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    match Document::parse_bytes(bytes) {
+        Ok(doc) => Box::into_raw(Box::new(doc)),
+        Err(e) => {
+            set_last_error(&e.message);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Frees a document previously returned by a parse function.
+///
+/// Passing null is safe and does nothing.
+///
+/// # Safety
+///
+/// `doc` must have been returned by `xmloxide_parse_str` or
+/// `xmloxide_parse_bytes`, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_free_doc(doc: *mut Document) {
+    if !doc.is_null() {
+        unsafe {
+            drop(Box::from_raw(doc));
+        }
+    }
+}
+
+/// Returns the XML version string from the document's XML declaration.
+///
+/// Returns null if no version was declared. The returned string must
+/// be freed with [`xmloxide_free_string`](super::strings::xmloxide_free_string).
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_doc_version(doc: *const Document) -> *mut c_char {
+    if doc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let doc = unsafe { &*doc };
+    match &doc.version {
+        Some(v) => to_c_string(v),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the encoding string from the document's XML declaration.
+///
+/// Returns null if no encoding was declared. The returned string must
+/// be freed with [`xmloxide_free_string`](super::strings::xmloxide_free_string).
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_doc_encoding(doc: *const Document) -> *mut c_char {
+    if doc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let doc = unsafe { &*doc };
+    match &doc.encoding {
+        Some(e) => to_c_string(e),
+        None => std::ptr::null_mut(),
+    }
+}

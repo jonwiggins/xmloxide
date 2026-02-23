@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Example Blog</title>
+  <link href="http://example.com/"/>
+  <link rel="self" href="http://example.com/feed.xml"/>
+  <updated>2024-12-01T12:00:00Z</updated>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <author>
+    <name>Jane Doe</name>
+    <email>jane@example.com</email>
+    <uri>http://example.com/~jane</uri>
+  </author>
+  <generator version="1.0" uri="http://example.com/gen">BlogEngine</generator>
+  <category term="tech"/>
+  <category term="rust"/>
+  <subtitle>A blog about programming and technology</subtitle>
+  <icon>http://example.com/favicon.ico</icon>
+  <logo>http://example.com/logo.png</logo>
+  <rights>Copyright (c) 2024, Jane Doe</rights>
+
+  <entry>
+    <title>Getting Started with Rust</title>
+    <link href="http://example.com/posts/rust-intro"/>
+    <link rel="alternate" type="text/html" href="http://example.com/posts/rust-intro.html"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+    <updated>2024-11-15T18:30:00Z</updated>
+    <published>2024-11-15T18:30:00Z</published>
+    <summary>An introduction to the Rust programming language, covering ownership, borrowing, and lifetimes.</summary>
+    <content type="html">&lt;p&gt;Rust is a systems programming language that runs blazingly fast, prevents segfaults, and guarantees thread safety.&lt;/p&gt;&lt;p&gt;In this post, we will explore the core concepts that make Rust unique among modern programming languages.&lt;/p&gt;</content>
+    <category term="rust"/>
+    <category term="programming"/>
+    <author>
+      <name>Jane Doe</name>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Understanding XML Parsing</title>
+    <link href="http://example.com/posts/xml-parsing"/>
+    <id>urn:uuid:2225c695-cfb8-4ebb-bbbb-80da344efa6b</id>
+    <updated>2024-11-20T10:00:00Z</updated>
+    <published>2024-11-20T10:00:00Z</published>
+    <summary>Deep dive into XML parsing techniques including DOM, SAX, and pull parsing approaches.</summary>
+    <content type="html">&lt;p&gt;XML parsing is a fundamental operation in many software systems. There are several approaches to parsing XML, each with its own trade-offs.&lt;/p&gt;&lt;p&gt;DOM parsers build an in-memory tree representation, SAX parsers emit events, and pull parsers let the consumer drive the process.&lt;/p&gt;</content>
+    <category term="xml"/>
+    <category term="parsing"/>
+  </entry>
+
+  <entry>
+    <title>Memory Safety in Systems Programming</title>
+    <link href="http://example.com/posts/memory-safety"/>
+    <id>urn:uuid:3325c695-cfb8-4ebb-cccc-80da344efa6c</id>
+    <updated>2024-11-25T14:00:00Z</updated>
+    <published>2024-11-25T14:00:00Z</published>
+    <summary>Exploring how modern languages approach memory safety without garbage collection overhead.</summary>
+    <content type="html">&lt;p&gt;Memory safety bugs are one of the most common sources of security vulnerabilities. Languages like Rust, Swift, and modern C++ offer different approaches to preventing these issues at compile time.&lt;/p&gt;</content>
+    <category term="systems"/>
+    <category term="safety"/>
+    <author>
+      <name>John Smith</name>
+      <email>john@example.com</email>
+    </author>
+  </entry>
+
+  <entry>
+    <title>Building High-Performance Parsers</title>
+    <link href="http://example.com/posts/fast-parsers"/>
+    <id>urn:uuid:4425c695-cfb8-4ebb-dddd-80da344efa6d</id>
+    <updated>2024-12-01T12:00:00Z</updated>
+    <published>2024-12-01T12:00:00Z</published>
+    <summary>Techniques for building parsers that can process gigabytes of data per second.</summary>
+    <content type="html">&lt;p&gt;Parser performance matters when processing large datasets. Techniques like SIMD-accelerated scanning, arena allocation, and string interning can dramatically improve throughput.&lt;/p&gt;&lt;p&gt;This post examines real-world benchmarks comparing different parser architectures and the performance characteristics of each approach.&lt;/p&gt;</content>
+    <category term="performance"/>
+    <category term="parsing"/>
+  </entry>
+
+  <entry>
+    <title>The State of XML in 2024</title>
+    <link href="http://example.com/posts/xml-2024"/>
+    <id>urn:uuid:5525c695-cfb8-4ebb-eeee-80da344efa6e</id>
+    <updated>2024-12-01T12:00:00Z</updated>
+    <published>2024-12-01T12:00:00Z</published>
+    <summary>Despite JSON's popularity, XML remains crucial in enterprise systems, document processing, and configuration.</summary>
+    <content type="html">&lt;p&gt;XML continues to be widely used across industries. From SOAP web services to office document formats (OOXML, ODF), from SVG graphics to Maven build files, XML is everywhere.&lt;/p&gt;&lt;p&gt;This post surveys the current XML ecosystem and discusses why having robust, secure XML parsing libraries remains important.&lt;/p&gt;</content>
+    <category term="xml"/>
+    <category term="industry"/>
+  </entry>
+</feed>

@@ -151,6 +151,7 @@ impl<'a, 'h> SaxParser<'a, 'h> {
         pi.set_max_depth(options.max_depth);
         pi.set_max_name_length(options.max_name_length);
         pi.set_max_entity_expansions(options.max_entity_expansions);
+        pi.set_entity_resolver(options.entity_resolver.clone());
 
         Self {
             input: pi,
@@ -299,11 +300,24 @@ impl<'a, 'h> SaxParser<'a, 'h> {
                 }
                 if let Ok(dtd) = crate::validation::dtd::parse_dtd(&subset_text) {
                     for (ent_name, ent_decl) in &dtd.entities {
-                        if let crate::validation::dtd::EntityKind::Internal(value) = &ent_decl.kind
-                        {
-                            self.input
-                                .entity_map
-                                .insert(ent_name.clone(), value.clone());
+                        match &ent_decl.kind {
+                            crate::validation::dtd::EntityKind::Internal(value) => {
+                                self.input
+                                    .entity_map
+                                    .insert(ent_name.clone(), value.clone());
+                            }
+                            crate::validation::dtd::EntityKind::External {
+                                system_id,
+                                public_id,
+                            } => {
+                                self.input.entity_external.insert(
+                                    ent_name.clone(),
+                                    crate::parser::input::ExternalEntityInfo {
+                                        system_id: system_id.clone(),
+                                        public_id: public_id.clone(),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -451,6 +465,34 @@ impl<'a, 'h> SaxParser<'a, 'h> {
     fn parse_char_data(&mut self) -> Result<(), ParseError> {
         let mut text = String::new();
         while !self.input.at_end() {
+            // Bulk scan: find the next `<`, `&`, or `]]>` boundary
+            let safe_len = self.input.scan_char_data();
+            if safe_len > 0 {
+                let start = self.input.pos();
+                let chunk_bytes = self.input.slice(start, start + safe_len);
+                if chunk_bytes.contains(&b'\r') {
+                    let chunk = std::str::from_utf8(chunk_bytes)
+                        .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                    let mut chars = chunk.chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\r' {
+                            if chars.peek() == Some(&'\n') {
+                                chars.next();
+                            }
+                            text.push('\n');
+                        } else {
+                            text.push(ch);
+                        }
+                    }
+                } else {
+                    let chunk = std::str::from_utf8(chunk_bytes)
+                        .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                    text.push_str(chunk);
+                }
+                self.input.advance_counting_lines(safe_len);
+                continue;
+            }
+
             if self.input.peek() == Some(b'<') {
                 break;
             }
@@ -470,8 +512,7 @@ impl<'a, 'h> SaxParser<'a, 'h> {
             }
 
             if self.input.peek() == Some(b'&') {
-                let resolved = self.input.parse_reference()?;
-                text.push_str(&resolved);
+                self.input.parse_reference_into(&mut text)?;
             } else {
                 let ch = self.input.next_char()?;
                 text.push(ch);

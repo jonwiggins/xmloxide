@@ -57,6 +57,8 @@ pub enum NodeKind {
     EntityRef {
         /// The entity name (without `&` and `;`).
         name: String,
+        /// The expanded value of the entity (used for `text_content()`).
+        value: Option<String>,
     },
 
     /// A document type declaration node, e.g., `<!DOCTYPE html>`.
@@ -69,5 +71,7 @@ pub enum NodeKind {
         system_id: Option<String>,
         /// The PUBLIC identifier, if any.
         public_id: Option<String>,
+        /// The serialized internal subset content (between `[` and `]`), if any.
+        internal_subset: Option<String>,
     },
 }
