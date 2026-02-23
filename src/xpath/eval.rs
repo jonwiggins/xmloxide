@@ -22,7 +22,7 @@
 //! All 27 core `XPath` 1.0 functions are implemented (node-set, string,
 //! boolean, and number function groups).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ast::{Axis, BinaryOp, Expr, NodeTest, Step};
 use super::types::XPathError;
@@ -273,11 +273,12 @@ impl<'a> XPathContext<'a> {
     /// set in document order with duplicates removed.
     fn apply_step(&self, input: &[NodeId], step: &Step) -> Result<Vec<NodeId>, XPathError> {
         let mut result: Vec<NodeId> = Vec::new();
+        let mut seen = HashSet::new();
         for &node in input {
             let axis_nodes = self.expand_axis(node, step.axis);
             let filtered = self.apply_node_test(&axis_nodes, &step.node_test, step.axis, node);
             for id in filtered {
-                if !result.contains(&id) {
+                if seen.insert(id) {
                     result.push(id);
                 }
             }
@@ -288,8 +289,20 @@ impl<'a> XPathContext<'a> {
             result = self.apply_predicate(&result, pred)?;
         }
 
-        // Sort into document order
-        sort_document_order(&mut result);
+        // Sort into document order. Skip for axes that naturally produce
+        // document-order results when input is already ordered (the common case).
+        let needs_sort = !matches!(
+            step.axis,
+            Axis::Child
+                | Axis::Descendant
+                | Axis::DescendantOrSelf
+                | Axis::Self_
+                | Axis::Following
+                | Axis::FollowingSibling
+        );
+        if needs_sort {
+            sort_document_order(&mut result);
+        }
 
         Ok(result)
     }
@@ -545,7 +558,12 @@ impl<'a> XPathContext<'a> {
                 context_node: node,
                 context_position: i + 1, // 1-based
                 context_size: size,
-                variables: self.variables.clone(),
+                // Avoid cloning the HashMap when it's empty (the common case).
+                variables: if self.variables.is_empty() {
+                    HashMap::new()
+                } else {
+                    self.variables.clone()
+                },
             };
             let val = ctx.eval_expr(predicate)?;
             let keep = match &val {
@@ -616,8 +634,9 @@ impl<'a> XPathContext<'a> {
         };
 
         // Merge, dedup, sort
+        let seen: HashSet<NodeId> = lnodes.iter().copied().collect();
         for id in rnodes {
-            if !lnodes.contains(&id) {
+            if !seen.contains(&id) {
                 lnodes.push(id);
             }
         }

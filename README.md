@@ -169,7 +169,17 @@ cargo test --all-features
 
 ## C/C++ FFI
 
-xmloxide provides a C-compatible API for embedding in C/C++ projects (like Chromium, game engines, or any codebase that currently uses libxml2). The library builds as both a `cdylib` and `staticlib`.
+xmloxide provides a C-compatible API for embedding in C/C++ projects (like Chromium, game engines, or any codebase that currently uses libxml2).
+
+To build the C library, temporarily set `crate-type = ["cdylib", "staticlib"]` in `Cargo.toml`'s `[lib]` section, or build directly:
+
+```sh
+# Shared library (.so / .dylib / .dll)
+cargo rustc --lib --release -- --crate-type cdylib
+
+# Static library (.a / .lib)
+cargo rustc --lib --release -- --crate-type staticlib
+```
 
 ```c
 #include "xmloxide.h"

@@ -48,7 +48,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [lib]
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib"]
 
 [[bin]]
 name = "xmllint"
