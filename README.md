@@ -1,5 +1,11 @@
 # xmloxide
 
+[![CI](https://github.com/jonwiggins/xmloxide/actions/workflows/ci.yml/badge.svg)](https://github.com/jonwiggins/xmloxide/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/xmloxide.svg)](https://crates.io/crates/xmloxide)
+[![docs.rs](https://docs.rs/xmloxide/badge.svg)](https://docs.rs/xmloxide)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.81-blue.svg)](https://www.rust-lang.org)
+
 A pure Rust reimplementation of [libxml2](https://gitlab.gnome.org/GNOME/libxml2) — the de facto standard XML/HTML parsing library in the open-source world.
 
 libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide aims to be a memory-safe, high-performance replacement that passes the same conformance test suites.
