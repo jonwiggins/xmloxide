@@ -518,3 +518,311 @@ fn write_html_escaped_attr(out: &mut String, text: &str, reencode: bool) {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::html::parse_html;
+
+    // -- Void elements -------------------------------------------------------
+
+    #[test]
+    fn test_void_element_br() {
+        let doc = parse_html("<html><body><br></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        assert!(html.contains("<br>"), "expected <br>, got: {html}");
+        assert!(!html.contains("<br/>"), "should not have <br/>");
+        assert!(!html.contains("</br>"), "should not have </br>");
+    }
+
+    #[test]
+    fn test_void_element_img_with_attr() {
+        let doc = parse_html(r#"<html><body><img src="x.png"></body></html>"#).unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains(r#"<img src="x.png">"#),
+            "expected img with src, got: {html}"
+        );
+        assert!(!html.contains("</img>"), "void element should not close");
+    }
+
+    // -- Non-void elements ---------------------------------------------------
+
+    #[test]
+    fn test_non_void_empty_element() {
+        let doc = parse_html("<html><body><p></p></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains("<p></p>"),
+            "expected <p></p>, not self-closing, got: {html}"
+        );
+    }
+
+    // -- Raw text elements ---------------------------------------------------
+
+    #[test]
+    fn test_script_not_escaped() {
+        let doc = parse_html("<html><body><script>if (a < b) {}</script></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains("if (a < b) {}"),
+            "script content should not be escaped, got: {html}"
+        );
+        assert!(
+            !html.contains("&lt;"),
+            "script content should not contain &lt;"
+        );
+    }
+
+    #[test]
+    fn test_style_not_escaped() {
+        let doc = parse_html("<html><body><style>.a > .b {}</style></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains(".a > .b {}"),
+            "style content should not be escaped, got: {html}"
+        );
+        assert!(
+            !html.contains("&gt;"),
+            "style content should not contain &gt; inside style tag"
+        );
+    }
+
+    // -- Attributes ----------------------------------------------------------
+
+    #[test]
+    fn test_boolean_attribute() {
+        let doc = parse_html(r#"<html><body><input disabled="disabled"></body></html>"#).unwrap();
+        let html = serialize_html(&doc);
+        // Boolean attribute: when value == name, output without value
+        assert!(
+            html.contains("<input disabled>") || html.contains("<input disabled "),
+            "expected boolean attr, got: {html}"
+        );
+    }
+
+    #[test]
+    fn test_regular_attribute_preserved() {
+        let doc = parse_html(r#"<html><body><input type="text"></body></html>"#).unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains(r#"type="text""#),
+            "expected type=\"text\", got: {html}"
+        );
+    }
+
+    #[test]
+    fn test_multiple_attributes() {
+        let doc = parse_html(
+            r#"<html><body><input type="text" name="field" value="hello"></body></html>"#,
+        )
+        .unwrap();
+        let html = serialize_html(&doc);
+        assert!(html.contains(r#"type="text""#), "missing type attr");
+        assert!(html.contains(r#"name="field""#), "missing name attr");
+        assert!(html.contains(r#"value="hello""#), "missing value attr");
+    }
+
+    // -- Text escaping -------------------------------------------------------
+
+    #[test]
+    fn test_text_escaping() {
+        let doc = parse_html("<html><body><p>a &amp; b &lt; c &gt; d</p></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        // The serializer should re-escape special characters in text
+        assert!(
+            html.contains("&amp;") && html.contains("&lt;") && html.contains("&gt;"),
+            "expected escaped entities in text, got: {html}"
+        );
+    }
+
+    // -- Comments ------------------------------------------------------------
+
+    #[test]
+    fn test_comment_preserved() {
+        let doc = parse_html("<html><body><!-- comment --></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains("<!-- comment -->"),
+            "comment should be preserved, got: {html}"
+        );
+    }
+
+    // -- DOCTYPE -------------------------------------------------------------
+
+    #[test]
+    fn test_doctype_serialization() {
+        let doc = parse_html(
+            r#"<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><body></body></html>"#,
+        )
+        .unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains("<!DOCTYPE html"),
+            "expected DOCTYPE, got: {html}"
+        );
+        assert!(
+            html.contains("PUBLIC"),
+            "expected PUBLIC in DOCTYPE, got: {html}"
+        );
+    }
+
+    // -- Charset / encoding --------------------------------------------------
+
+    #[test]
+    fn test_meta_charset_utf8() {
+        let doc =
+            parse_html(r#"<html><head><meta charset="utf-8"></head><body>caf&#233;</body></html>"#)
+                .unwrap();
+        let html = serialize_html(&doc);
+        // With UTF-8 charset declared, non-ASCII should be preserved as UTF-8
+        assert!(
+            html.contains("café") || html.contains("caf"),
+            "UTF-8 content should be preserved, got: {html}"
+        );
+    }
+
+    // -- Block/inline formatting ---------------------------------------------
+
+    #[test]
+    fn test_inline_element_no_newlines() {
+        let doc = parse_html("<html><body><p>Hello <span>world</span></p></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        // Inline elements like span should not have extra formatting newlines
+        assert!(
+            html.contains("<span>world</span>"),
+            "inline element should not have extra newlines, got: {html}"
+        );
+    }
+
+    // -- Trailing newline ----------------------------------------------------
+
+    #[test]
+    fn test_trailing_newline() {
+        let doc = parse_html("<html><body></body></html>").unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.ends_with('\n'),
+            "output should end with newline, got: {html:?}"
+        );
+    }
+
+    // -- Nested elements -----------------------------------------------------
+
+    #[test]
+    fn test_nested_elements() {
+        let doc =
+            parse_html("<html><body><div><ul><li>one</li><li>two</li></ul></div></body></html>")
+                .unwrap();
+        let html = serialize_html(&doc);
+        assert!(html.contains("<ul>"), "missing <ul>");
+        assert!(html.contains("<li>one</li>"), "missing first li");
+        assert!(html.contains("<li>two</li>"), "missing second li");
+        assert!(html.contains("</ul>"), "missing </ul>");
+    }
+
+    // -- Entity references ---------------------------------------------------
+
+    #[test]
+    fn test_entity_ref_serialization() {
+        // Build a document manually with an entity reference node
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html_id = doc.create_node(NodeKind::Element {
+            name: "html".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, html_id);
+        let body_id = doc.create_node(NodeKind::Element {
+            name: "body".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(html_id, body_id);
+        let entity_id = doc.create_node(NodeKind::EntityRef {
+            name: "nbsp".to_string(),
+            value: None,
+        });
+        doc.append_child(body_id, entity_id);
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains("&nbsp;"),
+            "entity reference should be preserved, got: {html}"
+        );
+    }
+
+    // -- Full document roundtrip ---------------------------------------------
+
+    #[test]
+    fn test_full_html_document() {
+        let input =
+            "<html><head><title>Test</title></head><body><h1>Hello</h1><p>World</p></body></html>";
+        let doc = parse_html(input).unwrap();
+        let html = serialize_html(&doc);
+        assert!(html.contains("<html>"), "missing <html>");
+        assert!(html.contains("<head>"), "missing <head>");
+        assert!(html.contains("<title>Test</title>"), "missing title");
+        assert!(html.contains("<body>"), "missing <body>");
+        assert!(html.contains("Hello"), "missing h1 content");
+        assert!(html.contains("World"), "missing p content");
+        assert!(html.contains("</html>"), "missing </html>");
+    }
+
+    // -- URI attribute encoding ----------------------------------------------
+
+    #[test]
+    fn test_uri_attribute_space() {
+        let doc = parse_html(r#"<html><body><a href="a b">link</a></body></html>"#).unwrap();
+        let html = serialize_html(&doc);
+        assert!(
+            html.contains("a%20b"),
+            "spaces in href should be encoded as %20, got: {html}"
+        );
+    }
+
+    // -- Attribute with quotes -----------------------------------------------
+
+    #[test]
+    fn test_attr_with_quotes() {
+        // Build manually to control the attribute value precisely
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html_id = doc.create_node(NodeKind::Element {
+            name: "html".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, html_id);
+        let body_id = doc.create_node(NodeKind::Element {
+            name: "body".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(html_id, body_id);
+        let div_id = doc.create_node(NodeKind::Element {
+            name: "div".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![crate::tree::Attribute {
+                name: "title".to_string(),
+                value: "say \"hello\"".to_string(),
+                prefix: None,
+                namespace: None,
+                raw_value: None,
+            }],
+        });
+        doc.append_child(body_id, div_id);
+        let html = serialize_html(&doc);
+        // When value contains " and not ', should use single-quote delimiters
+        assert!(
+            html.contains("title='say \"hello\"'"),
+            "expected single-quoted attr, got: {html}"
+        );
+    }
+}

@@ -2202,11 +2202,11 @@ fn is_name_char(c: char) -> bool {
 /// use xmloxide::validation::dtd::{parse_dtd, validate};
 ///
 /// let dtd = parse_dtd("<!ELEMENT root (#PCDATA)>").unwrap();
-/// let doc = Document::parse_str("<!DOCTYPE root><root>hello</root>").unwrap();
-/// let result = validate(&doc, &dtd);
+/// let mut doc = Document::parse_str("<!DOCTYPE root><root>hello</root>").unwrap();
+/// let result = validate(&mut doc, &dtd);
 /// assert!(result.is_valid);
 /// ```
-pub fn validate(doc: &Document, dtd: &Dtd) -> ValidationResult {
+pub fn validate(doc: &mut Document, dtd: &Dtd) -> ValidationResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut id_values: HashSet<String> = HashSet::new();
@@ -2279,7 +2279,7 @@ fn check_root_element(doc: &Document, _dtd: &Dtd, errors: &mut Vec<ValidationErr
 /// Recursively validates an element and its descendants.
 #[allow(clippy::too_many_arguments)]
 fn validate_element_recursive(
-    doc: &Document,
+    doc: &mut Document,
     dtd: &Dtd,
     node_id: NodeId,
     errors: &mut Vec<ValidationError>,
@@ -2319,19 +2319,23 @@ fn validate_element_recursive(
         idref_values,
     );
 
+    // Collect child element IDs first to avoid borrow conflicts
+    let child_ids: Vec<NodeId> = doc
+        .children(node_id)
+        .filter(|&child_id| matches!(doc.node(child_id).kind, NodeKind::Element { .. }))
+        .collect();
+
     // Recurse into child elements
-    for child_id in doc.children(node_id) {
-        if matches!(doc.node(child_id).kind, NodeKind::Element { .. }) {
-            validate_element_recursive(
-                doc,
-                dtd,
-                child_id,
-                errors,
-                warnings,
-                id_values,
-                idref_values,
-            );
-        }
+    for child_id in child_ids {
+        validate_element_recursive(
+            doc,
+            dtd,
+            child_id,
+            errors,
+            warnings,
+            id_values,
+            idref_values,
+        );
     }
 }
 
@@ -2530,7 +2534,7 @@ fn match_with_occurrence(
 /// Validates attributes for an element against DTD attribute declarations.
 #[allow(clippy::too_many_arguments)]
 fn validate_attributes(
-    doc: &Document,
+    doc: &mut Document,
     dtd: &Dtd,
     node_id: NodeId,
     elem_name: &str,
@@ -2540,7 +2544,7 @@ fn validate_attributes(
     idref_values: &mut Vec<String>,
 ) {
     let attr_decls = dtd.attributes.get(elem_name);
-    let actual_attrs = doc.attributes(node_id);
+    let actual_attrs = doc.attributes(node_id).to_vec();
 
     if let Some(decls) = attr_decls {
         // Check each declared attribute
@@ -2577,6 +2581,8 @@ fn validate_attributes(
             // Type checking for present attributes
             if let Some(attr) = actual {
                 validate_attribute_type(
+                    doc,
+                    node_id,
                     &attr.value,
                     &decl.attribute_type,
                     &decl.attribute_name,
@@ -2589,7 +2595,7 @@ fn validate_attributes(
         }
 
         // Check for undeclared attributes (skip xmlns-related attributes)
-        for attr in actual_attrs {
+        for attr in &actual_attrs {
             if attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns") {
                 continue;
             }
@@ -2611,6 +2617,8 @@ fn validate_attributes(
 /// Validates an attribute value against its declared type.
 #[allow(clippy::too_many_arguments)]
 fn validate_attribute_type(
+    doc: &mut Document,
+    node_id: NodeId,
     value: &str,
     attr_type: &AttributeType,
     attr_name: &str,
@@ -2624,7 +2632,7 @@ fn validate_attribute_type(
             // Any string is valid CDATA
         }
         AttributeType::Id => {
-            validate_id_value(value, attr_name, elem_name, errors, id_values);
+            validate_id_value(doc, node_id, value, attr_name, elem_name, errors, id_values);
         }
         AttributeType::IdRef => {
             validate_idref_value(value, attr_name, elem_name, errors, idref_values);
@@ -2648,7 +2656,12 @@ fn validate_attribute_type(
 }
 
 /// Validates an ID attribute value: must be a valid XML Name and unique.
+///
+/// On success, registers the ID in the document's `id_map` so it can be
+/// looked up via [`Document::element_by_id`] and the `XPath` `id()` function.
 fn validate_id_value(
+    doc: &mut Document,
+    node_id: NodeId,
     value: &str,
     attr_name: &str,
     elem_name: &str,
@@ -2673,6 +2686,8 @@ fn validate_id_value(
             line: None,
             column: None,
         });
+    } else {
+        doc.set_id(value, node_id);
     }
 }
 
@@ -3071,16 +3086,16 @@ mod tests {
     #[test]
     fn test_validate_valid_document() {
         let dtd = parse_dtd("<!ELEMENT root (#PCDATA)>").unwrap();
-        let doc = make_doc("<!DOCTYPE root><root>hello</root>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE root><root>hello</root>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
     #[test]
     fn test_validate_root_name_mismatch() {
         let dtd = parse_dtd("<!ELEMENT root (#PCDATA)>").unwrap();
-        let doc = make_doc("<!DOCTYPE root><other>text</other>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE root><other>text</other>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3096,16 +3111,16 @@ mod tests {
     #[test]
     fn test_validate_empty_element() {
         let dtd = parse_dtd("<!ELEMENT br EMPTY>").unwrap();
-        let doc = make_doc("<!DOCTYPE br><br/>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE br><br/>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
     #[test]
     fn test_validate_empty_element_has_content() {
         let dtd = parse_dtd("<!ELEMENT br EMPTY>").unwrap();
-        let doc = make_doc("<!DOCTYPE br><br>text</br>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE br><br>text</br>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3124,8 +3139,8 @@ mod tests {
              <!ELEMENT child (#PCDATA)>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE container><container><child>text</child></container>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE container><container><child>text</child></container>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3137,11 +3152,11 @@ mod tests {
              <!ELEMENT author (#PCDATA)>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE book>\
              <book><title>XML</title><author>Jon</author></book>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3153,11 +3168,11 @@ mod tests {
              <!ELEMENT author (#PCDATA)>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE book>\
              <book><author>Jon</author><title>XML</title></book>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3176,8 +3191,8 @@ mod tests {
              <!ATTLIST img src CDATA #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE img><img/>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE img><img/>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3196,8 +3211,8 @@ mod tests {
              <!ATTLIST img src CDATA #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE img><img src=\"photo.jpg\"/>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE img><img src=\"photo.jpg\"/>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3208,8 +3223,8 @@ mod tests {
              <!ATTLIST doc version CDATA #FIXED \"1.0\">",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE doc><doc version=\"1.0\">text</doc>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE doc><doc version=\"1.0\">text</doc>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3220,8 +3235,8 @@ mod tests {
              <!ATTLIST doc version CDATA #FIXED \"1.0\">",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE doc><doc version=\"2.0\">text</doc>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE doc><doc version=\"2.0\">text</doc>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3240,8 +3255,8 @@ mod tests {
              <!ATTLIST input type (text|password) #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE input><input type=\"text\"/>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE input><input type=\"text\"/>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3252,8 +3267,8 @@ mod tests {
              <!ATTLIST input type (text|password) #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE input><input type=\"checkbox\"/>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE input><input type=\"checkbox\"/>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3273,14 +3288,14 @@ mod tests {
              <!ATTLIST item id ID #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE root>\
              <root>\
                <item id=\"a\">first</item>\
                <item id=\"a\">second</item>\
              </root>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3302,14 +3317,14 @@ mod tests {
              <!ATTLIST ref target IDREF #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE root>\
              <root>\
                <item id=\"x\">item</item>\
                <ref target=\"x\">ref</ref>\
              </root>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3321,11 +3336,11 @@ mod tests {
              <!ATTLIST ref target IDREF #REQUIRED>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE root>\
              <root><ref target=\"nonexistent\">ref</ref></root>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result.errors.iter().any(|e| e
@@ -3339,8 +3354,8 @@ mod tests {
     #[test]
     fn test_validate_undeclared_element() {
         let dtd = parse_dtd("<!ELEMENT root (child)>\n<!ELEMENT child (#PCDATA)>").unwrap();
-        let doc = make_doc("<!DOCTYPE root><root><unknown/></root>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE root><root><unknown/></root>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3359,8 +3374,8 @@ mod tests {
              <!ATTLIST root id ID #IMPLIED>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE root><root id=\"x\" bogus=\"y\">text</root>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE root><root id=\"x\" bogus=\"y\">text</root>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3381,11 +3396,11 @@ mod tests {
              <!ELEMENT strong (#PCDATA)>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE p>\
              <p>Hello <em>world</em> and <strong>friends</strong></p>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3397,11 +3412,11 @@ mod tests {
              <!ELEMENT b (#PCDATA)>",
         )
         .unwrap();
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE p>\
              <p>Hello <b>world</b></p>",
         );
-        let result = validate(&doc, &dtd);
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3421,8 +3436,8 @@ mod tests {
              <!ELEMENT b (#PCDATA)>",
         )
         .unwrap();
-        let doc = make_doc("<!DOCTYPE item><item><b>hello</b></item>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE item><item><b>hello</b></item>");
+        let result = validate(&mut doc, &dtd);
         assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 
@@ -3431,16 +3446,16 @@ mod tests {
         let dtd = parse_dtd("<!ELEMENT list (item+)>\n<!ELEMENT item (#PCDATA)>").unwrap();
 
         // Valid: one item
-        let doc = make_doc("<!DOCTYPE list><list><item>a</item></list>");
-        assert!(validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE list><list><item>a</item></list>");
+        assert!(validate(&mut doc, &dtd).is_valid);
 
         // Valid: multiple items
-        let doc = make_doc("<!DOCTYPE list><list><item>a</item><item>b</item></list>");
-        assert!(validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE list><list><item>a</item><item>b</item></list>");
+        assert!(validate(&mut doc, &dtd).is_valid);
 
         // Invalid: zero items
-        let doc = make_doc("<!DOCTYPE list><list></list>");
-        assert!(!validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE list><list></list>");
+        assert!(!validate(&mut doc, &dtd).is_valid);
     }
 
     #[test]
@@ -3448,12 +3463,12 @@ mod tests {
         let dtd = parse_dtd("<!ELEMENT list (item*)>\n<!ELEMENT item (#PCDATA)>").unwrap();
 
         // Valid: zero items
-        let doc = make_doc("<!DOCTYPE list><list></list>");
-        assert!(validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE list><list></list>");
+        assert!(validate(&mut doc, &dtd).is_valid);
 
         // Valid: multiple items
-        let doc = make_doc("<!DOCTYPE list><list><item>a</item><item>b</item></list>");
-        assert!(validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE list><list><item>a</item><item>b</item></list>");
+        assert!(validate(&mut doc, &dtd).is_valid);
     }
 
     #[test]
@@ -3466,15 +3481,15 @@ mod tests {
         .unwrap();
 
         // Valid: with optional
-        let doc = make_doc(
+        let mut doc = make_doc(
             "<!DOCTYPE doc>\
              <doc><title>T</title><subtitle>S</subtitle></doc>",
         );
-        assert!(validate(&doc, &dtd).is_valid);
+        assert!(validate(&mut doc, &dtd).is_valid);
 
         // Valid: without optional
-        let doc = make_doc("<!DOCTYPE doc><doc><title>T</title></doc>");
-        assert!(validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE doc><doc><title>T</title></doc>");
+        assert!(validate(&mut doc, &dtd).is_valid);
     }
 
     #[test]
@@ -3519,8 +3534,8 @@ mod tests {
     #[test]
     fn test_validate_element_content_with_text() {
         let dtd = parse_dtd("<!ELEMENT book (title)>\n<!ELEMENT title (#PCDATA)>").unwrap();
-        let doc = make_doc("<!DOCTYPE book><book>stray text<title>T</title></book>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE book><book>stray text<title>T</title></book>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3577,12 +3592,12 @@ mod tests {
         .unwrap();
 
         // Valid NMTOKEN
-        let doc = make_doc("<!DOCTYPE root><root token=\"abc-123\">text</root>");
-        assert!(validate(&doc, &dtd).is_valid);
+        let mut doc = make_doc("<!DOCTYPE root><root token=\"abc-123\">text</root>");
+        assert!(validate(&mut doc, &dtd).is_valid);
 
         // Invalid NMTOKEN (spaces not allowed)
-        let doc = make_doc("<!DOCTYPE root><root token=\"abc 123\">text</root>");
-        let result = validate(&doc, &dtd);
+        let mut doc = make_doc("<!DOCTYPE root><root token=\"abc 123\">text</root>");
+        let result = validate(&mut doc, &dtd);
         assert!(!result.is_valid);
         assert!(
             result
@@ -3592,5 +3607,30 @@ mod tests {
             "errors: {:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn test_validate_populates_id_map() {
+        let dtd = parse_dtd(
+            "<!ELEMENT root (item*)>\n\
+             <!ELEMENT item (#PCDATA)>\n\
+             <!ATTLIST item id ID #REQUIRED>",
+        )
+        .unwrap();
+        let mut doc =
+            make_doc(r#"<!DOCTYPE root><root><item id="a">A</item><item id="b">B</item></root>"#);
+        let result = validate(&mut doc, &dtd);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        // The id_map should have been populated
+        let item_a = doc.element_by_id("a");
+        assert!(item_a.is_some(), "expected to find element with id='a'");
+        let item_b = doc.element_by_id("b");
+        assert!(item_b.is_some(), "expected to find element with id='b'");
+        assert_eq!(doc.element_by_id("c"), None);
+
+        // Verify the nodes are the correct elements
+        assert_eq!(doc.node_name(item_a.unwrap()), Some("item"));
+        assert_eq!(doc.node_name(item_b.unwrap()), Some("item"));
     }
 }

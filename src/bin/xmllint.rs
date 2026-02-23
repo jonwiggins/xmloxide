@@ -162,7 +162,7 @@ fn process_file(cli: &Cli, filename: &str) -> u8 {
         parse_as_xml(cli, &input)
     };
 
-    let doc = match doc {
+    let mut doc = match doc {
         Ok(d) => d,
         Err(msg) => {
             eprintln!("{filename}: {msg}");
@@ -185,14 +185,14 @@ fn process_file(cli: &Cli, filename: &str) -> u8 {
     let mut exit_code = EXIT_SUCCESS;
 
     if cli.valid {
-        let code = validate_dtd_internal(filename, &doc);
+        let code = validate_dtd_internal(filename, &mut doc);
         if code > exit_code {
             exit_code = code;
         }
     }
 
     if let Some(ref dtd_file) = cli.dtdvalid {
-        let code = validate_dtd_external(filename, &doc, dtd_file);
+        let code = validate_dtd_external(filename, &mut doc, dtd_file);
         if code > exit_code {
             exit_code = code;
         }
@@ -280,7 +280,7 @@ fn parse_as_html(cli: &Cli, input: &str) -> Result<Document, String> {
 // ---------------------------------------------------------------------------
 
 /// Validates a document against its internal DTD (--valid).
-fn validate_dtd_internal(filename: &str, doc: &Document) -> u8 {
+fn validate_dtd_internal(filename: &str, doc: &mut Document) -> u8 {
     let dtd_text = extract_internal_dtd_subset(doc);
     if dtd_text.is_empty() {
         eprintln!("{filename}: no DTD found for validation");
@@ -300,7 +300,7 @@ fn validate_dtd_internal(filename: &str, doc: &Document) -> u8 {
 }
 
 /// Validates a document against an external DTD file (--dtdvalid).
-fn validate_dtd_external(filename: &str, doc: &Document, dtd_file: &str) -> u8 {
+fn validate_dtd_external(filename: &str, doc: &mut Document, dtd_file: &str) -> u8 {
     let dtd_content = match fs::read_to_string(dtd_file) {
         Ok(content) => content,
         Err(e) => {

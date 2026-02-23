@@ -1420,6 +1420,41 @@ fn strip_timezone(value: &str) -> &str {
     value
 }
 
+/// Applies whitespace normalization to a value according to the XSD `whiteSpace` facet.
+///
+/// See XSD 1.0 section 4.3.6:
+/// - `Preserve`: no normalization
+/// - `Replace`: replace `\t`, `\n`, `\r` with space
+/// - `Collapse`: replace + collapse contiguous spaces + strip leading/trailing
+fn apply_whitespace_normalization(value: &str, ws: &WhiteSpaceValue) -> String {
+    match ws {
+        WhiteSpaceValue::Preserve => value.to_string(),
+        WhiteSpaceValue::Replace => value
+            .chars()
+            .map(|c| {
+                if matches!(c, '\t' | '\n' | '\r') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect(),
+        WhiteSpaceValue::Collapse => {
+            let replaced: String = value
+                .chars()
+                .map(|c| {
+                    if matches!(c, '\t' | '\n' | '\r') {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            replaced.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+    }
+}
+
 /// Validates facet constraints on a string value.
 fn validate_facets(
     value: &str,
@@ -1427,8 +1462,23 @@ fn validate_facets(
     context: &str,
     errors: &mut Vec<ValidationError>,
 ) {
+    // Find any WhiteSpace facet and normalize the value before checking other facets.
+    let normalized;
+    let effective_value = if let Some(ws) = facets.iter().find_map(|f| {
+        if let Facet::WhiteSpace(ws) = f {
+            Some(ws)
+        } else {
+            None
+        }
+    }) {
+        normalized = apply_whitespace_normalization(value, ws);
+        &normalized
+    } else {
+        value
+    };
+
     for facet in facets {
-        validate_single_facet(value, facet, context, errors);
+        validate_single_facet(effective_value, facet, context, errors);
     }
 }
 
@@ -2343,5 +2393,30 @@ mod tests {
             "<address><street>123 Main St</street><city>Springfield</city></address>",
         );
         assert!(r.is_valid, "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn test_whitespace_preserve() {
+        use super::apply_whitespace_normalization;
+        use super::WhiteSpaceValue;
+        let result = apply_whitespace_normalization("  hello\tworld\n", &WhiteSpaceValue::Preserve);
+        assert_eq!(result, "  hello\tworld\n");
+    }
+
+    #[test]
+    fn test_whitespace_replace() {
+        use super::apply_whitespace_normalization;
+        use super::WhiteSpaceValue;
+        let result = apply_whitespace_normalization("a\tb\nc\r", &WhiteSpaceValue::Replace);
+        assert_eq!(result, "a b c ");
+    }
+
+    #[test]
+    fn test_whitespace_collapse() {
+        use super::apply_whitespace_normalization;
+        use super::WhiteSpaceValue;
+        let result =
+            apply_whitespace_normalization("  hello \t world \n ", &WhiteSpaceValue::Collapse);
+        assert_eq!(result, "hello world");
     }
 }

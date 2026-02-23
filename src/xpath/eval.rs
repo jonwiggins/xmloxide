@@ -1094,15 +1094,37 @@ impl<'a> XPathContext<'a> {
         Ok(XPathValue::Number(xpath_round(n)))
     }
 
-    /// `id(object)` - stub implementation.
+    /// `id(object)` — selects elements by their ID attribute value.
     ///
-    /// The `id()` function requires DTD information to resolve ID attributes.
-    /// Since we don't have DTD validation yet, this returns an empty node-set.
+    /// When the argument is a node-set, the string-value of each node is used
+    /// as a whitespace-separated list of IDs. When the argument is any other
+    /// type, it is converted to a string and treated as a whitespace-separated
+    /// list of IDs. Returns the elements whose ID matches, in document order.
+    ///
+    /// See `XPath` 1.0 section 4.1.
     fn fn_id(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
         check_arg_count("id", args, 1)?;
-        // Evaluate the argument (to consume it) but return empty
-        let _val = self.eval_expr(&args[0])?;
-        Ok(XPathValue::NodeSet(Vec::new()))
+        let val = self.eval_expr(&args[0])?;
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        let id_strings: Vec<String> = match &val {
+            XPathValue::NodeSet(nodes) => nodes.iter().map(|&n| self.string_value(n)).collect(),
+            other => vec![self.value_to_string(other)],
+        };
+
+        for id_str in &id_strings {
+            for token in id_str.split_whitespace() {
+                if let Some(node) = self.doc.element_by_id(token) {
+                    if seen.insert(node) {
+                        result.push(node);
+                    }
+                }
+            }
+        }
+
+        sort_document_order(&mut result);
+        Ok(XPathValue::NodeSet(result))
     }
 
     // -----------------------------------------------------------------------
@@ -1828,6 +1850,71 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => assert_eq!(ns.len(), 2), // a and b
             _ => panic!("expected node-set"),
+        }
+    }
+
+    // -- id() function -------------------------------------------------------
+
+    #[test]
+    fn test_xpath_id_single() {
+        let mut doc = Document::parse_str(
+            r#"<root><item id="x">Hello</item><item id="y">World</item></root>"#,
+        )
+        .unwrap();
+        // Populate the id_map
+        let root = doc.root_element().unwrap();
+        let children: Vec<_> = doc.children(root).collect();
+        doc.set_id("x", children[0]);
+        doc.set_id("y", children[1]);
+
+        let expr = parse("id('x')").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert_eq!(ns.len(), 1);
+                assert_eq!(doc.node_name(ns[0]), Some("item"));
+                assert_eq!(doc.text_content(ns[0]), "Hello");
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_xpath_id_multiple_space_separated() {
+        let mut doc =
+            Document::parse_str(r#"<root><a id="p">1</a><b id="q">2</b><c id="r">3</c></root>"#)
+                .unwrap();
+        let root = doc.root_element().unwrap();
+        let children: Vec<_> = doc.children(root).collect();
+        doc.set_id("p", children[0]);
+        doc.set_id("q", children[1]);
+        doc.set_id("r", children[2]);
+
+        let expr = parse("id('p r')").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert_eq!(ns.len(), 2);
+                assert_eq!(doc.node_name(ns[0]), Some("a"));
+                assert_eq!(doc.node_name(ns[1]), Some("c"));
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_xpath_id_unknown_returns_empty() {
+        let doc = Document::parse_str("<root/>").unwrap();
+        let root = doc.root_element().unwrap();
+
+        let expr = parse("id('nonexistent')").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => assert!(ns.is_empty()),
+            other => panic!("expected empty node-set, got {other:?}"),
         }
     }
 }

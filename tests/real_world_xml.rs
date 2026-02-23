@@ -355,3 +355,214 @@ fn test_empty_elements_and_self_closing() {
     assert_eq!(doc.node_name(children[2]), Some("empty"));
     assert_eq!(doc.first_child(children[2]), None); // empty element, no children
 }
+
+// --- Validation integration tests ---
+
+#[test]
+fn test_dtd_validation_valid_catalog() {
+    use xmloxide::validation::dtd::{parse_dtd, validate};
+
+    let dtd_text = "\
+        <!ELEMENT catalog (book*)>\n\
+        <!ELEMENT book (title, author, year)>\n\
+        <!ELEMENT title (#PCDATA)>\n\
+        <!ELEMENT author (#PCDATA)>\n\
+        <!ELEMENT year (#PCDATA)>";
+    let dtd = parse_dtd(dtd_text).unwrap();
+
+    let xml = "<!DOCTYPE catalog>\
+        <catalog>\
+            <book><title>Rust in Action</title><author>Tim McNamara</author><year>2021</year></book>\
+            <book><title>Programming Rust</title><author>Jim Blandy</author><year>2021</year></book>\
+        </catalog>";
+    let mut doc = Document::parse_str(xml).unwrap();
+    let result = validate(&mut doc, &dtd);
+    assert!(result.is_valid, "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_dtd_validation_invalid_content_model() {
+    use xmloxide::validation::dtd::{parse_dtd, validate};
+
+    let dtd_text = "\
+        <!ELEMENT root (a, b)>\n\
+        <!ELEMENT a (#PCDATA)>\n\
+        <!ELEMENT b (#PCDATA)>";
+    let dtd = parse_dtd(dtd_text).unwrap();
+
+    // Wrong order: b before a
+    let xml = "<!DOCTYPE root><root><b>1</b><a>2</a></root>";
+    let mut doc = Document::parse_str(xml).unwrap();
+    let result = validate(&mut doc, &dtd);
+    assert!(!result.is_valid);
+    assert!(
+        result.errors.iter().any(|e| e.message.contains("content")),
+        "expected content model error, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_dtd_validation_id_idref() {
+    use xmloxide::validation::dtd::{parse_dtd, validate};
+
+    let dtd_text = "\
+        <!ELEMENT root (item*, ref*)>\n\
+        <!ELEMENT item (#PCDATA)>\n\
+        <!ATTLIST item id ID #REQUIRED>\n\
+        <!ELEMENT ref EMPTY>\n\
+        <!ATTLIST ref target IDREF #REQUIRED>";
+    let dtd = parse_dtd(dtd_text).unwrap();
+
+    let xml = r#"<!DOCTYPE root><root><item id="a">A</item><item id="b">B</item><ref target="a"/><ref target="b"/></root>"#;
+    let mut doc = Document::parse_str(xml).unwrap();
+    let result = validate(&mut doc, &dtd);
+    assert!(result.is_valid, "errors: {:?}", result.errors);
+
+    // Verify id_map was populated
+    assert!(doc.element_by_id("a").is_some());
+    assert!(doc.element_by_id("b").is_some());
+}
+
+#[test]
+fn test_relaxng_validation_valid() {
+    use xmloxide::validation::relaxng::{parse_relaxng, validate};
+
+    let schema_xml = r#"
+        <element name="addressBook" xmlns="http://relaxng.org/ns/structure/1.0">
+            <zeroOrMore>
+                <element name="card">
+                    <element name="name"><text/></element>
+                    <element name="email"><text/></element>
+                </element>
+            </zeroOrMore>
+        </element>
+    "#;
+    let schema = parse_relaxng(schema_xml).unwrap();
+
+    let xml = "<addressBook>\
+        <card><name>Alice</name><email>alice@example.com</email></card>\
+        <card><name>Bob</name><email>bob@example.com</email></card>\
+    </addressBook>";
+    let doc = Document::parse_str(xml).unwrap();
+    let result = validate(&doc, &schema);
+    assert!(result.is_valid, "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_relaxng_validation_invalid() {
+    use xmloxide::validation::relaxng::{parse_relaxng, validate};
+
+    let schema_xml = r#"
+        <element name="person" xmlns="http://relaxng.org/ns/structure/1.0">
+            <element name="name"><text/></element>
+            <element name="email"><text/></element>
+        </element>
+    "#;
+    let schema = parse_relaxng(schema_xml).unwrap();
+
+    // Missing required <email> element
+    let xml = "<person><name>Alice</name></person>";
+    let doc = Document::parse_str(xml).unwrap();
+    let result = validate(&doc, &schema);
+    assert!(!result.is_valid);
+    assert!(!result.errors.is_empty());
+}
+
+#[test]
+fn test_xsd_validation_valid() {
+    use xmloxide::validation::xsd::{parse_xsd, validate_xsd};
+
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="person">
+            <xs:complexType><xs:sequence>
+                <xs:element name="name" type="xs:string"/>
+                <xs:element name="age" type="xs:integer"/>
+            </xs:sequence></xs:complexType>
+        </xs:element>
+    </xs:schema>"#;
+    let schema = parse_xsd(xsd).unwrap();
+
+    let xml = "<person><name>Alice</name><age>30</age></person>";
+    let doc = Document::parse_str(xml).unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(result.is_valid, "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_xsd_validation_invalid_type() {
+    use xmloxide::validation::xsd::{parse_xsd, validate_xsd};
+
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="count" type="xs:integer"/>
+    </xs:schema>"#;
+    let schema = parse_xsd(xsd).unwrap();
+
+    let xml = "<count>not-a-number</count>";
+    let doc = Document::parse_str(xml).unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(!result.is_valid);
+    assert!(
+        result.errors.iter().any(|e| e.message.contains("integer")),
+        "expected integer type error, got: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_docbook_like_document() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<article>
+  <info>
+    <title>xmloxide Architecture</title>
+    <author><personname><firstname>Jon</firstname><surname>Wiggins</surname></personname></author>
+  </info>
+  <section>
+    <title>Introduction</title>
+    <para>xmloxide is a pure Rust reimplementation of libxml2.</para>
+    <para>It uses arena allocation with typed indices.</para>
+  </section>
+  <section>
+    <title>Design</title>
+    <itemizedlist>
+      <listitem><para>Arena-based tree</para></listitem>
+      <listitem><para>Recursive descent parser</para></listitem>
+      <listitem><para>Zero-copy where possible</para></listitem>
+    </itemizedlist>
+  </section>
+</article>"#;
+
+    let doc = parse_and_roundtrip(xml);
+    let root = doc.root_element().unwrap();
+    assert_eq!(doc.node_name(root), Some("article"));
+}
+
+#[test]
+fn test_configuration_xml() {
+    let xml = r#"<?xml version="1.0"?>
+<configuration>
+  <appSettings>
+    <add key="DatabaseHost" value="localhost"/>
+    <add key="DatabasePort" value="5432"/>
+    <add key="DatabaseName" value="myapp"/>
+    <add key="LogLevel" value="info"/>
+  </appSettings>
+  <connectionStrings>
+    <add name="default" connectionString="Host=localhost;Database=myapp" providerName="Npgsql"/>
+  </connectionStrings>
+  <system.web>
+    <compilation debug="true"/>
+    <httpRuntime targetFramework="4.8"/>
+  </system.web>
+</configuration>"#;
+
+    let doc = parse_and_roundtrip(xml);
+    let root = doc.root_element().unwrap();
+    assert_eq!(doc.node_name(root), Some("configuration"));
+
+    // Verify nested elements survived roundtrip
+    let output = serialize(&doc);
+    assert!(output.contains("DatabaseHost"));
+    assert!(output.contains("connectionString"));
+    assert!(output.contains("system.web"));
+}

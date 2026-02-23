@@ -20,6 +20,7 @@ mod node;
 pub use node::NodeKind;
 
 use crate::error::{ParseDiagnostic, ParseError};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 /// A typed index into the document's node arena.
@@ -144,6 +145,12 @@ pub struct Document {
     pub standalone: Option<bool>,
     /// Diagnostics collected during parsing (warnings and recovered errors).
     pub diagnostics: Vec<ParseDiagnostic>,
+    /// Mapping from ID attribute values to element nodes.
+    ///
+    /// Populated during DTD validation when attributes of type ID are
+    /// validated. Used by [`element_by_id`](Document::element_by_id) and
+    /// the `XPath` `id()` function.
+    id_map: HashMap<String, NodeId>,
 }
 
 impl Document {
@@ -165,6 +172,7 @@ impl Document {
             encoding: None,
             standalone: None,
             diagnostics: Vec::new(),
+            id_map: HashMap::new(),
         }
     }
 
@@ -405,6 +413,27 @@ impl Document {
             .iter()
             .find(|a| a.name == name)
             .map(|a| a.value.as_str())
+    }
+
+    // --- ID lookup ---
+
+    /// Associates an ID value with an element node.
+    ///
+    /// Called during DTD validation when an attribute of type ID is found.
+    /// Subsequent calls to [`element_by_id`](Document::element_by_id) will
+    /// return the associated node.
+    pub fn set_id(&mut self, id: &str, node: NodeId) {
+        self.id_map.insert(id.to_string(), node);
+    }
+
+    /// Looks up an element by its ID attribute value.
+    ///
+    /// Returns the `NodeId` of the element that was registered with
+    /// [`set_id`](Document::set_id) for the given ID string, or `None`
+    /// if no such ID exists.
+    #[must_use]
+    pub fn element_by_id(&self, id: &str) -> Option<NodeId> {
+        self.id_map.get(id).copied()
     }
 
     // --- Navigation ---
@@ -1037,5 +1066,27 @@ mod tests {
             attributes: vec![],
         });
         assert_eq!(doc.node_text(elem), None);
+    }
+
+    #[test]
+    fn test_element_by_id_none() {
+        let doc = Document::new();
+        assert_eq!(doc.element_by_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_set_id_and_lookup() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.create_node(NodeKind::Element {
+            name: "item".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, elem);
+        doc.set_id("a", elem);
+        assert_eq!(doc.element_by_id("a"), Some(elem));
+        assert_eq!(doc.element_by_id("b"), None);
     }
 }

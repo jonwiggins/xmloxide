@@ -1833,12 +1833,11 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            // Should be Group(Attribute, Text)
-            assert!(matches!(pattern.as_ref(), Pattern::Group(_, _)));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        // Should be Group(Attribute, Text)
+        assert!(matches!(pattern.as_ref(), Pattern::Group(_, _)));
     }
 
     #[test]
@@ -1852,11 +1851,10 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(matches!(pattern.as_ref(), Pattern::Choice(_, _)));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(matches!(pattern.as_ref(), Pattern::Choice(_, _)));
     }
 
     #[test]
@@ -1869,11 +1867,10 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(matches!(pattern.as_ref(), Pattern::ZeroOrMore(_)));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(matches!(pattern.as_ref(), Pattern::ZeroOrMore(_)));
     }
 
     #[test]
@@ -1886,11 +1883,10 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(matches!(pattern.as_ref(), Pattern::OneOrMore(_)));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(matches!(pattern.as_ref(), Pattern::OneOrMore(_)));
     }
 
     #[test]
@@ -1904,11 +1900,10 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(matches!(pattern.as_ref(), Pattern::Group(_, _)));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(matches!(pattern.as_ref(), Pattern::Group(_, _)));
     }
 
     #[test]
@@ -1922,11 +1917,10 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(matches!(pattern.as_ref(), Pattern::Interleave(_, _)));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(matches!(pattern.as_ref(), Pattern::Interleave(_, _)));
     }
 
     #[test]
@@ -1937,11 +1931,10 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(matches!(pattern.as_ref(), Pattern::Value(v) if v == "active"));
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(matches!(pattern.as_ref(), Pattern::Value(v) if v == "active"));
     }
 
     #[test]
@@ -1952,13 +1945,12 @@ mod tests {
             </element>
         "#;
         let schema = parse_relaxng(schema_xml).unwrap();
-        if let Pattern::Element { pattern, .. } = &schema.start {
-            assert!(
-                matches!(pattern.as_ref(), Pattern::Data { datatype, .. } if datatype == "integer")
-            );
-        } else {
-            panic!("expected Element pattern");
-        }
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected Element pattern, got {:?}", schema.start);
+        };
+        assert!(
+            matches!(pattern.as_ref(), Pattern::Data { datatype, .. } if datatype == "integer")
+        );
     }
 
     // --- Validation tests ---
