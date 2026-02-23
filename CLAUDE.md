@@ -2,20 +2,26 @@
 
 ## Project Overview
 
-**xmloxide** is a pure Rust reimplementation of libxml2 — the de facto standard XML/HTML parsing library in the open-source world. libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide aims to be a memory-safe, high-performance replacement that passes the same conformance test suites.
+**xmloxide** is a pure Rust reimplementation of libxml2 — the de facto standard XML/HTML parsing library in the open-source world. libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide is a memory-safe, high-performance replacement that passes the same conformance test suites.
 
-### Goals
+**Version:** 0.1.0 (released 2026-02-23)
+**License:** MIT
+**MSRV:** Rust 1.81+
+
+### Achieved Goals
 
 - Full conformance with W3C XML 1.0 (Fifth Edition) and Namespaces in XML 1.0
-- Pass the W3C XML Conformance Test Suite (2000+ test files)
-- Pass libxml2's own regression suite (`runtest`, `runsuite`, `runxmlconf`, `testapi`)
-- Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0, XmlReader, DTD/RelaxNG/XSD validation, C14N, XInclude, XML Catalogs
-- Zero `unsafe` in public API surface; minimal `unsafe` internally (arena internals only, if needed)
+- **1727/1727** W3C XML Conformance Test Suite tests passing (100%)
+- **119/119** libxml2 regression tests passing (100%)
+- Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0, XmlReader, push parser, DTD/RelaxNG/XSD validation, C14N, XInclude, XML Catalogs
+- Zero `unsafe` in public API surface (`unsafe_code = "deny"` in Cargo.toml)
 - No system dependencies — pure Rust (uses `encoding_rs` for character encoding)
+- C/C++ FFI layer with header file (`include/xmloxide.h`)
+- `xmllint` CLI tool
+- Performance competitive with libxml2 (serialization 1.5-2.3x faster)
 
-### Non-Goals (for now)
+### Non-Goals
 
-- C FFI compatibility layer (Phase 6, later)
 - XSLT (that's libxslt, a separate project)
 - XML 1.1 support (rarely used, can add later)
 - Full libxml2 API-level compatibility (we design an idiomatic Rust API)
@@ -43,61 +49,66 @@ libxml2 uses a web of raw C pointers (parent, children, next, prev, doc, ns). We
 ```
 src/
 ├── lib.rs              # Public API re-exports, crate docs
+├── bin/
+│   └── xmllint.rs      # xmllint CLI (behind "cli" feature)
 ├── tree/
-│   ├── mod.rs          # Document, NodeId, NodeData, tree navigation
-│   ├── node.rs         # Node type enum, element/text/comment/PI/etc
-│   ├── namespace.rs    # Namespace handling, NsId
-│   ├── attribute.rs    # Attribute storage and access
-│   └── arena.rs        # Arena allocator internals, free-list
+│   ├── mod.rs          # Document, NodeId, NodeData, tree navigation, id_map
+│   └── node.rs         # NodeKind enum (element/text/comment/PI/doctype/etc)
 ├── parser/
 │   ├── mod.rs          # ParseOptions, top-level parse functions
 │   ├── xml.rs          # XML 1.0 parser (core state machine)
 │   ├── push.rs         # Push/incremental parser wrapper
-│   ├── dtd.rs          # DTD parsing (ELEMENT, ATTLIST, ENTITY, NOTATION)
 │   └── input.rs        # Parser input stack (entity expansion, includes)
 ├── html/
-│   ├── mod.rs          # HTML parser (error-tolerant)
-│   └── entities.rs     # HTML5 named character references
+│   ├── mod.rs          # HTML parser (error-tolerant, auto-closing, void elements)
+│   └── entities.rs     # HTML named character references
 ├── sax/
-│   └── mod.rs          # SAX2 handler trait and default implementation
+│   └── mod.rs          # SAX2 handler trait and streaming parser
+├── reader/
+│   └── mod.rs          # XmlReader pull-based parsing API
 ├── encoding/
 │   └── mod.rs          # Encoding detection, BOM sniffing, encoding_rs bridge
-├── io/
-│   └── mod.rs          # Input/output abstraction (files, memory, streams)
 ├── xpath/
-│   ├── mod.rs          # XPath public API
+│   ├── mod.rs          # XPath public API, evaluate() entry point
+│   ├── ast.rs          # XPath AST types (Expr, Step, Axis, etc.)
 │   ├── lexer.rs        # XPath expression tokenizer
 │   ├── parser.rs       # XPath expression parser → AST
-│   ├── compiler.rs     # AST → compiled expression
 │   ├── eval.rs         # Expression evaluator against a node tree
-│   └── types.rs        # XPath value types (nodeset, string, number, boolean)
+│   └── types.rs        # XPath value types (NodeSet, String, Number, Boolean)
+├── validation/
+│   ├── mod.rs          # ValidationResult, ValidationError
+│   ├── dtd.rs          # DTD parsing and validation (populates id_map)
+│   ├── relaxng.rs      # RelaxNG schema parsing and validation
+│   └── xsd.rs          # XML Schema (XSD) parsing and validation
 ├── serial/
 │   ├── mod.rs          # Serialization options and entry points
 │   ├── xml.rs          # XML serializer
 │   ├── html.rs         # HTML serializer (void elements, attribute rules)
-│   └── c14n.rs         # Canonical XML (C14N 1.0 / 1.1)
+│   └── c14n.rs         # Canonical XML (C14N 1.0 / Exclusive C14N)
+├── xinclude/
+│   └── mod.rs          # XInclude 1.0 document inclusion
+├── catalog/
+│   └── mod.rs          # OASIS XML Catalogs for URI resolution
+├── ffi/
+│   ├── mod.rs          # FFI module root (feature-gated behind "ffi")
+│   ├── document.rs     # Document parsing FFI
+│   ├── tree.rs         # Tree navigation FFI
+│   ├── serial.rs       # Serialization FFI
+│   ├── xpath.rs        # XPath evaluation FFI
+│   └── strings.rs      # String memory management FFI
 ├── error/
-│   └── mod.rs          # Error types, error accumulator, structured diagnostics
+│   └── mod.rs          # Error types, ParseError, ParseDiagnostic
 └── util/
     ├── mod.rs
-    ├── dict.rs          # String interning dictionary (like libxml2's xmlDict)
-    ├── uri.rs           # RFC 3986 URI parsing and resolution
-    ├── buf.rs           # Growable byte buffer
+    ├── dict.rs          # String interning dictionary
     └── qname.rs         # QName (prefix:localname) handling
 ```
 
-### Phased Implementation Plan
+### Key Design Decisions
 
-| Phase | Scope | Test Target |
-|-------|-------|-------------|
-| 1 | Core tree + XML parser + serialization | `runtest` XML regression tests |
-| 2 | HTML parser, SAX2, XmlReader, push parser | All `runtest` categories |
-| 3 | XPath 1.0 | XPath regression tests |
-| 4 | DTD + RelaxNG validation | `runsuite` RelaxNG tests |
-| 5 | XML Schema, Schematron, C14N, XInclude | Full `runsuite` + `runxmlconf` |
-| 6 | `xmllint` CLI, C FFI layer, perf tuning | End-to-end parity |
-
-We are currently in **Phase 1**.
+- **DTD `validate()` takes `&mut Document`** — because it populates the `id_map` on `Document` when ID-type attributes are found. This enables `element_by_id()` and the XPath `id()` function.
+- **The FFI module is feature-gated** behind `#[cfg(feature = "ffi")]` to avoid pulling in C interop code unless needed.
+- **The CLI is feature-gated** behind `cli` (which is a default feature) using `dep:clap`.
 
 ---
 
@@ -115,7 +126,7 @@ CI will reject unformatted code.
 
 ### Linting
 
-All code must pass `clippy` at the **pedantic** level with zero warnings. Configuration is in `Cargo.toml` under `[lints]` and in `clippy.toml`.
+All code must pass `clippy` at the **pedantic** level with zero warnings. Configuration is in `Cargo.toml` under `[lints]`.
 
 ```sh
 cargo clippy --all-targets --all-features -- -D warnings
@@ -123,9 +134,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Key clippy policies:
 - `pedantic` is enabled globally — we selectively `allow` specific pedantic lints only with justification
-- `unwrap()` and `expect()` are **forbidden** in library code (use `?` or return `Result`)
-- `unwrap()` is permitted in tests and benchmarks only
-- `unsafe` blocks require a `// SAFETY:` comment explaining the invariant
+- `unwrap()` and `expect()` are **warned** in library code (use `?` or return `Result`)
+- `unwrap()` is permitted in tests (via `#[allow(clippy::unwrap_used)]` on test modules)
+- `unsafe_code` is **denied** crate-wide
 
 ### Naming Conventions
 
@@ -135,7 +146,7 @@ Key clippy policies:
 - Feature flags: `kebab-case` in Cargo.toml, `snake_case` in `#[cfg(feature = "...")]`
 - Module files: `snake_case.rs`
 - Private helpers: prefixed with `_` only if needed to avoid dead-code warnings; prefer `pub(crate)` visibility over private-with-underscore
-- NodeId / NsId / AttrId: always use the newtype, never raw `usize` or `u32`
+- NodeId: always use the newtype, never raw `usize` or `u32`
 
 ### API Design Principles
 
@@ -150,7 +161,7 @@ Key clippy policies:
 ### Error Handling
 
 - Define domain-specific error enums, not stringly-typed errors
-- Use `thiserror` style derives (but hand-implement for now to avoid the dependency)
+- Hand-implement error traits (no `thiserror` dependency)
 - The parser supports **error recovery mode**: collect errors into a `Vec<ParseDiagnostic>` while still producing a (possibly partial) tree — this is critical because it's how most real-world users consume libxml2
 - Errors carry **source location** (line, column, byte offset) matching libxml2's error reporting
 - Error severity levels: `Warning`, `Error`, `Fatal` (matching libxml2's `xmlErrorLevel`)
@@ -162,6 +173,7 @@ Key clippy policies:
 - Include `# Examples` sections for key API entry points
 - Reference the relevant spec section where applicable (e.g., "See XML 1.0 §2.3 Common Syntactic Constructs")
 - Module-level docs (`//!` comments in `mod.rs`) explain the module's role and design rationale
+- Use backtick-wrapped names for identifiers and abbreviations in doc comments (e.g., `XPath`, `id_map`) to satisfy `clippy::doc_markdown`
 
 ### Testing
 
@@ -170,26 +182,27 @@ Key clippy policies:
 - Test names follow `test_<function>_<scenario>` — e.g., `test_parse_str_empty_document`, `test_node_append_child_to_leaf`
 - Use `pretty_assertions` for comparing large strings/structures in tests
 - Every parser feature needs a roundtrip test: parse → serialize → parse again → assert tree equality
-- Conformance tests (W3C suite) live in `tests/conformance/` and are driven by the test XML catalogs
+- Prefer `let...else { panic!("expected X, got {:?}", actual) }` over `if let...else { panic!("expected X") }` for better failure diagnostics
 
 ### Performance
 
 - The string dictionary (`Dict`) is load-bearing — hot-path string comparisons must go through interned `SymbolId` equality, not `str` comparison
 - The parser should be zero-copy for attribute values and text content where possible (reference into the input buffer)
 - Benchmark critical paths: `benches/parser_bench.rs` compares against known documents
+- `benches/comparison_bench.rs` provides head-to-head comparison with libxml2 (requires `--features bench-libxml2`)
 - Profile before optimizing — don't prematurely complicate the architecture
 
 ### Git Conventions
 
 - Commit messages: `<module>: <imperative summary>` — e.g., `tree: add NodeId newtype with NonZeroU32`, `parser: implement element start tag parsing`
 - One logical change per commit
-- Feature branches: `feature/<phase>-<module>` — e.g., `feature/phase1-tree`, `feature/phase1-parser`
+- Feature branches: `feature/<module>` — e.g., `feature/tree`, `feature/parser`
 
 ---
 
 ## Key Specifications & References
 
-These are the specs we implement against. Keep them bookmarked:
+These are the specs we implement against:
 
 - [XML 1.0 (Fifth Edition)](https://www.w3.org/TR/xml/) — the core spec
 - [Namespaces in XML 1.0](https://www.w3.org/TR/xml-names/) — namespace processing
@@ -200,38 +213,8 @@ These are the specs we implement against. Keep them bookmarked:
 - [W3C XML Schema](https://www.w3.org/TR/xmlschema-1/) — XSD 1.0
 - [HTML 4.01](https://www.w3.org/TR/html401/) — libxml2's HTML parser targets HTML 4, not HTML5
 - [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986) — URI syntax
-- [W3C XML Conformance Test Suite](https://www.w3.org/XML/Test/) — 2000+ test files
+- [W3C XML Conformance Test Suite](https://www.w3.org/XML/Test/) — 1727 applicable test files
 - [libxml2 source](https://gitlab.gnome.org/GNOME/libxml2) — the reference implementation
-
-### libxml2 Source Files → xmloxide Modules
-
-| libxml2 file | Lines (approx) | xmloxide module | Priority |
-|---|---|---|---|
-| `tree.c` | ~10K | `tree/` | Phase 1 |
-| `parser.c` | ~16K | `parser/xml.rs` | Phase 1 |
-| `HTMLparser.c` | ~7K | `html/` | Phase 2 |
-| `SAX2.c` | ~3K | `sax/` | Phase 2 |
-| `encoding.c` | ~3K | `encoding/` | Phase 1 |
-| `xmlIO.c` | ~4K | `io/` | Phase 1 |
-| `xpath.c` | ~14K | `xpath/` | Phase 3 |
-| `xmlsave.c` + `HTMLtree.c` | ~5K | `serial/` | Phase 1 |
-| `valid.c` | ~5K | (validation module, TBD) | Phase 4 |
-| `relaxng.c` | ~8K | (validation module, TBD) | Phase 4 |
-| `xmlschemas.c` + `xmlschemastypes.c` | ~15K | (validation module, TBD) | Phase 5 |
-| `c14n.c` | ~2K | `serial/c14n.rs` | Phase 5 |
-| `xinclude.c` | ~3K | (TBD) | Phase 5 |
-| `dict.c` | ~1K | `util/dict.rs` | Phase 1 |
-| `uri.c` | ~2K | `util/uri.rs` | Phase 1 |
-| `entities.c` | ~1K | `tree/` (entity storage) | Phase 1 |
-| `xmlstring.c`, `buf.c` | ~2K | `util/buf.rs` | Phase 1 |
-| `hash.c`, `list.c` | ~1K | Use `std::collections` | Phase 1 |
-| `catalog.c` | ~3K | (TBD) | Phase 5 |
-| `xmlreader.c` | ~3K | (TBD) | Phase 2 |
-| `xmlwriter.c` | ~3K | `serial/` (writer API) | Phase 2 |
-| `xmlregexp.c` | ~4K | (TBD, internal to validation) | Phase 4 |
-| `schematron.c` | ~2K | (TBD) | Phase 5 |
-| `pattern.c` | ~2K | (TBD) | Phase 3 |
-| `xpointer.c` | ~2K | (TBD) | Phase 3 |
 
 ---
 
@@ -248,11 +231,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 
 # Run tests for a specific module
-cargo test --all-features tree::
-cargo test --all-features parser::
+cargo test --all-features -- tree::
+cargo test --all-features -- parser::
+cargo test --all-features -- validation::dtd
+cargo test --all-features -- serial::html
 
 # Run benchmarks
 cargo bench
+
+# Run benchmarks against libxml2
+cargo bench --features bench-libxml2
 
 # Check without building (fast feedback)
 cargo check --all-features
@@ -260,8 +248,19 @@ cargo check --all-features
 # Build docs
 cargo doc --all-features --no-deps --open
 
-# Run with a specific feature set (e.g., minimal)
-cargo test --no-default-features --features "html,xpath"
+# Run conformance suite (requires download first)
+./scripts/download-conformance-suite.sh
+cargo test --test conformance
+
+# Run libxml2 compatibility suite (requires download first)
+./scripts/download-libxml2-tests.sh
+cargo test --test libxml2_compat
+
+# Run fuzz targets
+cargo +nightly fuzz run fuzz_xml_parse
+cargo +nightly fuzz run fuzz_html_parse
+cargo +nightly fuzz run fuzz_xpath
+cargo +nightly fuzz run fuzz_roundtrip
 ```
 
 ---
@@ -310,6 +309,8 @@ fn parse_something(&mut self) -> Result<NodeId, ParseError> {
 
 - **Minimize dependencies.** This is a foundational library — every dep is a supply chain risk.
 - **Required:** `encoding_rs` (character encoding — replaces iconv/ICU, well-audited Mozilla crate)
+- **CLI only:** `clap` (behind `cli` feature, default-on)
+- **Benchmarks only:** `libxml` (behind `bench-libxml2` feature, off by default)
 - **Dev only:** `criterion` (benchmarks), `pretty_assertions` (test output)
 - **Explicitly rejected:** `thiserror` (we hand-implement error types), `serde` (not needed in core — add as optional feature later), `regex` (we implement our own pattern matching for XPath/validation), `nom`/`pest`/`winnow` (we write a hand-rolled recursive descent parser for performance and error recovery, matching libxml2's approach)
 
@@ -318,3 +319,30 @@ The parser is hand-rolled recursive descent (not combinator-based) because:
 2. Error recovery requires fine-grained control over the parse state
 3. Push/incremental parsing requires suspendable state, which combinators make awkward
 4. Performance — no abstraction overhead
+
+---
+
+## CI/CD
+
+Three GitHub Actions workflows:
+
+- **ci.yml** — runs on every push/PR: formatting, clippy, tests (stable + MSRV 1.81), doc build
+- **compat.yml** — weekly: downloads libxml2 test suite, runs full compatibility tests
+- **bench.yml** — on every PR: runs parser benchmarks, tracks regression (fails at >115%)
+
+Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, tests, doc build).
+
+---
+
+## Test Suites
+
+| Suite | Location | Tests | Notes |
+|-------|----------|-------|-------|
+| Unit tests | `src/**/*.rs` (inline) | ~637 | All modules |
+| W3C Conformance | `tests/conformance.rs` | 1727/1727 | Requires `download-conformance-suite.sh` |
+| libxml2 Compat | `tests/libxml2_compat.rs` | 119/119 | Requires `download-libxml2-tests.sh` |
+| Real-world XML | `tests/real_world_xml.rs` | 22 | Atom, SVG, XHTML, Maven, SOAP, validation |
+| Security/DoS | `tests/security.rs` | 15 | Billion laughs, deep nesting, etc. |
+| Entity resolver | `tests/entity_resolver.rs` | 14 | Entity expansion edge cases |
+| FFI | `tests/ffi_tests.rs` | 40 | C API surface tests |
+| Fuzz targets | `fuzz/` | 4 targets | XML, HTML, XPath, roundtrip |
