@@ -1,0 +1,37 @@
+[package]
+name = "xmloxide-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.xmloxide]
+path = ".."
+
+[[bin]]
+name = "fuzz_xml_parse"
+path = "fuzz_targets/fuzz_xml_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_html_parse"
+path = "fuzz_targets/fuzz_html_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_xpath"
+path = "fuzz_targets/fuzz_xpath.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip"
+path = "fuzz_targets/fuzz_roundtrip.rs"
+doc = false
+
+[workspace]
+members = ["."]

@@ -19,7 +19,8 @@ libxml2 became officially unmaintained in December 2025 with known security issu
 - **`xmllint` CLI** — command-line tool for parsing, validating, and querying XML
 - **Zero-copy where possible** — string interning for fast comparisons
 - **No global state** — each `Document` is self-contained and `Send + Sync`
-- **Minimal dependencies** — only `encoding_rs` and `clap` (CLI only)
+- **C/C++ FFI** — full C API with header file (`include/xmloxide.h`) for embedding in C/C++ projects
+- **Minimal dependencies** — only `encoding_rs` (library has zero other deps; `clap` is CLI-only)
 
 ## Quick Start
 
@@ -132,6 +133,7 @@ xmllint --html page.html
 | `xinclude` | XInclude 1.0 document inclusion |
 | `catalog` | OASIS XML Catalogs for URI resolution |
 | `encoding` | Character encoding detection and transcoding |
+| `ffi` | C/C++ FFI bindings (`include/xmloxide.h`) |
 
 ## Performance
 
@@ -165,12 +167,46 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 cargo test --all-features
 ```
 
+## C/C++ FFI
+
+xmloxide provides a C-compatible API for embedding in C/C++ projects (like Chromium, game engines, or any codebase that currently uses libxml2). The library builds as both a `cdylib` and `staticlib`.
+
+```c
+#include "xmloxide.h"
+
+xmloxide_document *doc = xmloxide_parse_str("<root>Hello</root>");
+uint32_t root = xmloxide_doc_root_element(doc);
+char *name = xmloxide_node_name(doc, root);   // "root"
+char *text = xmloxide_node_text_content(doc, root); // "Hello"
+
+xmloxide_free_string(name);
+xmloxide_free_string(text);
+xmloxide_free_doc(doc);
+```
+
+The full API — including tree navigation, XPath evaluation, and serialization — is declared in [`include/xmloxide.h`](include/xmloxide.h).
+
+## Fuzzing
+
+xmloxide includes fuzz targets for security testing:
+
+```sh
+# Install cargo-fuzz (requires nightly)
+cargo install cargo-fuzz
+
+# Run a fuzz target
+cargo +nightly fuzz run fuzz_xml_parse
+cargo +nightly fuzz run fuzz_html_parse
+cargo +nightly fuzz run fuzz_xpath
+cargo +nightly fuzz run fuzz_roundtrip
+```
+
 ## Building
 
 ```sh
 cargo build
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo clippy --all-targets -- -D warnings
 cargo bench
 ```
 

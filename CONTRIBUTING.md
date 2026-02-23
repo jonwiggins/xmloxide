@@ -49,10 +49,10 @@ cd xmloxide
 cargo build
 
 # Run all tests
-cargo test --all-features
+cargo test
 
 # Run the linter
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 
 # Check formatting
 cargo fmt --all -- --check
@@ -131,9 +131,9 @@ points:
 
 2. **Ensure CI passes.** Your PR must pass all CI checks:
    - `cargo fmt --all -- --check`
-   - `cargo clippy --all-targets --all-features -- -D warnings`
-   - `cargo test --all-features` (on both stable and MSRV 1.81)
-   - `cargo doc --all-features --no-deps` with no warnings
+   - `cargo clippy --all-targets -- -D warnings`
+   - `cargo test` (on both stable and MSRV 1.81)
+   - `cargo doc --no-deps` with no warnings
 
 3. **Write tests.** Bug fixes should include a regression test. New features
    should include unit tests and, where applicable, roundtrip tests
@@ -233,11 +233,11 @@ Rules:
 
 ```sh
 # All tests
-cargo test --all-features
+cargo test
 
 # Tests for a specific module
-cargo test --all-features tree::
-cargo test --all-features parser::
+cargo test tree::
+cargo test parser::
 
 # Run benchmarks
 cargo bench

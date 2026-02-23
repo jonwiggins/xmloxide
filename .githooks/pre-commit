@@ -1,5 +1,9 @@
 #!/bin/sh
 # Pre-commit hook: run cargo fmt, clippy, tests, and doc check before committing
+#
+# Note: we intentionally do NOT use --all-features because the bench-libxml2
+# feature requires the libxml2 system library and a newer Rust edition.
+# CI mirrors these exact commands.
 
 set -e
 
@@ -14,7 +18,7 @@ echo "Formatting check passed."
 
 echo ""
 echo "Running cargo clippy..."
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 if [ $? -ne 0 ]; then
     echo ""
     echo "ERROR: Clippy found warnings. Fix them and try again."
@@ -24,7 +28,7 @@ echo "Clippy check passed."
 
 echo ""
 echo "Running cargo test..."
-cargo test --all-features --quiet
+cargo test --quiet
 if [ $? -ne 0 ]; then
     echo ""
     echo "ERROR: Tests failed. Fix them and try again."
@@ -34,7 +38,7 @@ echo "All tests passed."
 
 echo ""
 echo "Running cargo doc..."
-RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --quiet
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --quiet
 if [ $? -ne 0 ]; then
     echo ""
     echo "ERROR: Documentation build has warnings. Fix them and try again."

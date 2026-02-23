@@ -1,0 +1,32 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Performance regression check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        run: cargo bench --bench parser_bench -- --output-format bencher | tee bench-output.txt
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: xmloxide benchmarks
+          tool: cargo
+          output-file-path: bench-output.txt
+          comment-on-alert: true
+          alert-threshold: "115%"
+          fail-on-alert: true
+          summary-always: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
