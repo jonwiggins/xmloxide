@@ -42,7 +42,7 @@ will not be tolerated.
 
 ```sh
 # Clone the repository
-git clone https://github.com/jondot/xmloxide.git
+git clone https://github.com/jonwiggins/xmloxide.git
 cd xmloxide
 
 # Build the project

@@ -12,7 +12,7 @@
 //! # String Ownership
 //!
 //! All strings returned by FFI functions are caller-owned C strings that
-//! must be freed via [`xmloxide_free_string`].
+//! must be freed via [`xmloxide_free_string`](strings::xmloxide_free_string).
 //!
 //! # Safety
 //!

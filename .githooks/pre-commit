@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pre-commit hook: run cargo fmt, clippy, and tests before committing
+# Pre-commit hook: run cargo fmt, clippy, tests, and doc check before committing
 
 set -e
 
@@ -31,3 +31,13 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 echo "All tests passed."
+
+echo ""
+echo "Running cargo doc..."
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --quiet
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "ERROR: Documentation build has warnings. Fix them and try again."
+    exit 1
+fi
+echo "Documentation check passed."

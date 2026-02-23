@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.81"
 license = "MIT"
 description = "A pure Rust reimplementation of libxml2 — memory-safe XML/HTML parsing"
-repository = "https://github.com/jondot/xmloxide"
+repository = "https://github.com/jonwiggins/xmloxide"
 keywords = ["xml", "html", "parser", "dom", "xpath"]
 categories = ["parser-implementations", "web-programming"]
 
