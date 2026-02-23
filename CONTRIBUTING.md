@@ -106,6 +106,14 @@ to see if it's already planned.
 4. **Make your changes** following the guidelines below.
 5. **Submit a pull request** against `main`.
 
+### Current Project Phase
+
+xmloxide follows a phased implementation plan (see [CLAUDE.md](CLAUDE.md) for
+the full roadmap). We are currently in **Phase 1** (core tree, XML parser,
+serialization). Contributions that align with the current phase are most likely
+to be reviewed and merged quickly. If you want to work on a later phase, open
+an issue to discuss timing and design before investing significant effort.
+
 ### Good First Contributions
 
 Look for issues labeled `good-first-issue` or `help-wanted`. Other good entry
