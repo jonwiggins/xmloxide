@@ -38,6 +38,7 @@ unsafe fn doc_and_node(doc: *const Document, raw_node: u32) -> Option<(&'static 
     if doc.is_null() {
         return None;
     }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
     let doc = unsafe { &*doc };
     let node_id = NodeId::from_raw(raw_node)?;
     Some((doc, node_id))
@@ -53,6 +54,7 @@ pub unsafe extern "C" fn xmloxide_doc_root(doc: *const Document) -> u32 {
     if doc.is_null() {
         return 0;
     }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
     let doc = unsafe { &*doc };
     doc.root().into_raw()
 }
@@ -67,6 +69,7 @@ pub unsafe extern "C" fn xmloxide_doc_root_element(doc: *const Document) -> u32 
     if doc.is_null() {
         return 0;
     }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
     let doc = unsafe { &*doc };
     node_id_to_raw(doc.root_element())
 }
@@ -256,6 +259,7 @@ pub unsafe extern "C" fn xmloxide_node_attribute(
     if name.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `name` is a valid null-terminated string.
     let c_name = unsafe { std::ffi::CStr::from_ptr(name) };
     let Ok(name_str) = c_name.to_str() else {
         return std::ptr::null_mut();

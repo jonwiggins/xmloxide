@@ -228,6 +228,13 @@ cargo bench
 
 Minimum supported Rust version: **1.81**
 
+## Limitations
+
+- **No XML 1.1** — xmloxide implements XML 1.0 (Fifth Edition) only. XML 1.1 is rarely used and not planned.
+- **No XSLT** — XSLT is a separate specification (libxslt) and is out of scope.
+- **No Schematron** — Schematron validation is not implemented. DTD, RelaxNG, and XSD are supported.
+- **HTML 4.01 only** — the HTML parser targets HTML 4.01, not the HTML5 parsing algorithm.
+
 ## License
 
 MIT

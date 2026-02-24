@@ -26,6 +26,7 @@ pub unsafe extern "C" fn xmloxide_parse_str(input: *const c_char) -> *mut Docume
         set_last_error("null input pointer");
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `input` is a valid null-terminated string.
     let c_str = unsafe { CStr::from_ptr(input) };
     let s = match c_str.to_str() {
         Ok(s) => s,
@@ -60,6 +61,7 @@ pub unsafe extern "C" fn xmloxide_parse_bytes(data: *const u8, len: usize) -> *m
         set_last_error("null data pointer");
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `data` points to `len` valid bytes.
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     match Document::parse_bytes(bytes) {
         Ok(doc) => Box::into_raw(Box::new(doc)),
@@ -81,6 +83,7 @@ pub unsafe extern "C" fn xmloxide_parse_bytes(data: *const u8, len: usize) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn xmloxide_free_doc(doc: *mut Document) {
     if !doc.is_null() {
+        // SAFETY: `doc` was created by `Box::into_raw` in a parse function, and is non-null.
         unsafe {
             drop(Box::from_raw(doc));
         }
@@ -100,6 +103,7 @@ pub unsafe extern "C" fn xmloxide_doc_version(doc: *const Document) -> *mut c_ch
     if doc.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
     let doc = unsafe { &*doc };
     match &doc.version {
         Some(v) => to_c_string(v),
@@ -120,6 +124,7 @@ pub unsafe extern "C" fn xmloxide_doc_encoding(doc: *const Document) -> *mut c_c
     if doc.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
     let doc = unsafe { &*doc };
     match &doc.encoding {
         Some(e) => to_c_string(e),

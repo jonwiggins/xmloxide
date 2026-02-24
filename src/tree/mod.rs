@@ -1089,4 +1089,491 @@ mod tests {
         assert_eq!(doc.element_by_id("a"), Some(elem));
         assert_eq!(doc.element_by_id("b"), None);
     }
+
+    #[test]
+    fn test_remove_node_middle_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        doc.remove_node(b);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, c]);
+        assert_eq!(doc.parent(b), None);
+        assert_eq!(doc.next_sibling(b), None);
+        assert_eq!(doc.prev_sibling(b), None);
+        assert_eq!(doc.next_sibling(a), Some(c));
+        assert_eq!(doc.prev_sibling(c), Some(a));
+    }
+
+    #[test]
+    fn test_remove_node_only_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Element {
+            name: "only".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, a);
+
+        doc.remove_node(a);
+
+        assert_eq!(doc.first_child(root), None);
+        assert_eq!(doc.last_child(root), None);
+        assert_eq!(doc.parent(a), None);
+    }
+
+    #[test]
+    fn test_remove_node_first_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+
+        doc.remove_node(a);
+
+        assert_eq!(doc.first_child(root), Some(b));
+        assert_eq!(doc.prev_sibling(b), None);
+        assert_eq!(doc.parent(a), None);
+    }
+
+    #[test]
+    fn test_remove_node_last_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+
+        doc.remove_node(b);
+
+        assert_eq!(doc.last_child(root), Some(a));
+        assert_eq!(doc.next_sibling(a), None);
+        assert_eq!(doc.parent(b), None);
+    }
+
+    #[test]
+    fn test_remove_node_no_parent_is_noop() {
+        let mut doc = Document::new();
+        let orphan = doc.create_node(NodeKind::Text {
+            content: "orphan".to_string(),
+        });
+
+        // Removing a node with no parent should not panic
+        doc.remove_node(orphan);
+
+        assert_eq!(doc.parent(orphan), None);
+    }
+
+    #[test]
+    fn test_prepend_child_to_empty_parent() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Element {
+            name: "first".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+
+        doc.prepend_child(root, a);
+
+        assert_eq!(doc.first_child(root), Some(a));
+        assert_eq!(doc.last_child(root), Some(a));
+        assert_eq!(doc.parent(a), Some(root));
+    }
+
+    #[test]
+    fn test_prepend_child_before_existing() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        doc.prepend_child(root, a);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, b, c]);
+        assert_eq!(doc.first_child(root), Some(a));
+        assert_eq!(doc.last_child(root), Some(c));
+        assert_eq!(doc.parent(a), Some(root));
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.prev_sibling(b), Some(a));
+    }
+
+    #[test]
+    fn test_prepend_child_multiple_times() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+
+        doc.prepend_child(root, c);
+        doc.prepend_child(root, b);
+        doc.prepend_child(root, a);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, b, c]);
+    }
+
+    #[test]
+    fn test_node_namespace_with_namespace() {
+        let mut doc = Document::new();
+        let elem = doc.create_node(NodeKind::Element {
+            name: "rect".to_string(),
+            prefix: Some("svg".to_string()),
+            namespace: Some("http://www.w3.org/2000/svg".to_string()),
+            attributes: vec![],
+        });
+
+        assert_eq!(doc.node_namespace(elem), Some("http://www.w3.org/2000/svg"));
+    }
+
+    #[test]
+    fn test_node_namespace_without_namespace() {
+        let mut doc = Document::new();
+        let elem = doc.create_node(NodeKind::Element {
+            name: "div".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+
+        assert_eq!(doc.node_namespace(elem), None);
+    }
+
+    #[test]
+    fn test_node_namespace_non_element() {
+        let mut doc = Document::new();
+        let text = doc.create_node(NodeKind::Text {
+            content: "hello".to_string(),
+        });
+        let comment = doc.create_node(NodeKind::Comment {
+            content: "a comment".to_string(),
+        });
+
+        assert_eq!(doc.node_namespace(text), None);
+        assert_eq!(doc.node_namespace(comment), None);
+    }
+
+    #[test]
+    fn test_first_child_of_leaf_node() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let leaf = doc.create_node(NodeKind::Text {
+            content: "leaf".to_string(),
+        });
+        doc.append_child(root, leaf);
+
+        assert_eq!(doc.first_child(leaf), None);
+    }
+
+    #[test]
+    fn test_last_child_of_leaf_node() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let leaf = doc.create_node(NodeKind::Text {
+            content: "leaf".to_string(),
+        });
+        doc.append_child(root, leaf);
+
+        assert_eq!(doc.last_child(leaf), None);
+    }
+
+    #[test]
+    fn test_first_child_last_child_single_child() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let only = doc.create_node(NodeKind::Element {
+            name: "only".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        doc.append_child(root, only);
+
+        assert_eq!(doc.first_child(root), Some(only));
+        assert_eq!(doc.last_child(root), Some(only));
+    }
+
+    #[test]
+    fn test_first_child_last_child_multiple_children() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let first = doc.create_node(NodeKind::Text {
+            content: "first".to_string(),
+        });
+        let middle = doc.create_node(NodeKind::Text {
+            content: "middle".to_string(),
+        });
+        let last = doc.create_node(NodeKind::Text {
+            content: "last".to_string(),
+        });
+
+        doc.append_child(root, first);
+        doc.append_child(root, middle);
+        doc.append_child(root, last);
+
+        assert_eq!(doc.first_child(root), Some(first));
+        assert_eq!(doc.last_child(root), Some(last));
+        assert_ne!(doc.first_child(root), doc.last_child(root));
+    }
+
+    #[test]
+    fn test_next_sibling_last_has_none() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.next_sibling(b), None);
+    }
+
+    #[test]
+    fn test_prev_sibling_first_has_none() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+
+        assert_eq!(doc.prev_sibling(a), None);
+        assert_eq!(doc.prev_sibling(b), Some(a));
+    }
+
+    #[test]
+    fn test_next_prev_sibling_chain() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        let b = doc.create_node(NodeKind::Text {
+            content: "B".to_string(),
+        });
+        let c = doc.create_node(NodeKind::Text {
+            content: "C".to_string(),
+        });
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        // Forward traversal
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.next_sibling(b), Some(c));
+        assert_eq!(doc.next_sibling(c), None);
+
+        // Backward traversal
+        assert_eq!(doc.prev_sibling(c), Some(b));
+        assert_eq!(doc.prev_sibling(b), Some(a));
+        assert_eq!(doc.prev_sibling(a), None);
+    }
+
+    #[test]
+    fn test_parse_str_simple_element() {
+        let Ok(doc) = Document::parse_str("<root/>") else {
+            panic!("failed to parse simple element");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.node_name(root), Some("root"));
+    }
+
+    #[test]
+    fn test_parse_str_nested_elements() {
+        let Ok(doc) = Document::parse_str("<parent><child/></parent>") else {
+            panic!("failed to parse nested elements");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.node_name(root), Some("parent"));
+
+        let Some(child) = doc.first_child(root) else {
+            panic!("root element has no children");
+        };
+        assert_eq!(doc.node_name(child), Some("child"));
+    }
+
+    #[test]
+    fn test_parse_str_with_text_content() {
+        let Ok(doc) = Document::parse_str("<msg>hello</msg>") else {
+            panic!("failed to parse element with text");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.text_content(root), "hello");
+    }
+
+    #[test]
+    fn test_parse_str_with_attributes() {
+        let Ok(doc) = Document::parse_str(r#"<div id="main" class="x"/>"#) else {
+            panic!("failed to parse element with attributes");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.attribute(root, "id"), Some("main"));
+        assert_eq!(doc.attribute(root, "class"), Some("x"));
+    }
+
+    #[test]
+    fn test_parse_bytes_utf8() {
+        let input = b"<root>hello</root>";
+        let Ok(doc) = Document::parse_bytes(input) else {
+            panic!("failed to parse bytes");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.node_name(root), Some("root"));
+        assert_eq!(doc.text_content(root), "hello");
+    }
+
+    #[test]
+    fn test_parse_bytes_with_xml_declaration() {
+        let input = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><data/>";
+        let Ok(doc) = Document::parse_bytes(input) else {
+            panic!("failed to parse bytes with XML declaration");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.node_name(root), Some("data"));
+    }
+
+    #[test]
+    fn test_parse_bytes_with_bom() {
+        // UTF-8 BOM followed by XML
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        input.extend_from_slice(b"<root/>");
+        let Ok(doc) = Document::parse_bytes(&input) else {
+            panic!("failed to parse bytes with BOM");
+        };
+        let Some(root) = doc.root_element() else {
+            panic!("parsed document has no root element");
+        };
+        assert_eq!(doc.node_name(root), Some("root"));
+    }
+
+    #[test]
+    fn test_node_count_empty_document() {
+        let doc = Document::new();
+        // A new document has exactly 1 node: the document root node
+        assert_eq!(doc.node_count(), 1);
+    }
+
+    #[test]
+    fn test_node_count_after_creating_nodes() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Element {
+            name: "a".to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        });
+        assert_eq!(doc.node_count(), 2);
+
+        let b = doc.create_node(NodeKind::Text {
+            content: "text".to_string(),
+        });
+        assert_eq!(doc.node_count(), 3);
+
+        doc.append_child(root, a);
+        doc.append_child(a, b);
+
+        // Appending does not change the count — nodes already exist in arena
+        assert_eq!(doc.node_count(), 3);
+    }
+
+    #[test]
+    fn test_node_count_after_remove() {
+        let mut doc = Document::new();
+        let root = doc.root();
+
+        let a = doc.create_node(NodeKind::Text {
+            content: "A".to_string(),
+        });
+        doc.append_child(root, a);
+        assert_eq!(doc.node_count(), 2);
+
+        // Removing a node does not free it from the arena
+        doc.remove_node(a);
+        assert_eq!(doc.node_count(), 2);
+    }
 }

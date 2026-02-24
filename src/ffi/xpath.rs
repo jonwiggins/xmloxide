@@ -42,7 +42,9 @@ pub unsafe extern "C" fn xmloxide_xpath_eval(
         set_last_error("null pointer argument");
         return std::ptr::null_mut();
     }
+    // SAFETY: Null checks above. Caller guarantees both pointers are valid.
     let doc = unsafe { &*doc };
+    // SAFETY: Null check above. Caller guarantees `expr` is a valid null-terminated string.
     let c_expr = unsafe { CStr::from_ptr(expr) };
     let Ok(expr_str) = c_expr.to_str() else {
         set_last_error("invalid UTF-8 in XPath expression");
@@ -79,6 +81,7 @@ pub unsafe extern "C" fn xmloxide_xpath_result_type(result: *const XPathValue) -
     if result.is_null() {
         return -1;
     }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     match val {
         XPathValue::NodeSet(_) => XMLOXIDE_XPATH_NODESET,
@@ -100,6 +103,7 @@ pub unsafe extern "C" fn xmloxide_xpath_result_boolean(result: *const XPathValue
     if result.is_null() {
         return 0;
     }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     i32::from(val.to_boolean())
 }
@@ -116,6 +120,7 @@ pub unsafe extern "C" fn xmloxide_xpath_result_number(result: *const XPathValue)
     if result.is_null() {
         return f64::NAN;
     }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     val.to_number()
 }
@@ -133,6 +138,7 @@ pub unsafe extern "C" fn xmloxide_xpath_result_string(result: *const XPathValue)
     if result.is_null() {
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     to_c_string(&val.to_xpath_string())
 }
@@ -149,6 +155,7 @@ pub unsafe extern "C" fn xmloxide_xpath_nodeset_count(result: *const XPathValue)
     if result.is_null() {
         return 0;
     }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     match val {
         XPathValue::NodeSet(nodes) => nodes.len(),
@@ -171,6 +178,7 @@ pub unsafe extern "C" fn xmloxide_xpath_nodeset_item(
     if result.is_null() {
         return 0;
     }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     match val {
         XPathValue::NodeSet(nodes) => nodes.get(index).map_or(0, |id| id.into_raw()),
@@ -188,6 +196,7 @@ pub unsafe extern "C" fn xmloxide_xpath_nodeset_item(
 #[no_mangle]
 pub unsafe extern "C" fn xmloxide_xpath_free_result(result: *mut XPathValue) {
     if !result.is_null() {
+        // SAFETY: `result` was created by `Box::into_raw` in `xmloxide_xpath_eval`, and is non-null.
         unsafe {
             drop(Box::from_raw(result));
         }

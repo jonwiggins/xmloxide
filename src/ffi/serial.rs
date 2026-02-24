@@ -23,6 +23,7 @@ pub unsafe extern "C" fn xmloxide_serialize(doc: *const Document) -> *mut c_char
         set_last_error("null document pointer");
         return std::ptr::null_mut();
     }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
     let doc = unsafe { &*doc };
     let output = crate::serial::serialize(doc);
     to_c_string(&output)

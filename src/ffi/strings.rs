@@ -25,6 +25,7 @@ pub(crate) fn to_c_string(s: &str) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn xmloxide_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
+        // SAFETY: `ptr` was created by `CString::into_raw` via `to_c_string`, and is non-null.
         unsafe {
             drop(CString::from_raw(ptr));
         }
