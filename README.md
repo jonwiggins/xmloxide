@@ -66,6 +66,7 @@ assert_eq!(result.to_number(), 1.0);
 
 ```rust
 use xmloxide::sax::{parse_sax, SaxHandler, DefaultHandler};
+use xmloxide::parser::ParseOptions;
 
 struct MyHandler;
 impl SaxHandler for MyHandler {
@@ -75,7 +76,7 @@ impl SaxHandler for MyHandler {
     }
 }
 
-parse_sax("<root><child/></root>", &mut MyHandler);
+parse_sax("<root><child/></root>", &ParseOptions::default(), &mut MyHandler).unwrap();
 ```
 
 ### HTML Parsing

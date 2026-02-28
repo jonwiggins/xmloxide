@@ -52,7 +52,7 @@ cargo build
 cargo test
 
 # Run the linter
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Check formatting
 cargo fmt --all -- --check
@@ -78,7 +78,7 @@ The project uses standard Cargo tooling with a few configuration files:
 | `rustfmt.toml` | Formatting rules (max width 100, shorthand syntax) |
 | `clippy.toml` | Clippy thresholds (argument count, type complexity) |
 | `Cargo.toml` `[lints]` | Clippy pedantic enabled, `unwrap`/`expect` warned |
-| `.githooks/pre-commit` | Pre-commit hook (fmt + clippy + test) |
+| `scripts/pre-commit` | Pre-commit hook (fmt + clippy + test + doc) |
 | `.github/workflows/ci.yml` | CI pipeline (fmt, clippy, test on stable + MSRV, docs) |
 
 ## How to Contribute
@@ -106,13 +106,12 @@ to see if it's already planned.
 4. **Make your changes** following the guidelines below.
 5. **Submit a pull request** against `main`.
 
-### Current Project Phase
+### Current Project Status
 
-xmloxide follows a phased implementation plan (see [CLAUDE.md](CLAUDE.md) for
-the full roadmap). We are currently in **Phase 1** (core tree, XML parser,
-serialization). Contributions that align with the current phase are most likely
-to be reviewed and merged quickly. If you want to work on a later phase, open
-an issue to discuss timing and design before investing significant effort.
+xmloxide v0.1.0 implements the full feature set: XML/HTML parsing, DOM, SAX2,
+XmlReader, XPath 1.0, DTD/RelaxNG/XSD validation, C14N, XInclude, XML Catalogs,
+and C/C++ FFI. Contributions that improve conformance, performance, error
+messages, documentation, or test coverage are especially welcome.
 
 ### Good First Contributions
 
@@ -131,9 +130,9 @@ points:
 
 2. **Ensure CI passes.** Your PR must pass all CI checks:
    - `cargo fmt --all -- --check`
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo test` (on both stable and MSRV 1.81)
-   - `cargo doc --no-deps` with no warnings
+   - `cargo clippy --all-targets --all-features -- -D warnings`
+   - `cargo test --all-features` (on both stable and MSRV 1.81)
+   - `cargo doc --all-features --no-deps` with no warnings
 
 3. **Write tests.** Bug fixes should include a regression test. New features
    should include unit tests and, where applicable, roundtrip tests
@@ -310,8 +309,8 @@ serialization changes, reference the relevant section:
 ## Security
 
 If you discover a security vulnerability, please **do not** open a public
-issue. Instead, report it privately by emailing the maintainers or using
-GitHub's [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
+issue. Instead, report it privately using GitHub's
+[private vulnerability reporting](https://github.com/jonwiggins/xmloxide/security/advisories/new)
 feature on the repository.
 
 Include:
