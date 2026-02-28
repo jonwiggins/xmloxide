@@ -144,19 +144,27 @@ xmllint --html page.html
 
 ## Performance
 
-xmloxide **matches or beats libxml2** in parsing throughput across a range of document sizes and styles:
+Parsing throughput is competitive with libxml2, with stricter conformance validation adding some overhead. Serialization is **1.6-2.5x faster** thanks to the arena-based tree design.
+
+**Parsing:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 29.5 µs | 31.7 µs | **7% faster** |
-| SVG drawing | 6.3 KB | 69.7 µs | 82.0 µs | **15% faster** |
-| Maven POM | 11.5 KB | 91.2 µs | 93.2 µs | **2% faster** |
-| XHTML page | 10.2 KB | 78.4 µs | 76.6 µs | ~3% slower |
-| Large (400 KB) | 400 KB | 2.52 ms | 2.57 ms | **2% faster** |
+| Atom feed | 4.9 KB | 31.2 µs | 24.5 µs | ~27% slower |
+| SVG drawing | 6.3 KB | 61.6 µs | 63.1 µs | **~2% faster** |
+| Maven POM | 11.5 KB | 92.4 µs | 71.9 µs | ~28% slower |
+| XHTML page | 10.2 KB | 79.6 µs | 59.6 µs | ~34% slower |
+| Large (374 KB) | 374 KB | 2.36 ms | 2.00 ms | ~18% slower |
 
-Serialization is **1.5-2.3x faster** than libxml2 thanks to the arena-based tree design.
+**Serialization:**
 
-Key optimizations: O(1) character peek (vs libxml2's O(n) in some paths), bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, and inline entity resolution.
+| Document | Size | xmloxide | libxml2 | Result |
+|----------|------|----------|---------|--------|
+| Atom feed | 4.9 KB | 10.8 µs | 16.8 µs | **1.6x faster** |
+| Maven POM | 11.5 KB | 18.7 µs | 46.1 µs | **2.5x faster** |
+| Large (374 KB) | 374 KB | 577 µs | 1370 µs | **2.4x faster** |
+
+Key optimizations: arena-based tree for fast serialization, O(1) character peek, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, and inline entity resolution.
 
 ```sh
 # Run benchmarks (requires libxml2 system library)
