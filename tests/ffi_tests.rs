@@ -11,6 +11,8 @@ use std::os::raw::c_char;
 use xmloxide::ffi::c14n::*;
 use xmloxide::ffi::catalog::*;
 use xmloxide::ffi::document::*;
+use xmloxide::ffi::push::*;
+use xmloxide::ffi::reader::*;
 use xmloxide::ffi::serial::*;
 use xmloxide::ffi::strings::*;
 use xmloxide::ffi::tree::*;
@@ -1469,5 +1471,357 @@ fn test_catalog_null_safety() {
         assert!(xmloxide_catalog_resolve_system(std::ptr::null(), std::ptr::null()).is_null());
         assert!(xmloxide_catalog_resolve_public(std::ptr::null(), std::ptr::null()).is_null());
         assert!(xmloxide_catalog_resolve_uri(std::ptr::null(), std::ptr::null()).is_null());
+    }
+}
+
+// ---------- Push parser tests ----------
+
+#[test]
+fn test_push_parser_basic() {
+    unsafe {
+        let parser = xmloxide_push_parser_new();
+        assert!(!parser.is_null());
+
+        let chunk1 = b"<root>";
+        let chunk2 = b"<child>Hello</child>";
+        let chunk3 = b"</root>";
+
+        xmloxide_push_parser_push(parser, chunk1.as_ptr(), chunk1.len());
+        xmloxide_push_parser_push(parser, chunk2.as_ptr(), chunk2.len());
+        xmloxide_push_parser_push(parser, chunk3.as_ptr(), chunk3.len());
+
+        let doc = xmloxide_push_parser_finish(parser);
+        assert!(!doc.is_null());
+
+        let root = xmloxide_doc_root_element(doc);
+        let name = c_string_to_owned(xmloxide_node_name(doc, root));
+        assert_eq!(name.as_deref(), Some("root"));
+
+        let child = xmloxide_node_first_child(doc, root);
+        let child_name = c_string_to_owned(xmloxide_node_name(doc, child));
+        assert_eq!(child_name.as_deref(), Some("child"));
+
+        let text = c_string_to_owned(xmloxide_node_text_content(doc, child));
+        assert_eq!(text.as_deref(), Some("Hello"));
+
+        xmloxide_free_doc(doc);
+        // parser was consumed by finish — do NOT free it
+    }
+}
+
+#[test]
+fn test_push_parser_buffered_bytes() {
+    unsafe {
+        let parser = xmloxide_push_parser_new();
+        assert_eq!(xmloxide_push_parser_buffered_bytes(parser), 0);
+
+        let data = b"<root/>";
+        xmloxide_push_parser_push(parser, data.as_ptr(), data.len());
+        assert_eq!(xmloxide_push_parser_buffered_bytes(parser), 7);
+
+        let doc = xmloxide_push_parser_finish(parser);
+        assert!(!doc.is_null());
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_push_parser_reset() {
+    unsafe {
+        let parser = xmloxide_push_parser_new();
+
+        let bad = b"<incomplete";
+        xmloxide_push_parser_push(parser, bad.as_ptr(), bad.len());
+        assert_eq!(xmloxide_push_parser_buffered_bytes(parser), 11);
+
+        xmloxide_push_parser_reset(parser);
+        assert_eq!(xmloxide_push_parser_buffered_bytes(parser), 0);
+
+        let good = b"<root/>";
+        xmloxide_push_parser_push(parser, good.as_ptr(), good.len());
+
+        let doc = xmloxide_push_parser_finish(parser);
+        assert!(!doc.is_null());
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_push_parser_free_without_finish() {
+    unsafe {
+        let parser = xmloxide_push_parser_new();
+        let data = b"<root/>";
+        xmloxide_push_parser_push(parser, data.as_ptr(), data.len());
+        // Discard without finishing
+        xmloxide_push_parser_free(parser);
+    }
+}
+
+#[test]
+fn test_push_parser_null_safety() {
+    unsafe {
+        // Push to null parser — should not crash
+        xmloxide_push_parser_push(std::ptr::null_mut(), std::ptr::null(), 0);
+        // Finish null parser
+        let doc = xmloxide_push_parser_finish(std::ptr::null_mut());
+        assert!(doc.is_null());
+        // Buffered bytes on null
+        assert_eq!(xmloxide_push_parser_buffered_bytes(std::ptr::null()), 0);
+        // Reset null
+        xmloxide_push_parser_reset(std::ptr::null_mut());
+        // Free null
+        xmloxide_push_parser_free(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn test_push_parser_malformed_error() {
+    unsafe {
+        let parser = xmloxide_push_parser_new();
+        let data = b"<a></b>";
+        xmloxide_push_parser_push(parser, data.as_ptr(), data.len());
+        let doc = xmloxide_push_parser_finish(parser);
+        assert!(doc.is_null());
+        assert!(last_error().is_some());
+    }
+}
+
+#[test]
+fn test_push_parser_split_tokens() {
+    unsafe {
+        let parser = xmloxide_push_parser_new();
+        // Split element name across chunks
+        let chunks: &[&[u8]] = &[b"<ro", b"ot at", b"tr=\"val", b"ue\"/>"];
+        for chunk in chunks {
+            xmloxide_push_parser_push(parser, chunk.as_ptr(), chunk.len());
+        }
+        let doc = xmloxide_push_parser_finish(parser);
+        assert!(!doc.is_null());
+
+        let root = xmloxide_doc_root_element(doc);
+        let name = c_string_to_owned(xmloxide_node_name(doc, root));
+        assert_eq!(name.as_deref(), Some("root"));
+
+        let attr_name = CString::new("attr").unwrap();
+        let val = c_string_to_owned(xmloxide_node_attribute(doc, root, attr_name.as_ptr()));
+        assert_eq!(val.as_deref(), Some("value"));
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+// ---------- XmlReader tests ----------
+
+#[test]
+fn test_reader_basic_traversal() {
+    let xml = CString::new("<root><child>Hello</child></root>").unwrap();
+    unsafe {
+        let reader = xmloxide_reader_new(xml.as_ptr());
+        assert!(!reader.is_null());
+
+        // First read: <root>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ELEMENT);
+        let name = c_string_to_owned(xmloxide_reader_name(reader));
+        assert_eq!(name.as_deref(), Some("root"));
+        assert_eq!(xmloxide_reader_depth(reader), 0);
+
+        // <child>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ELEMENT);
+        let name = c_string_to_owned(xmloxide_reader_name(reader));
+        assert_eq!(name.as_deref(), Some("child"));
+        assert_eq!(xmloxide_reader_depth(reader), 1);
+
+        // Text "Hello"
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_TEXT);
+        let val = c_string_to_owned(xmloxide_reader_value(reader));
+        assert_eq!(val.as_deref(), Some("Hello"));
+        assert_eq!(xmloxide_reader_has_value(reader), 1);
+
+        // </child>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(
+            xmloxide_reader_node_type(reader),
+            XMLOXIDE_READER_END_ELEMENT
+        );
+
+        // </root>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(
+            xmloxide_reader_node_type(reader),
+            XMLOXIDE_READER_END_ELEMENT
+        );
+
+        // End of document
+        assert_eq!(xmloxide_reader_read(reader), 0);
+
+        xmloxide_reader_free(reader);
+    }
+}
+
+#[test]
+fn test_reader_attributes() {
+    let xml = CString::new("<root id=\"42\" class=\"big\"/>").unwrap();
+    unsafe {
+        let reader = xmloxide_reader_new(xml.as_ptr());
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ELEMENT);
+        assert_eq!(xmloxide_reader_is_empty_element(reader), 1);
+        assert_eq!(xmloxide_reader_attribute_count(reader), 2);
+
+        let attr_name = CString::new("id").unwrap();
+        let val = c_string_to_owned(xmloxide_reader_get_attribute(reader, attr_name.as_ptr()));
+        assert_eq!(val.as_deref(), Some("42"));
+
+        let attr_name = CString::new("class").unwrap();
+        let val = c_string_to_owned(xmloxide_reader_get_attribute(reader, attr_name.as_ptr()));
+        assert_eq!(val.as_deref(), Some("big"));
+
+        // Missing attribute
+        let missing = CString::new("nonexistent").unwrap();
+        assert!(xmloxide_reader_get_attribute(reader, missing.as_ptr()).is_null());
+
+        xmloxide_reader_free(reader);
+    }
+}
+
+#[test]
+fn test_reader_attribute_navigation() {
+    let xml = CString::new("<root a=\"1\" b=\"2\"/>").unwrap();
+    unsafe {
+        let reader = xmloxide_reader_new(xml.as_ptr());
+        assert_eq!(xmloxide_reader_read(reader), 1);
+
+        // Move to first attribute
+        assert_eq!(xmloxide_reader_move_to_first_attribute(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ATTRIBUTE);
+        let name = c_string_to_owned(xmloxide_reader_name(reader));
+        assert_eq!(name.as_deref(), Some("a"));
+        let val = c_string_to_owned(xmloxide_reader_value(reader));
+        assert_eq!(val.as_deref(), Some("1"));
+
+        // Move to next attribute
+        assert_eq!(xmloxide_reader_move_to_next_attribute(reader), 1);
+        let name = c_string_to_owned(xmloxide_reader_name(reader));
+        assert_eq!(name.as_deref(), Some("b"));
+        let val = c_string_to_owned(xmloxide_reader_value(reader));
+        assert_eq!(val.as_deref(), Some("2"));
+
+        // No more attributes
+        assert_eq!(xmloxide_reader_move_to_next_attribute(reader), 0);
+
+        // Move back to element
+        assert_eq!(xmloxide_reader_move_to_element(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ELEMENT);
+
+        xmloxide_reader_free(reader);
+    }
+}
+
+#[test]
+fn test_reader_namespace() {
+    let xml =
+        CString::new("<ns:root xmlns:ns=\"http://example.com\"><ns:child/></ns:root>").unwrap();
+    unsafe {
+        let reader = xmloxide_reader_new(xml.as_ptr());
+        assert_eq!(xmloxide_reader_read(reader), 1);
+
+        let local = c_string_to_owned(xmloxide_reader_local_name(reader));
+        assert_eq!(local.as_deref(), Some("root"));
+
+        let prefix = c_string_to_owned(xmloxide_reader_prefix(reader));
+        assert_eq!(prefix.as_deref(), Some("ns"));
+
+        let ns = c_string_to_owned(xmloxide_reader_namespace_uri(reader));
+        assert_eq!(ns.as_deref(), Some("http://example.com"));
+
+        xmloxide_reader_free(reader);
+    }
+}
+
+#[test]
+fn test_reader_comment_and_pi() {
+    let xml = CString::new("<?target data?><root><!-- comment --></root>").unwrap();
+    unsafe {
+        let reader = xmloxide_reader_new(xml.as_ptr());
+
+        // PI
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_PI);
+        let name = c_string_to_owned(xmloxide_reader_name(reader));
+        assert_eq!(name.as_deref(), Some("target"));
+        let val = c_string_to_owned(xmloxide_reader_value(reader));
+        assert_eq!(val.as_deref(), Some("data"));
+
+        // <root>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ELEMENT);
+
+        // Comment
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_COMMENT);
+        let val = c_string_to_owned(xmloxide_reader_value(reader));
+        assert_eq!(val.as_deref(), Some(" comment "));
+
+        xmloxide_reader_free(reader);
+    }
+}
+
+#[test]
+fn test_reader_null_safety() {
+    unsafe {
+        // Null input
+        let reader = xmloxide_reader_new(std::ptr::null());
+        assert!(reader.is_null());
+        assert!(last_error().is_some());
+
+        // Null reader in all functions
+        assert_eq!(xmloxide_reader_read(std::ptr::null_mut()), -1);
+        assert_eq!(
+            xmloxide_reader_node_type(std::ptr::null()),
+            XMLOXIDE_READER_NONE
+        );
+        assert!(xmloxide_reader_name(std::ptr::null()).is_null());
+        assert!(xmloxide_reader_local_name(std::ptr::null()).is_null());
+        assert!(xmloxide_reader_prefix(std::ptr::null()).is_null());
+        assert!(xmloxide_reader_namespace_uri(std::ptr::null()).is_null());
+        assert!(xmloxide_reader_value(std::ptr::null()).is_null());
+        assert_eq!(xmloxide_reader_depth(std::ptr::null()), 0);
+        assert_eq!(xmloxide_reader_is_empty_element(std::ptr::null()), 0);
+        assert_eq!(xmloxide_reader_has_value(std::ptr::null()), 0);
+        assert_eq!(xmloxide_reader_attribute_count(std::ptr::null()), 0);
+        assert!(xmloxide_reader_get_attribute(std::ptr::null(), std::ptr::null()).is_null());
+        assert_eq!(
+            xmloxide_reader_move_to_first_attribute(std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(
+            xmloxide_reader_move_to_next_attribute(std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(xmloxide_reader_move_to_element(std::ptr::null_mut()), 0);
+        // Free null is safe
+        xmloxide_reader_free(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn test_reader_empty_element() {
+    let xml = CString::new("<root><br/></root>").unwrap();
+    unsafe {
+        let reader = xmloxide_reader_new(xml.as_ptr());
+
+        // <root>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_is_empty_element(reader), 0);
+
+        // <br/>
+        assert_eq!(xmloxide_reader_read(reader), 1);
+        assert_eq!(xmloxide_reader_node_type(reader), XMLOXIDE_READER_ELEMENT);
+        assert_eq!(xmloxide_reader_is_empty_element(reader), 1);
+
+        xmloxide_reader_free(reader);
     }
 }

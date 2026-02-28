@@ -18,7 +18,9 @@
 //!
 //! # Known Limitations
 //!
-//! - The `namespace::` axis is not yet implemented and returns empty results.
+//! - The `namespace::` axis returns the element's `NodeId` when in-scope
+//!   namespaces match (following the same pattern as the attribute axis).
+//!   Namespace nodes are not materialized as separate tree nodes.
 //!
 //! # Submodules
 //!

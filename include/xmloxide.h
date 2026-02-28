@@ -52,6 +52,12 @@ typedef struct xmloxide_validation_result xmloxide_validation_result;
 /** Opaque XML Catalog handle. */
 typedef struct xmloxide_catalog xmloxide_catalog;
 
+/** Opaque push parser handle. */
+typedef struct xmloxide_push_parser xmloxide_push_parser;
+
+/** Opaque XML reader handle. */
+typedef struct xmloxide_reader xmloxide_reader;
+
 /* ---------- Node type constants ---------- */
 
 #define XMLOXIDE_NODE_ELEMENT       1
@@ -544,6 +550,165 @@ char *xmloxide_catalog_resolve_public(const xmloxide_catalog *catalog,
  */
 char *xmloxide_catalog_resolve_uri(const xmloxide_catalog *catalog,
                                    const char *uri);
+
+/* ---------- Push parser (incremental) ---------- */
+
+/**
+ * Creates a new push parser with default options.
+ * The returned parser must be consumed via xmloxide_push_parser_finish()
+ * or freed with xmloxide_push_parser_free().
+ */
+xmloxide_push_parser *xmloxide_push_parser_new(void);
+
+/**
+ * Feeds a chunk of raw bytes into the push parser.
+ * Data can be split at arbitrary byte boundaries.
+ */
+void xmloxide_push_parser_push(xmloxide_push_parser *parser,
+                                const uint8_t *data, size_t len);
+
+/**
+ * Finalizes parsing and returns the constructed document.
+ *
+ * This CONSUMES the parser — the parser pointer becomes invalid after
+ * this call. Do NOT call xmloxide_push_parser_free() after finish.
+ *
+ * Returns a document pointer on success, or NULL on failure.
+ * The returned document must be freed with xmloxide_free_doc().
+ */
+xmloxide_document *xmloxide_push_parser_finish(xmloxide_push_parser *parser);
+
+/**
+ * Returns the number of bytes currently buffered in the push parser.
+ */
+size_t xmloxide_push_parser_buffered_bytes(const xmloxide_push_parser *parser);
+
+/**
+ * Resets the push parser, discarding all buffered data.
+ * The parser can then be reused for a new document.
+ */
+void xmloxide_push_parser_reset(xmloxide_push_parser *parser);
+
+/**
+ * Frees a push parser without finishing it.
+ * Use this to discard a parser whose data you no longer need.
+ * Passing NULL is safe. Do NOT call after finish().
+ */
+void xmloxide_push_parser_free(xmloxide_push_parser *parser);
+
+/* ---------- XmlReader (pull-based streaming) ---------- */
+
+/*
+ * Reader node type constants (matching libxml2's xmlReaderTypes).
+ */
+#define XMLOXIDE_READER_NONE             0
+#define XMLOXIDE_READER_ELEMENT          1
+#define XMLOXIDE_READER_ATTRIBUTE        2
+#define XMLOXIDE_READER_TEXT             3
+#define XMLOXIDE_READER_CDATA            4
+#define XMLOXIDE_READER_PI               7
+#define XMLOXIDE_READER_COMMENT          8
+#define XMLOXIDE_READER_DOCUMENT_TYPE   10
+#define XMLOXIDE_READER_WHITESPACE      13
+#define XMLOXIDE_READER_END_ELEMENT     15
+#define XMLOXIDE_READER_XML_DECLARATION 17
+#define XMLOXIDE_READER_END_DOCUMENT    (-1)
+
+/**
+ * Creates a new XmlReader from a null-terminated UTF-8 string.
+ * Returns an opaque reader pointer, or NULL on failure.
+ * The reader must be freed with xmloxide_reader_free().
+ */
+xmloxide_reader *xmloxide_reader_new(const char *input);
+
+/**
+ * Advances the reader to the next node.
+ * Returns 1 if a node was read, 0 at end of document, -1 on error.
+ */
+int32_t xmloxide_reader_read(xmloxide_reader *reader);
+
+/**
+ * Returns the node type of the current node.
+ * Returns one of the XMLOXIDE_READER_* constants.
+ */
+int32_t xmloxide_reader_node_type(const xmloxide_reader *reader);
+
+/**
+ * Returns the qualified name of the current node, or NULL.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_reader_name(const xmloxide_reader *reader);
+
+/**
+ * Returns the local name of the current node (without prefix), or NULL.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_reader_local_name(const xmloxide_reader *reader);
+
+/**
+ * Returns the namespace prefix of the current node, or NULL.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_reader_prefix(const xmloxide_reader *reader);
+
+/**
+ * Returns the namespace URI of the current node, or NULL.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_reader_namespace_uri(const xmloxide_reader *reader);
+
+/**
+ * Returns the value of the current node (text, comment, attribute value),
+ * or NULL for elements and end elements.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_reader_value(const xmloxide_reader *reader);
+
+/** Returns the depth of the current node in the document tree. */
+uint32_t xmloxide_reader_depth(const xmloxide_reader *reader);
+
+/**
+ * Returns 1 if the current element is self-closing (empty), 0 otherwise.
+ */
+int32_t xmloxide_reader_is_empty_element(const xmloxide_reader *reader);
+
+/**
+ * Returns 1 if the current node has a value, 0 otherwise.
+ */
+int32_t xmloxide_reader_has_value(const xmloxide_reader *reader);
+
+/** Returns the number of attributes on the current element. */
+size_t xmloxide_reader_attribute_count(const xmloxide_reader *reader);
+
+/**
+ * Returns the value of an attribute by name on the current element, or NULL.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_reader_get_attribute(const xmloxide_reader *reader,
+                                     const char *name);
+
+/**
+ * Moves the reader to the first attribute of the current element.
+ * Returns 1 if successful, 0 if no attributes or not on an element.
+ */
+int32_t xmloxide_reader_move_to_first_attribute(xmloxide_reader *reader);
+
+/**
+ * Moves the reader to the next attribute.
+ * Returns 1 if successful, 0 if no more attributes.
+ */
+int32_t xmloxide_reader_move_to_next_attribute(xmloxide_reader *reader);
+
+/**
+ * Moves the reader back to the element from an attribute.
+ * Returns 1 if moved back, 0 if not on an attribute.
+ */
+int32_t xmloxide_reader_move_to_element(xmloxide_reader *reader);
+
+/**
+ * Frees a reader. Passing NULL is safe and does nothing.
+ */
+void xmloxide_reader_free(xmloxide_reader *reader);
 
 /* ---------- String lifecycle ---------- */
 

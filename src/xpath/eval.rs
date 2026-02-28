@@ -216,7 +216,9 @@ impl<'a> XPathContext<'a> {
         }
 
         let mut nodes = vec![self.context_node];
-        for (i, step) in steps.iter().enumerate() {
+        let mut i = 0;
+        while i < steps.len() {
+            let step = &steps[i];
             // If the last step is an attribute axis, resolve to attribute values
             if i == steps.len() - 1 && step.axis == Axis::Attribute && step.predicates.is_empty() {
                 // For multiple context nodes, return the first attribute value found
@@ -228,9 +230,44 @@ impl<'a> XPathContext<'a> {
                 }
                 return Ok(XPathValue::String(String::new()));
             }
-            nodes = self.apply_step(&nodes, step)?;
+            // Optimization: fuse descendant-or-self::node()/child::X into
+            // descendant::X — avoids materializing the huge intermediate
+            // node-set that `//` produces.
+            if let Some(fused) = Self::try_fuse_descendant_child(steps, i) {
+                nodes = self.apply_step(&nodes, &fused)?;
+                i += 2; // skip both steps
+            } else {
+                nodes = self.apply_step(&nodes, step)?;
+                i += 1;
+            }
         }
         Ok(XPathValue::NodeSet(nodes))
+    }
+
+    /// Tries to fuse `descendant-or-self::node()` + `child::X` at position `i`
+    /// into a single `descendant::X` step. Returns `None` if the pattern doesn't
+    /// match (e.g., the first step has predicates, or the second step isn't `child`).
+    fn try_fuse_descendant_child(steps: &[Step], i: usize) -> Option<Step> {
+        if i + 1 >= steps.len() {
+            return None;
+        }
+        let first = &steps[i];
+        let second = &steps[i + 1];
+        // Pattern: descendant-or-self::node() with no predicates,
+        // followed by child::X (with or without predicates).
+        if first.axis == Axis::DescendantOrSelf
+            && first.node_test == NodeTest::Node
+            && first.predicates.is_empty()
+            && second.axis == Axis::Child
+        {
+            Some(Step {
+                axis: Axis::Descendant,
+                node_test: second.node_test.clone(),
+                predicates: second.predicates.clone(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Evaluates an attribute access (e.g., `@id`) on a single element node.
@@ -263,8 +300,17 @@ impl<'a> XPathContext<'a> {
             return Ok(XPathValue::NodeSet(vec![root]));
         }
         let mut nodes = vec![root];
-        for step in steps {
-            nodes = self.apply_step(&nodes, step)?;
+        let mut i = 0;
+        while i < steps.len() {
+            // Optimization: fuse descendant-or-self::node()/child::X into
+            // descendant::X.
+            if let Some(fused) = Self::try_fuse_descendant_child(steps, i) {
+                nodes = self.apply_step(&nodes, &fused)?;
+                i += 2;
+            } else {
+                nodes = self.apply_step(&nodes, &steps[i])?;
+                i += 1;
+            }
         }
         Ok(XPathValue::NodeSet(nodes))
     }
@@ -273,14 +319,21 @@ impl<'a> XPathContext<'a> {
     /// set in document order with duplicates removed.
     fn apply_step(&self, input: &[NodeId], step: &Step) -> Result<Vec<NodeId>, XPathError> {
         let mut result: Vec<NodeId> = Vec::new();
-        let mut seen = HashSet::new();
-        for &node in input {
-            let axis_nodes = self.expand_axis(node, step.axis);
-            let filtered = self.apply_node_test(&axis_nodes, &step.node_test, step.axis, node);
-            for id in filtered {
-                if seen.insert(id) {
-                    result.push(id);
-                }
+
+        if input.len() == 1 {
+            // Fast path: single input node — no dedup needed.
+            self.expand_axis_filtered(input[0], step.axis, &step.node_test, &mut result);
+        } else {
+            // Multiple input nodes — need dedup via HashSet.
+            let mut seen = HashSet::new();
+            for &node in input {
+                self.expand_axis_filtered_dedup(
+                    node,
+                    step.axis,
+                    &step.node_test,
+                    &mut result,
+                    &mut seen,
+                );
             }
         }
 
@@ -308,7 +361,143 @@ impl<'a> XPathContext<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Axis expansion
+    // Fused axis expansion + node test filtering
+    // -----------------------------------------------------------------------
+
+    /// Expands axis from `node`, filters by `test`, and pushes matching nodes
+    /// directly into `result`. No intermediate Vec allocation.
+    fn expand_axis_filtered(
+        &self,
+        node: NodeId,
+        axis: Axis,
+        test: &NodeTest,
+        result: &mut Vec<NodeId>,
+    ) {
+        if axis == Axis::Attribute {
+            result.extend(self.apply_attribute_node_test(node, test));
+            return;
+        }
+        if axis == Axis::Namespace {
+            result.extend(self.apply_namespace_node_test(node, test));
+            return;
+        }
+        match axis {
+            Axis::Child => {
+                for child in self.doc.children(node) {
+                    if self.node_matches_test(child, test, axis) {
+                        result.push(child);
+                    }
+                }
+            }
+            Axis::Descendant => {
+                for desc in self.doc.descendants(node) {
+                    if self.node_matches_test(desc, test, axis) {
+                        result.push(desc);
+                    }
+                }
+            }
+            Axis::DescendantOrSelf => {
+                if self.node_matches_test(node, test, axis) {
+                    result.push(node);
+                }
+                for desc in self.doc.descendants(node) {
+                    if self.node_matches_test(desc, test, axis) {
+                        result.push(desc);
+                    }
+                }
+            }
+            Axis::Self_ => {
+                if self.node_matches_test(node, test, axis) {
+                    result.push(node);
+                }
+            }
+            Axis::Parent => {
+                if let Some(p) = self.doc.parent(node) {
+                    if self.node_matches_test(p, test, axis) {
+                        result.push(p);
+                    }
+                }
+            }
+            _ => {
+                // For less common axes, fall back to expand + filter
+                let axis_nodes = self.expand_axis(node, axis);
+                for id in axis_nodes {
+                    if self.node_matches_test(id, test, axis) {
+                        result.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Like `expand_axis_filtered` but with deduplication via `seen` `HashSet`.
+    fn expand_axis_filtered_dedup(
+        &self,
+        node: NodeId,
+        axis: Axis,
+        test: &NodeTest,
+        result: &mut Vec<NodeId>,
+        seen: &mut HashSet<NodeId>,
+    ) {
+        if axis == Axis::Attribute {
+            for id in self.apply_attribute_node_test(node, test) {
+                if seen.insert(id) {
+                    result.push(id);
+                }
+            }
+            return;
+        }
+        if axis == Axis::Namespace {
+            for id in self.apply_namespace_node_test(node, test) {
+                if seen.insert(id) {
+                    result.push(id);
+                }
+            }
+            return;
+        }
+        match axis {
+            Axis::Child => {
+                for child in self.doc.children(node) {
+                    if self.node_matches_test(child, test, axis) && seen.insert(child) {
+                        result.push(child);
+                    }
+                }
+            }
+            Axis::Descendant => {
+                for desc in self.doc.descendants(node) {
+                    if self.node_matches_test(desc, test, axis) && seen.insert(desc) {
+                        result.push(desc);
+                    }
+                }
+            }
+            Axis::DescendantOrSelf => {
+                if self.node_matches_test(node, test, axis) && seen.insert(node) {
+                    result.push(node);
+                }
+                for desc in self.doc.descendants(node) {
+                    if self.node_matches_test(desc, test, axis) && seen.insert(desc) {
+                        result.push(desc);
+                    }
+                }
+            }
+            Axis::Self_ => {
+                if self.node_matches_test(node, test, axis) && seen.insert(node) {
+                    result.push(node);
+                }
+            }
+            _ => {
+                let axis_nodes = self.expand_axis(node, axis);
+                for id in axis_nodes {
+                    if self.node_matches_test(id, test, axis) && seen.insert(id) {
+                        result.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Axis expansion (for uncommon axes)
     // -----------------------------------------------------------------------
 
     /// Returns all candidate nodes along the given axis from `node`.
@@ -354,9 +543,8 @@ impl<'a> XPathContext<'a> {
                 Vec::new()
             }
             Axis::Namespace => {
-                // The namespace axis is not yet implemented. Returns an empty
-                // set rather than erroring, matching the behavior of many
-                // XPath implementations that treat unsupported axes as empty.
+                // Namespace axis handled via apply_namespace_node_test
+                // in the fused paths. Fallback here for completeness.
                 Vec::new()
             }
             Axis::Self_ => vec![node],
@@ -436,28 +624,6 @@ impl<'a> XPathContext<'a> {
     // Node test filtering
     // -----------------------------------------------------------------------
 
-    /// Filters candidate nodes by the given node test.
-    ///
-    /// For the attribute axis, this returns attribute-matching node IDs from the
-    /// source element rather than from the candidate list.
-    fn apply_node_test(
-        &self,
-        candidates: &[NodeId],
-        test: &NodeTest,
-        axis: Axis,
-        context_node: NodeId,
-    ) -> Vec<NodeId> {
-        if axis == Axis::Attribute {
-            return self.apply_attribute_node_test(context_node, test);
-        }
-
-        candidates
-            .iter()
-            .copied()
-            .filter(|&id| self.node_matches_test(id, test, axis))
-            .collect()
-    }
-
     /// Checks whether a single node matches a node test for a given axis.
     fn node_matches_test(&self, id: NodeId, test: &NodeTest, axis: Axis) -> bool {
         let node = self.doc.node(id);
@@ -536,6 +702,76 @@ impl<'a> XPathContext<'a> {
         }
     }
 
+    /// Handles the namespace axis: returns the element's `NodeId` if the
+    /// element has any in-scope namespace bindings that match `test`.
+    ///
+    /// Namespace nodes in `XPath` 1.0 (section 5.4) represent namespace
+    /// bindings in scope on an element. Each element has one namespace node
+    /// for every namespace prefix in scope, plus the implicit `xml` prefix.
+    ///
+    /// Since namespace nodes are not tree nodes in our arena, we follow the
+    /// same pattern as the attribute axis: return the element's own `NodeId`
+    /// when a match is found.
+    fn apply_namespace_node_test(&self, element: NodeId, test: &NodeTest) -> Vec<NodeId> {
+        if !matches!(self.doc.node(element).kind, NodeKind::Element { .. }) {
+            return Vec::new();
+        }
+
+        // Collect in-scope namespace prefixes by walking from the element up
+        // to the root, respecting the closest declaration for each prefix.
+        let mut ns_map: Vec<(Option<&str>, &str)> = Vec::new();
+        let mut seen_prefixes: HashSet<Option<&str>> = HashSet::new();
+
+        let mut current = Some(element);
+        while let Some(id) = current {
+            for attr in self.doc.attributes(id) {
+                if attr.name == "xmlns" && attr.prefix.is_none() {
+                    // Default namespace declaration: xmlns="..."
+                    if seen_prefixes.insert(None) && !attr.value.is_empty() {
+                        ns_map.push((None, &attr.value));
+                    }
+                } else if attr.prefix.as_deref() == Some("xmlns") {
+                    // Prefixed namespace declaration: xmlns:prefix="..."
+                    // The local name (attr.name) is the namespace prefix.
+                    if seen_prefixes.insert(Some(attr.name.as_str())) {
+                        ns_map.push((Some(attr.name.as_str()), &attr.value));
+                    }
+                }
+            }
+            current = self.doc.parent(id);
+        }
+
+        // The xml prefix is always implicitly in scope.
+        if seen_prefixes.insert(Some("xml")) {
+            ns_map.push((Some("xml"), "http://www.w3.org/XML/1998/namespace"));
+        }
+
+        match test {
+            NodeTest::Name(name) => {
+                // Match a specific namespace prefix
+                let target: Option<&str> = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.as_str())
+                };
+                if ns_map.iter().any(|(prefix, _)| *prefix == target) {
+                    vec![element]
+                } else {
+                    Vec::new()
+                }
+            }
+            NodeTest::Wildcard | NodeTest::Node => {
+                // Return the element once if any namespace bindings exist.
+                if ns_map.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![element]
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Predicate evaluation
     // -----------------------------------------------------------------------
@@ -554,13 +790,33 @@ impl<'a> XPathContext<'a> {
         let size = nodes.len();
         let mut result = Vec::new();
 
+        // Fast path for positional predicates like [1], [last()], etc.
+        // If the predicate is a numeric literal, we can skip evaluating
+        // it for every node.
+        if let Expr::Number(n) = predicate {
+            // Convert float position to 1-based integer index.
+            // XPath positions are 1-based, so [1] means the first node.
+            let pos = *n;
+            if pos >= 1.0 && pos.fract() == 0.0 {
+                // Safe: we checked pos is a non-negative integer that fits in usize range.
+                // Node sets can never exceed u32::MAX nodes (arena limit), so no precision loss.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let idx = pos as usize - 1;
+                if let Some(&node) = nodes.get(idx) {
+                    result.push(node);
+                }
+            }
+            return Ok(result);
+        }
+
         for (i, &node) in nodes.iter().enumerate() {
             let ctx = XPathContext {
                 doc: self.doc,
                 context_node: node,
                 context_position: i + 1, // 1-based
                 context_size: size,
-                // Avoid cloning the HashMap when it's empty (the common case).
+                // Share the variables reference — avoid cloning the HashMap.
+                // HashMap::new() doesn't allocate, so this is free when empty.
                 variables: if self.variables.is_empty() {
                     HashMap::new()
                 } else {
@@ -1915,6 +2171,137 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => assert!(ns.is_empty()),
             other => panic!("expected empty node-set, got {other:?}"),
+        }
+    }
+
+    // -- Namespace axis -------------------------------------------------------
+
+    #[test]
+    fn test_namespace_axis_with_declaration() {
+        let xml = r#"<root xmlns:ns="http://example.com"><child/></root>"#;
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+
+        // namespace::ns should match because ns is in scope
+        let expr = parse("namespace::ns").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => assert!(!ns.is_empty(), "expected namespace::ns to match"),
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_axis_inherited() {
+        let xml = r#"<root xmlns:ns="http://example.com"><child/></root>"#;
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+        let child = doc.first_child(root).unwrap();
+
+        // namespace::ns should be in scope on child (inherited from root)
+        let expr = parse("namespace::ns").unwrap();
+        let ctx = XPathContext::new(&doc, child);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert!(!ns.is_empty(), "expected namespace::ns to be inherited");
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_axis_xml_always_in_scope() {
+        let xml = "<root/>";
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+
+        // namespace::xml should always be in scope
+        let expr = parse("namespace::xml").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert!(
+                    !ns.is_empty(),
+                    "expected namespace::xml to always be in scope"
+                );
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_axis_wildcard() {
+        let xml = r#"<root xmlns:a="http://a" xmlns:b="http://b"><child/></root>"#;
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+
+        // namespace::* should return non-empty (a, b, xml are all in scope)
+        let expr = parse("namespace::*").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert!(!ns.is_empty(), "expected namespace::* to match");
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_axis_nonexistent_prefix() {
+        let xml = "<root/>";
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+
+        // namespace::nonexistent should return empty
+        let expr = parse("namespace::nonexistent").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert!(ns.is_empty(), "expected no match for nonexistent prefix");
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_axis_on_text_node() {
+        let xml = "<root>text</root>";
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+        let text = doc.first_child(root).unwrap();
+
+        // namespace axis on a text node should return empty
+        let expr = parse("namespace::*").unwrap();
+        let ctx = XPathContext::new(&doc, text);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert!(ns.is_empty(), "namespace axis on text node should be empty");
+            }
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_axis_default_namespace() {
+        let xml = r#"<root xmlns="http://default"><child/></root>"#;
+        let doc = Document::parse_str(xml).unwrap();
+        let root = doc.root_element().unwrap();
+
+        // namespace::* should include the default namespace
+        let expr = parse("namespace::*").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let result = ctx.evaluate(&expr).unwrap();
+        match &result {
+            XPathValue::NodeSet(ns) => {
+                assert!(!ns.is_empty(), "expected default namespace to be in scope");
+            }
+            other => panic!("expected node-set, got {other:?}"),
         }
     }
 }

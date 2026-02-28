@@ -25,6 +25,8 @@
 pub mod c14n;
 pub mod catalog;
 pub mod document;
+pub mod push;
+pub mod reader;
 pub mod serial;
 pub mod strings;
 pub mod tree;

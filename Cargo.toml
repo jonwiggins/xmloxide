@@ -14,8 +14,10 @@ categories = ["parser-implementations", "web-programming"]
 include = [
     "src/**/*.rs",
     "examples/**/*.rs",
+    "examples/**/*.c",
     "benches/**/*.rs",
     "include/*.h",
+    "Makefile",
     "Cargo.toml",
     "LICENSE",
     "README.md",
@@ -51,7 +53,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [lib]
-crate-type = ["lib"]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [package.metadata.docs.rs]
 all-features = true

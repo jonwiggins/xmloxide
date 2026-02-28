@@ -144,27 +144,36 @@ xmllint --html page.html
 
 ## Performance
 
-Parsing throughput is competitive with libxml2 — within 3-11% on most documents, and **15% faster** on SVG. Serialization is **1.5-2.4x faster** thanks to the arena-based tree design.
+Parsing throughput is competitive with libxml2 — within 3-8% on most documents, and **12% faster** on SVG. Serialization is **1.5-2.4x faster** thanks to the arena-based tree design. XPath is competitive and up to **2.2x faster** on attribute predicates.
 
 **Parsing:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 26.3 µs (178 MiB/s) | 24.3 µs (193 MiB/s) | ~8% slower |
-| SVG drawing | 6.3 KB | 55.6 µs (108 MiB/s) | 63.8 µs (94 MiB/s) | **15% faster** |
-| Maven POM | 11.5 KB | 74.6 µs (147 MiB/s) | 71.7 µs (153 MiB/s) | ~4% slower |
-| XHTML page | 10.2 KB | 67.3 µs (144 MiB/s) | 59.8 µs (162 MiB/s) | ~11% slower |
-| Large (374 KB) | 374 KB | 2.13 ms (171 MiB/s) | 2.07 ms (177 MiB/s) | ~3% slower |
+| Atom feed | 4.9 KB | 26.1 µs (180 MiB/s) | 24.3 µs (193 MiB/s) | ~8% slower |
+| SVG drawing | 6.3 KB | 56.0 µs (108 MiB/s) | 62.8 µs (96 MiB/s) | **12% faster** |
+| Maven POM | 11.5 KB | 75.0 µs (146 MiB/s) | 72.5 µs (151 MiB/s) | ~3% slower |
+| XHTML page | 10.2 KB | 69.6 µs (139 MiB/s) | 59.5 µs (163 MiB/s) | ~17% slower |
+| Large (374 KB) | 374 KB | 2.12 ms (172 MiB/s) | 2.02 ms (181 MiB/s) | ~5% slower |
 
 **Serialization:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 11.4 µs | 17.6 µs | **1.5x faster** |
-| Maven POM | 11.5 KB | 19.5 µs | 46.4 µs | **2.4x faster** |
-| Large (374 KB) | 374 KB | 608 µs | 1367 µs | **2.3x faster** |
+| Atom feed | 4.9 KB | 11.0 µs | 17.1 µs | **1.5x faster** |
+| Maven POM | 11.5 KB | 19.5 µs | 47.0 µs | **2.4x faster** |
+| Large (374 KB) | 374 KB | 613 µs | 1365 µs | **2.2x faster** |
 
-Key optimizations: arena-based tree for fast serialization, byte-level pre-checks for character validation, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, and inline entity resolution.
+**XPath:**
+
+| Expression | xmloxide | libxml2 | Result |
+|------------|----------|---------|--------|
+| Simple path (`/library/book/title`) | 1.77 µs | 1.60 µs | ~11% slower |
+| Attribute predicate (`//book[@id]`) | 7.17 µs | 15.9 µs | **2.2x faster** |
+| `count()` function | 1.38 µs | 1.66 µs | **17% faster** |
+| `string()` function | 1.61 µs | 1.76 µs | **9% faster** |
+
+Key optimizations: arena-based tree for fast serialization, byte-level pre-checks for character validation, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, inline entity resolution, and XPath `//` step fusion with fused axis expansion.
 
 ```sh
 # Run benchmarks (requires libxml2 system library)
@@ -173,7 +182,8 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 
 ## Testing
 
-- **778 unit tests** across all modules
+- **785 unit tests** across all modules
+- **104 FFI tests** covering the full C API surface
 - **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **Integration tests** covering real-world XML documents, edge cases, and error recovery
@@ -186,14 +196,16 @@ cargo test --all-features
 
 xmloxide provides a C-compatible API for embedding in C/C++ projects (like Chromium, game engines, or any codebase that currently uses libxml2).
 
-To build the C library, temporarily set `crate-type = ["cdylib", "staticlib"]` in `Cargo.toml`'s `[lib]` section, or build directly:
-
 ```sh
-# Shared library (.so / .dylib / .dll)
-cargo rustc --lib --release -- --crate-type cdylib
+# Build shared + static libraries (uses the included Makefile)
+make
 
-# Static library (.a / .lib)
-cargo rustc --lib --release -- --crate-type staticlib
+# Or build individually:
+make shared   # .so / .dylib / .dll
+make static   # .a / .lib
+
+# Build and run the C example
+make example
 ```
 
 ```c
@@ -243,8 +255,9 @@ The full API — including tree navigation and mutation, XPath evaluation, seria
 | `xmlXIncludeProcess` | `xinclude::process_xincludes` | `xmloxide_process_xincludes` |
 | `xmlLoadCatalog` | `Catalog::parse` | `xmloxide_parse_catalog` |
 | `xmlSAX2...` callbacks | `sax::SaxHandler` trait | — |
-| `xmlTextReaderRead` | `reader::XmlReader` | — |
-| `xmlCreatePushParserCtxt` | `parser::PushParser` | — |
+| `xmlTextReaderRead` | `reader::XmlReader` | `xmloxide_reader_read` |
+| `xmlCreatePushParserCtxt` | `parser::PushParser` | `xmloxide_push_parser_new` |
+| `xmlParseChunk` | `PushParser::push` | `xmloxide_push_parser_push` |
 
 **Thread safety:** Unlike libxml2, xmloxide has no global state. Each `Document` is self-contained and `Send + Sync`. The FFI layer uses thread-local storage for the last error message — each thread has its own error state. No initialization or cleanup functions are needed.
 
@@ -281,7 +294,7 @@ Minimum supported Rust version: **1.81**
 - **No Schematron** — Schematron validation is not implemented. DTD, RelaxNG, and XSD are supported.
 - **HTML 4.01 only** — the HTML parser targets HTML 4.01, not the HTML5 parsing algorithm.
 - **Push parser buffers internally** — the push/incremental parser API (`PushParser`) currently buffers all pushed data and performs the full parse on `finish()`, rather than truly streaming like libxml2's `xmlParseChunk`. SAX streaming (`parse_sax`) is available as an alternative for memory-constrained large-document processing.
-- **XPath `namespace::` axis** — the `namespace::` axis is not implemented; queries using it return an empty node set rather than an error.
+- **XPath `namespace::` axis** — the `namespace::` axis returns the element node when in-scope namespaces match (rather than materializing separate namespace nodes), following the same pattern as the attribute axis.
 
 ## Contributing
 
