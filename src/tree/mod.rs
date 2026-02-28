@@ -348,11 +348,13 @@ impl Document {
     ///
     /// Panics if `id` does not refer to a valid node.
     #[must_use]
+    #[inline]
     pub fn node(&self, id: NodeId) -> &NodeData {
         &self.nodes[id.as_index()]
     }
 
     /// Returns a mutable reference to the `NodeData` for the given node.
+    #[inline]
     pub(crate) fn node_mut(&mut self, id: NodeId) -> &mut NodeData {
         &mut self.nodes[id.as_index()]
     }
@@ -480,29 +482,34 @@ impl Document {
 
     /// Returns the parent of a node.
     #[must_use]
+    #[inline]
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).parent
     }
 
     /// Returns the first child of a node.
+    #[inline]
     #[must_use]
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).first_child
     }
 
     /// Returns the last child of a node.
+    #[inline]
     #[must_use]
     pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).last_child
     }
 
     /// Returns the next sibling of a node.
+    #[inline]
     #[must_use]
     pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).next_sibling
     }
 
     /// Returns the previous sibling of a node.
+    #[inline]
     #[must_use]
     pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).prev_sibling
@@ -751,6 +758,7 @@ pub struct Children<'a> {
 impl Iterator for Children<'_> {
     type Item = NodeId;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next?;
         self.next = self.doc.node(current).next_sibling;
@@ -767,6 +775,7 @@ pub struct Ancestors<'a> {
 impl Iterator for Ancestors<'_> {
     type Item = NodeId;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next?;
         self.next = self.doc.node(current).parent;
@@ -784,6 +793,7 @@ pub struct Descendants<'a> {
 impl Iterator for Descendants<'_> {
     type Item = NodeId;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next?;
 

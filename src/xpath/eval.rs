@@ -366,6 +366,7 @@ impl<'a> XPathContext<'a> {
 
     /// Expands axis from `node`, filters by `test`, and pushes matching nodes
     /// directly into `result`. No intermediate Vec allocation.
+    #[allow(clippy::too_many_lines)]
     fn expand_axis_filtered(
         &self,
         node: NodeId,
@@ -381,6 +382,64 @@ impl<'a> XPathContext<'a> {
             result.extend(self.apply_namespace_node_test(node, test));
             return;
         }
+
+        // Fast path for Name test on element-scanning axes: inline the name
+        // check to avoid per-node function call overhead through
+        // node_matches_test. This is the hottest path for queries like
+        // //entry/title or /root/child.
+        if let NodeTest::Name(name) = test {
+            match axis {
+                Axis::Child => {
+                    for child in self.doc.children(node) {
+                        if let NodeKind::Element {
+                            name: elem_name, ..
+                        } = &self.doc.node(child).kind
+                        {
+                            if elem_name == name {
+                                result.push(child);
+                            }
+                        }
+                    }
+                    return;
+                }
+                Axis::Descendant => {
+                    for desc in self.doc.descendants(node) {
+                        if let NodeKind::Element {
+                            name: elem_name, ..
+                        } = &self.doc.node(desc).kind
+                        {
+                            if elem_name == name {
+                                result.push(desc);
+                            }
+                        }
+                    }
+                    return;
+                }
+                Axis::DescendantOrSelf => {
+                    if let NodeKind::Element {
+                        name: elem_name, ..
+                    } = &self.doc.node(node).kind
+                    {
+                        if elem_name == name {
+                            result.push(node);
+                        }
+                    }
+                    for desc in self.doc.descendants(node) {
+                        if let NodeKind::Element {
+                            name: elem_name, ..
+                        } = &self.doc.node(desc).kind
+                        {
+                            if elem_name == name {
+                                result.push(desc);
+                            }
+                        }
+                    }
+                    return;
+                }
+                _ => {} // fall through to generic path
+            }
+        }
+
         match axis {
             Axis::Child => {
                 for child in self.doc.children(node) {
@@ -625,6 +684,7 @@ impl<'a> XPathContext<'a> {
     // -----------------------------------------------------------------------
 
     /// Checks whether a single node matches a node test for a given axis.
+    #[inline]
     fn node_matches_test(&self, id: NodeId, test: &NodeTest, axis: Axis) -> bool {
         let node = self.doc.node(id);
         match test {
