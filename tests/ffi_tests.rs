@@ -13,6 +13,7 @@ use xmloxide::ffi::catalog::*;
 use xmloxide::ffi::document::*;
 use xmloxide::ffi::push::*;
 use xmloxide::ffi::reader::*;
+use xmloxide::ffi::sax::*;
 use xmloxide::ffi::serial::*;
 use xmloxide::ffi::strings::*;
 use xmloxide::ffi::tree::*;
@@ -1824,4 +1825,264 @@ fn test_reader_empty_element() {
 
         xmloxide_reader_free(reader);
     }
+}
+
+// ---------- SAX streaming parser tests ----------
+
+/// A single start-element event captured by the SAX collector.
+type StartEvent = (
+    String,
+    Option<String>,
+    Option<String>,
+    Vec<(String, String)>,
+);
+
+/// Collects SAX events into vectors for assertion.
+#[derive(Default)]
+struct SaxCollector {
+    starts: Vec<StartEvent>,
+    ends: Vec<(String, Option<String>, Option<String>)>,
+    characters: Vec<String>,
+    cdata: Vec<String>,
+    comments: Vec<String>,
+    pis: Vec<(String, Option<String>)>,
+}
+
+unsafe extern "C" fn collect_start_element(
+    local_name: *const c_char,
+    prefix: *const c_char,
+    namespace: *const c_char,
+    attr_names: *const *const c_char,
+    attr_values: *const *const c_char,
+    attr_count: usize,
+    user_data: *mut std::ffi::c_void,
+) {
+    let collector = &mut *user_data.cast::<SaxCollector>();
+    let name = CStr::from_ptr(local_name).to_str().unwrap().to_owned();
+    let pfx = if prefix.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(prefix).to_str().unwrap().to_owned())
+    };
+    let ns = if namespace.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(namespace).to_str().unwrap().to_owned())
+    };
+    let mut attrs = Vec::new();
+    for i in 0..attr_count {
+        let n = CStr::from_ptr(*attr_names.add(i))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let v = CStr::from_ptr(*attr_values.add(i))
+            .to_str()
+            .unwrap()
+            .to_owned();
+        attrs.push((n, v));
+    }
+    collector.starts.push((name, pfx, ns, attrs));
+}
+
+unsafe extern "C" fn collect_end_element(
+    local_name: *const c_char,
+    prefix: *const c_char,
+    namespace: *const c_char,
+    user_data: *mut std::ffi::c_void,
+) {
+    let collector = &mut *user_data.cast::<SaxCollector>();
+    let name = CStr::from_ptr(local_name).to_str().unwrap().to_owned();
+    let pfx = if prefix.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(prefix).to_str().unwrap().to_owned())
+    };
+    let ns = if namespace.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(namespace).to_str().unwrap().to_owned())
+    };
+    collector.ends.push((name, pfx, ns));
+}
+
+unsafe extern "C" fn collect_characters(content: *const c_char, user_data: *mut std::ffi::c_void) {
+    let collector = &mut *user_data.cast::<SaxCollector>();
+    let text = CStr::from_ptr(content).to_str().unwrap().to_owned();
+    collector.characters.push(text);
+}
+
+unsafe extern "C" fn collect_cdata(content: *const c_char, user_data: *mut std::ffi::c_void) {
+    let collector = &mut *user_data.cast::<SaxCollector>();
+    let text = CStr::from_ptr(content).to_str().unwrap().to_owned();
+    collector.cdata.push(text);
+}
+
+unsafe extern "C" fn collect_comment(content: *const c_char, user_data: *mut std::ffi::c_void) {
+    let collector = &mut *user_data.cast::<SaxCollector>();
+    let text = CStr::from_ptr(content).to_str().unwrap().to_owned();
+    collector.comments.push(text);
+}
+
+unsafe extern "C" fn collect_pi(
+    target: *const c_char,
+    data: *const c_char,
+    user_data: *mut std::ffi::c_void,
+) {
+    let collector = &mut *user_data.cast::<SaxCollector>();
+    let t = CStr::from_ptr(target).to_str().unwrap().to_owned();
+    let d = if data.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(data).to_str().unwrap().to_owned())
+    };
+    collector.pis.push((t, d));
+}
+
+fn make_sax_handler(collector: &mut SaxCollector) -> XmloxideSaxHandler {
+    XmloxideSaxHandler {
+        start_element: Some(collect_start_element),
+        end_element: Some(collect_end_element),
+        characters: Some(collect_characters),
+        cdata: Some(collect_cdata),
+        comment: Some(collect_comment),
+        processing_instruction: Some(collect_pi),
+        user_data: std::ptr::from_mut(collector).cast::<std::ffi::c_void>(),
+    }
+}
+
+#[test]
+fn test_sax_parse_basic() {
+    let xml = CString::new("<root><child>Hello</child></root>").unwrap();
+    let mut collector = SaxCollector::default();
+    let handler = make_sax_handler(&mut collector);
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, 0);
+    }
+    assert_eq!(collector.starts.len(), 2);
+    assert_eq!(collector.starts[0].0, "root");
+    assert_eq!(collector.starts[1].0, "child");
+    assert_eq!(collector.ends.len(), 2);
+    assert_eq!(collector.ends[0].0, "child");
+    assert_eq!(collector.ends[1].0, "root");
+    assert_eq!(collector.characters, vec!["Hello"]);
+}
+
+#[test]
+fn test_sax_parse_attributes() {
+    let xml = CString::new("<root id=\"42\" class=\"big\"/>").unwrap();
+    let mut collector = SaxCollector::default();
+    let handler = make_sax_handler(&mut collector);
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, 0);
+    }
+    assert_eq!(collector.starts.len(), 1);
+    let (ref name, _, _, ref attrs) = collector.starts[0];
+    assert_eq!(name, "root");
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0], ("id".to_owned(), "42".to_owned()));
+    assert_eq!(attrs[1], ("class".to_owned(), "big".to_owned()));
+}
+
+#[test]
+fn test_sax_parse_namespaces() {
+    let xml =
+        CString::new("<ns:root xmlns:ns=\"http://example.com\"><ns:child/></ns:root>").unwrap();
+    let mut collector = SaxCollector::default();
+    let handler = make_sax_handler(&mut collector);
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, 0);
+    }
+    assert_eq!(collector.starts.len(), 2);
+    assert_eq!(collector.starts[0].0, "root");
+    assert_eq!(collector.starts[0].1, Some("ns".to_owned()));
+    assert_eq!(collector.starts[0].2, Some("http://example.com".to_owned()));
+    assert_eq!(collector.starts[1].0, "child");
+    assert_eq!(collector.starts[1].1, Some("ns".to_owned()));
+}
+
+#[test]
+fn test_sax_parse_comment_and_pi() {
+    let xml = CString::new("<?target data?><root><!-- comment --></root>").unwrap();
+    let mut collector = SaxCollector::default();
+    let handler = make_sax_handler(&mut collector);
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, 0);
+    }
+    assert_eq!(collector.pis.len(), 1);
+    assert_eq!(collector.pis[0].0, "target");
+    assert_eq!(collector.pis[0].1, Some("data".to_owned()));
+    assert_eq!(collector.comments.len(), 1);
+    assert_eq!(collector.comments[0], " comment ");
+}
+
+#[test]
+fn test_sax_parse_null_callbacks() {
+    // All callbacks are NULL — should still parse without crashing.
+    let xml = CString::new("<root>text<!-- comment --><?pi data?></root>").unwrap();
+    let handler = XmloxideSaxHandler {
+        start_element: None,
+        end_element: None,
+        characters: None,
+        cdata: None,
+        comment: None,
+        processing_instruction: None,
+        user_data: std::ptr::null_mut(),
+    };
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, 0);
+    }
+}
+
+#[test]
+fn test_sax_parse_null_args() {
+    unsafe {
+        // Null XML
+        let handler = XmloxideSaxHandler {
+            start_element: None,
+            end_element: None,
+            characters: None,
+            cdata: None,
+            comment: None,
+            processing_instruction: None,
+            user_data: std::ptr::null_mut(),
+        };
+        let result = xmloxide_sax_parse(std::ptr::null(), &handler);
+        assert_eq!(result, -1);
+        assert!(last_error().is_some());
+
+        // Null handler
+        let xml = CString::new("<root/>").unwrap();
+        let result = xmloxide_sax_parse(xml.as_ptr(), std::ptr::null());
+        assert_eq!(result, -1);
+        assert!(last_error().is_some());
+    }
+}
+
+#[test]
+fn test_sax_parse_malformed() {
+    let xml = CString::new("<root><unclosed>").unwrap();
+    let mut collector = SaxCollector::default();
+    let handler = make_sax_handler(&mut collector);
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, -1);
+        assert!(last_error().is_some());
+    }
+}
+
+#[test]
+fn test_sax_parse_cdata() {
+    let xml = CString::new("<root><![CDATA[raw <data>]]></root>").unwrap();
+    let mut collector = SaxCollector::default();
+    let handler = make_sax_handler(&mut collector);
+    unsafe {
+        let result = xmloxide_sax_parse(xml.as_ptr(), &handler);
+        assert_eq!(result, 0);
+    }
+    assert_eq!(collector.cdata, vec!["raw <data>"]);
 }

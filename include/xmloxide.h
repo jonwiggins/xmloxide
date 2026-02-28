@@ -710,6 +710,86 @@ int32_t xmloxide_reader_move_to_element(xmloxide_reader *reader);
  */
 void xmloxide_reader_free(xmloxide_reader *reader);
 
+/* ---------- SAX2 streaming parser ---------- */
+
+/**
+ * C function pointer type for start_element events.
+ *
+ * Parameters:
+ *   local_name  - element local name (never NULL)
+ *   prefix      - namespace prefix (may be NULL)
+ *   namespace   - namespace URI (may be NULL)
+ *   attr_names  - array of attribute name strings
+ *   attr_values - array of attribute value strings
+ *   attr_count  - number of attributes
+ *   user_data   - opaque pointer passed through from the handler
+ */
+typedef void (*xmloxide_sax_start_element_cb)(
+    const char *local_name, const char *prefix, const char *namespace_uri,
+    const char *const *attr_names, const char *const *attr_values,
+    size_t attr_count, void *user_data);
+
+/**
+ * C function pointer type for end_element events.
+ *
+ * Parameters:
+ *   local_name  - element local name (never NULL)
+ *   prefix      - namespace prefix (may be NULL)
+ *   namespace   - namespace URI (may be NULL)
+ *   user_data   - opaque pointer passed through from the handler
+ */
+typedef void (*xmloxide_sax_end_element_cb)(const char *local_name,
+                                             const char *prefix,
+                                             const char *namespace_uri,
+                                             void *user_data);
+
+/**
+ * C function pointer type for characters, CDATA, and comment events.
+ *
+ * Parameters:
+ *   content   - text content (never NULL)
+ *   user_data - opaque pointer passed through from the handler
+ */
+typedef void (*xmloxide_sax_text_cb)(const char *content, void *user_data);
+
+/**
+ * C function pointer type for processing instruction events.
+ *
+ * Parameters:
+ *   target    - PI target (never NULL)
+ *   data      - PI data (may be NULL)
+ *   user_data - opaque pointer passed through from the handler
+ */
+typedef void (*xmloxide_sax_pi_cb)(const char *target, const char *data,
+                                    void *user_data);
+
+/**
+ * SAX handler with C function pointer callbacks.
+ *
+ * Set any callback to NULL to ignore that event type.
+ * user_data is passed through to every callback.
+ */
+typedef struct {
+    xmloxide_sax_start_element_cb start_element;
+    xmloxide_sax_end_element_cb end_element;
+    xmloxide_sax_text_cb characters;
+    xmloxide_sax_text_cb cdata;
+    xmloxide_sax_text_cb comment;
+    xmloxide_sax_pi_cb processing_instruction;
+    void *user_data;
+} xmloxide_sax_handler;
+
+/**
+ * Parses XML with SAX streaming, dispatching events to C function pointers.
+ *
+ * xml must be a valid null-terminated UTF-8 C string.
+ * handler must point to a valid xmloxide_sax_handler struct.
+ *
+ * Returns 0 on success, -1 on error. Use xmloxide_last_error() for details.
+ */
+int32_t xmloxide_sax_parse(const char *xml,
+                            const xmloxide_sax_handler *handler);
+
 /* ---------- String lifecycle ---------- */
 
 /**
