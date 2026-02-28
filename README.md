@@ -144,36 +144,36 @@ xmllint --html page.html
 
 ## Performance
 
-Parsing throughput is competitive with libxml2 — within 3-8% on most documents, and **12% faster** on SVG. Serialization is **1.5-2.4x faster** thanks to the arena-based tree design. XPath is competitive and up to **2.2x faster** on attribute predicates.
+Parsing throughput is competitive with libxml2 — within 3-4% on most documents, and **12% faster** on SVG. Serialization is **1.5-2.4x faster** thanks to the arena-based tree design. XPath is **1.1-2.7x faster** across all benchmarks.
 
 **Parsing:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 26.1 µs (180 MiB/s) | 24.3 µs (193 MiB/s) | ~8% slower |
-| SVG drawing | 6.3 KB | 56.0 µs (108 MiB/s) | 62.8 µs (96 MiB/s) | **12% faster** |
-| Maven POM | 11.5 KB | 75.0 µs (146 MiB/s) | 72.5 µs (151 MiB/s) | ~3% slower |
-| XHTML page | 10.2 KB | 69.6 µs (139 MiB/s) | 59.5 µs (163 MiB/s) | ~17% slower |
-| Large (374 KB) | 374 KB | 2.12 ms (172 MiB/s) | 2.02 ms (181 MiB/s) | ~5% slower |
+| Atom feed | 4.9 KB | 26.7 µs (176 MiB/s) | 25.5 µs (184 MiB/s) | ~4% slower |
+| SVG drawing | 6.3 KB | 58.5 µs (103 MiB/s) | 65.6 µs (92 MiB/s) | **12% faster** |
+| Maven POM | 11.5 KB | 76.9 µs (142 MiB/s) | 74.2 µs (148 MiB/s) | ~4% slower |
+| XHTML page | 10.2 KB | 69.5 µs (139 MiB/s) | 61.5 µs (157 MiB/s) | ~13% slower |
+| Large (374 KB) | 374 KB | 2.15 ms (169 MiB/s) | 2.08 ms (175 MiB/s) | ~3% slower |
 
 **Serialization:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 11.0 µs | 17.1 µs | **1.5x faster** |
-| Maven POM | 11.5 KB | 19.5 µs | 47.0 µs | **2.4x faster** |
-| Large (374 KB) | 374 KB | 613 µs | 1365 µs | **2.2x faster** |
+| Atom feed | 4.9 KB | 11.3 µs | 17.5 µs | **1.5x faster** |
+| Maven POM | 11.5 KB | 20.1 µs | 47.5 µs | **2.4x faster** |
+| Large (374 KB) | 374 KB | 614 µs | 1397 µs | **2.3x faster** |
 
 **XPath:**
 
 | Expression | xmloxide | libxml2 | Result |
 |------------|----------|---------|--------|
-| Simple path (`/library/book/title`) | 1.77 µs | 1.60 µs | ~11% slower |
-| Attribute predicate (`//book[@id]`) | 7.17 µs | 15.9 µs | **2.2x faster** |
-| `count()` function | 1.38 µs | 1.66 µs | **17% faster** |
-| `string()` function | 1.61 µs | 1.76 µs | **9% faster** |
+| Simple path (`//entry/title`) | 1.51 µs | 1.63 µs | **8% faster** |
+| Attribute predicate (`//book[@id]`) | 5.91 µs | 15.99 µs | **2.7x faster** |
+| `count()` function | 1.09 µs | 1.67 µs | **1.5x faster** |
+| `string()` function | 1.32 µs | 1.77 µs | **1.3x faster** |
 
-Key optimizations: arena-based tree for fast serialization, byte-level pre-checks for character validation, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, inline entity resolution, and XPath `//` step fusion with fused axis expansion.
+Key optimizations: arena-based tree for fast serialization, byte-level pre-checks for character validation, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, inline entity resolution, XPath `//` step fusion with fused axis expansion, inlined tree accessors, and name-test fast paths for child/descendant axes.
 
 ```sh
 # Run benchmarks (requires libxml2 system library)
@@ -183,7 +183,7 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 ## Testing
 
 - **785 unit tests** across all modules
-- **104 FFI tests** covering the full C API surface
+- **112 FFI tests** covering the full C API surface (including SAX streaming)
 - **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **Integration tests** covering real-world XML documents, edge cases, and error recovery
@@ -254,7 +254,7 @@ The full API — including tree navigation and mutation, XPath evaluation, seria
 | `xmlSchemaValidateDoc` | `validation::xsd::validate_xsd` | `xmloxide_validate_xsd` |
 | `xmlXIncludeProcess` | `xinclude::process_xincludes` | `xmloxide_process_xincludes` |
 | `xmlLoadCatalog` | `Catalog::parse` | `xmloxide_parse_catalog` |
-| `xmlSAX2...` callbacks | `sax::SaxHandler` trait | — |
+| `xmlSAX2...` callbacks | `sax::SaxHandler` trait | `xmloxide_sax_parse` |
 | `xmlTextReaderRead` | `reader::XmlReader` | `xmloxide_reader_read` |
 | `xmlCreatePushParserCtxt` | `parser::PushParser` | `xmloxide_push_parser_new` |
 | `xmlParseChunk` | `PushParser::push` | `xmloxide_push_parser_push` |
