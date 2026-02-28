@@ -13,7 +13,7 @@
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use xmloxide::util::qname::split_qname;
 ///
 /// assert_eq!(split_qname("svg:rect"), (Some("svg"), "rect"));

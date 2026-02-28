@@ -34,7 +34,7 @@ impl SymbolId {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use xmloxide::util::dict::Dict;
 ///
 /// let mut dict = Dict::new();

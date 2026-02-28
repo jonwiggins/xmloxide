@@ -10,9 +10,9 @@ use crate::tree::{Attribute, Document, NodeId, NodeKind};
 use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
 
 use super::input::{
-    parse_cdata_content, parse_comment_content, parse_pi_content, parse_xml_decl, split_name,
-    split_owned_name, validate_pubid, ExternalEntityInfo, NamespaceResolver, ParserInput,
-    XMLNS_NAMESPACE, XML_NAMESPACE,
+    find_invalid_xml_char, parse_cdata_content, parse_comment_content, parse_pi_content,
+    parse_xml_decl, split_name, split_owned_name, validate_pubid, ExternalEntityInfo,
+    NamespaceResolver, ParserInput, XMLNS_NAMESPACE, XML_NAMESPACE,
 };
 use super::ParseOptions;
 
@@ -536,9 +536,19 @@ impl<'a> XmlParser<'a> {
                     // Prefixed namespace declaration: xmlns:prefix="uri"
                     let declared_prefix = &attr.name;
 
-                    // Validate QName: the local part (declared_prefix) must not
-                    // contain a colon (which would mean multiple colons in the
-                    // full xmlns:prefix name).
+                    // Validate QName: the local part (declared_prefix) must be
+                    // a non-empty NCName (no colon, not empty). An empty local
+                    // part means the attribute was `xmlns:` with nothing after
+                    // the colon, which is not a valid QName.
+                    if declared_prefix.is_empty() {
+                        let msg = "namespace prefix must not be empty (invalid QName 'xmlns:')";
+                        if self.options.recover {
+                            self.input
+                                .push_diagnostic(ErrorSeverity::Error, msg.to_string());
+                            continue;
+                        }
+                        return Err(self.input.fatal(msg));
+                    }
                     if declared_prefix.contains(':') {
                         let msg = "QName contains multiple colons";
                         if self.options.recover {
@@ -927,6 +937,7 @@ impl<'a> XmlParser<'a> {
     // --- Character Data ---
     // See XML 1.0 §2.4: [14] CharData
 
+    #[allow(clippy::too_many_lines)]
     fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError> {
         let mut text = String::new();
 
@@ -936,11 +947,27 @@ impl<'a> XmlParser<'a> {
             let safe_len = self.input.scan_char_data();
             if safe_len > 0 {
                 let start = self.input.pos();
-                let chunk_bytes = self.input.slice(start, start + safe_len);
+                // Copy chunk into an owned String to release the borrow on self.input
+                // before any potential diagnostic calls.
+                let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
+                    .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?
+                    .to_string();
+                // Validate XML chars: check for illegal multi-byte characters
+                // (e.g. U+FFFE, U+FFFF) that pass through the bulk scanner.
+                if let Some(bad) = find_invalid_xml_char(&chunk) {
+                    if self.options.recover {
+                        self.input.push_diagnostic(
+                            ErrorSeverity::Error,
+                            format!("invalid XML character: U+{:04X}", bad as u32),
+                        );
+                    } else {
+                        return Err(self
+                            .input
+                            .fatal(format!("invalid XML character: U+{:04X}", bad as u32)));
+                    }
+                }
                 // Check if CR normalization is needed (rare in practice)
-                if chunk_bytes.contains(&b'\r') {
-                    let chunk = std::str::from_utf8(chunk_bytes)
-                        .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                if chunk.contains('\r') {
                     let mut chars = chunk.chars().peekable();
                     while let Some(ch) = chars.next() {
                         if ch == '\r' {
@@ -954,9 +981,7 @@ impl<'a> XmlParser<'a> {
                         }
                     }
                 } else {
-                    let chunk = std::str::from_utf8(chunk_bytes)
-                        .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
-                    text.push_str(chunk);
+                    text.push_str(&chunk);
                 }
                 self.input.advance_counting_lines(safe_len);
                 continue;
@@ -994,11 +1019,15 @@ impl<'a> XmlParser<'a> {
                         // 1. The entity is internally declared and text-only (no '<'), OR
                         // 2. The entity is undeclared but we're in tolerant mode
                         //    (external DTD or PE refs make undeclared entities non-fatal)
-                        let is_text_only = self
-                            .input
-                            .entity_map
-                            .get(&entity_name)
-                            .is_some_and(|v| !v.contains('<'));
+                        let is_text_only =
+                            self.input.entity_map.get(&entity_name).is_some_and(|v| {
+                                // Check the replacement text after expanding character
+                                // references, not the raw value. An entity like
+                                // "&#60;foo>" contains no literal '<' but expands to
+                                // "<foo>" which is markup and must be re-parsed.
+                                let replacement = crate::validation::dtd::expand_char_refs_only(v);
+                                !replacement.contains('<')
+                            });
                         let is_undeclared_tolerant =
                             !self.input.entity_map.contains_key(&entity_name)
                                 && !self.input.entity_external.contains_key(&entity_name)

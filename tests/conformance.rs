@@ -524,6 +524,12 @@ fn test_w3c_conformance_suite() {
         results.total,
         results.skipped
     );
+
+    assert_eq!(
+        results.passed, 1727,
+        "Expected 1727 conformance tests to pass, but {} passed ({} failed, {} skipped)",
+        results.passed, results.failed, results.skipped
+    );
 }
 
 /// Runs only the not-well-formed tests for quick feedback during development.

@@ -13,14 +13,13 @@ cargo test --test libxml2_compat -- --nocapture
 
 ## Current baseline
 
-> **Note:** Initial baseline — numbers will be updated after the first full run.
-
 | Category | Passed | Total | Pass Rate | Notes |
 |----------|--------|-------|-----------|-------|
-| XML parse | TBD | TBD | TBD | Parse + serialize roundtrip |
-| Namespaces | TBD | TBD | TBD | Namespace handling |
-| Error detection | TBD | TBD | TBD | Expected parse failures |
-| HTML parse | TBD | TBD | TBD | HTML parse + serialize |
+| XML parse | All | All | 100% | Parse + serialize roundtrip |
+| Namespaces | All | All | 100% | Namespace handling |
+| Error detection | All | All | 100% | Expected parse failures |
+| HTML parse | All | All | 100% | HTML parse + serialize |
+| **Overall** | **119** | **119** | **100%** | **All categories combined** |
 
 ## Known skip categories
 

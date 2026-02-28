@@ -338,7 +338,7 @@ Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, t
 
 | Suite | Location | Tests | Notes |
 |-------|----------|-------|-------|
-| Unit tests | `src/**/*.rs` (inline) | ~637 | All modules |
+| Unit tests | `src/**/*.rs` (inline) | ~769 | All modules |
 | W3C Conformance | `tests/conformance.rs` | 1727/1727 | Requires `download-conformance-suite.sh` |
 | libxml2 Compat | `tests/libxml2_compat.rs` | 119/119 | Requires `download-libxml2-tests.sh` |
 | Real-world XML | `tests/real_world_xml.rs` | 22 | Atom, SVG, XHTML, Maven, SOAP, validation |

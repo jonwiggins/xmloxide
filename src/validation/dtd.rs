@@ -744,19 +744,6 @@ impl<'a> DtdParser<'a> {
             }
         }
 
-        // Check for duplicate attribute declarations on the same element.
-        for attrs in self.dtd.attributes.values() {
-            let mut seen = HashSet::new();
-            for attr in attrs {
-                if !seen.insert(&attr.attribute_name) {
-                    return Err(self.fatal(format!(
-                        "duplicate attribute declaration '{}' on element '{}'",
-                        attr.attribute_name, attr.element_name
-                    )));
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -767,12 +754,15 @@ impl<'a> DtdParser<'a> {
     /// be declared as internal entities whose replacement text is a character
     /// reference to the respective character."
     fn validate_predefined_entities(&self) -> Result<(), ParseError> {
+        // Per XML 1.0 §4.6: lt and amp MUST use character references.
+        // gt, apos, and quot may use either the literal character or a
+        // character reference.
         let expected: &[(&str, &str, &[&str])] = &[
             ("lt", "<", &["&#60;", "&#x3C;", "&#x3c;"]),
-            ("gt", ">", &["&#62;", "&#x3E;", "&#x3e;"]),
+            ("gt", ">", &[">", "&#62;", "&#x3E;", "&#x3e;"]),
             ("amp", "&", &["&#38;", "&#x26;"]),
-            ("apos", "'", &["&#39;", "&#x27;"]),
-            ("quot", "\"", &["&#34;", "&#x22;"]),
+            ("apos", "'", &["'", "&#39;", "&#x27;"]),
+            ("quot", "\"", &["\"", "&#34;", "&#x22;"]),
         ];
         for &(name, _char_val, valid_refs) in expected {
             if let Some(decl) = self.dtd.entities.get(name) {
@@ -1240,14 +1230,18 @@ impl<'a> DtdParser<'a> {
                 default,
             };
 
-            self.dtd
-                .declarations
-                .push(DtdDeclaration::Attlist(decl.clone()));
-            self.dtd
-                .attributes
-                .entry(element_name.clone())
-                .or_default()
-                .push(decl);
+            // Per XML 1.0 §3.3, the first attribute declaration is binding;
+            // subsequent declarations for the same attribute are ignored.
+            let attrs = self.dtd.attributes.entry(element_name.clone()).or_default();
+            if !attrs
+                .iter()
+                .any(|a| a.attribute_name == decl.attribute_name)
+            {
+                self.dtd
+                    .declarations
+                    .push(DtdDeclaration::Attlist(decl.clone()));
+                attrs.push(decl);
+            }
         }
 
         Ok(())

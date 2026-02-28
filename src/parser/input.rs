@@ -138,7 +138,7 @@ fn match_builtin_entity(bytes: &[u8]) -> Option<(&'static str, usize)> {
 /// Checks whether a chunk of text contains any characters that are not valid
 /// XML `Char`s per XML 1.0 §2.2. Returns the first invalid character found
 /// (if any), or `None` if the chunk is clean.
-fn find_invalid_xml_char(s: &str) -> Option<char> {
+pub(crate) fn find_invalid_xml_char(s: &str) -> Option<char> {
     s.chars().find(|&ch| !is_xml_char(ch))
 }
 
@@ -149,6 +149,9 @@ fn may_contain_invalid_xml_chars(bytes: &[u8]) -> bool {
     bytes
         .iter()
         .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F)
+        || bytes
+            .windows(3)
+            .any(|w| w[0] == 0xEF && w[1] == 0xBF && (w[2] == 0xBE || w[2] == 0xBF))
 }
 
 /// Splits a qualified name into optional prefix and local part.
@@ -625,12 +628,20 @@ impl<'a> ParserInput<'a> {
         let bytes = &self.input[self.pos..];
         let mut i = 0;
         while i < bytes.len() {
-            match bytes[i] {
+            let b = bytes[i];
+            match b {
                 b'<' | b'&' => return i,
                 b']' if i + 2 < bytes.len() && bytes[i + 1] == b']' && bytes[i + 2] == b'>' => {
                     return i;
                 }
-                _ => i += 1,
+                _ => {
+                    // Stop at invalid XML control characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F)
+                    // so they fall through to next_char() which validates and reports errors.
+                    if b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r' {
+                        return i;
+                    }
+                    i += 1;
+                }
             }
         }
         bytes.len()
@@ -1468,6 +1479,20 @@ impl<'a> ParserInput<'a> {
                 let start = self.pos;
                 let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
                     .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
+                // Validate XML chars: check for illegal multi-byte characters
+                // (e.g. U+FFFE, U+FFFF) that pass through the bulk scanner.
+                if let Some(bad) = find_invalid_xml_char(chunk) {
+                    if self.recover {
+                        self.push_diagnostic(
+                            ErrorSeverity::Error,
+                            format!("invalid XML character: U+{:04X}", bad as u32),
+                        );
+                    } else {
+                        return Err(
+                            self.fatal(format!("invalid XML character: U+{:04X}", bad as u32))
+                        );
+                    }
+                }
                 // Normalize whitespace in chunk (XML 1.0 §3.3.3)
                 if chunk
                     .as_bytes()

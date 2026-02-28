@@ -317,11 +317,17 @@ fn run_namespace_tests() -> CompatResults {
     results
 }
 
-/// Test category: check that error test files produce parse errors.
+/// Test category: check that error test files produce parse errors or, when
+/// a result file exists, that parsing succeeds with the expected output.
+///
+/// Some error test files in libxml2's suite are "warning" cases where libxml2
+/// emits a diagnostic but still produces valid output (e.g., duplicate ATTLIST
+/// declarations). For these, a result file exists and we compare output.
 fn run_error_tests() -> CompatResults {
     let mut results = CompatResults::new("Error detection");
     let base = libxml2_dir();
     let test_dir = base.join("test/errors");
+    let result_dir = base.join("result/errors");
 
     if !test_dir.is_dir() {
         return results;
@@ -342,11 +348,37 @@ fn run_error_tests() -> CompatResults {
             continue;
         };
 
-        // For error tests, we expect parsing to fail
-        if Document::parse_str(&input).is_err() {
-            results.pass();
+        let result_file = result_dir.join(format!("{stem}.xml"));
+        if result_file.exists() {
+            // This error test has a result file — libxml2 parsed it
+            // successfully (with warnings/recovery). If our strict parser
+            // also succeeds, compare output. If it errors, that's also
+            // acceptable since it's an error test.
+            match Document::parse_str(&input) {
+                Ok(doc) => {
+                    let Some(expected) = try_read_utf8(&result_file) else {
+                        results.skip();
+                        continue;
+                    };
+                    let output = serialize(&doc);
+                    if normalize_xml(&output) == normalize_xml(&expected) {
+                        results.pass();
+                    } else {
+                        results.fail(&stem);
+                    }
+                }
+                Err(_) => {
+                    // Strict parsing failed — acceptable for error tests.
+                    results.pass();
+                }
+            }
         } else {
-            results.fail(&stem);
+            // No result file — expect parsing to fail.
+            if Document::parse_str(&input).is_err() {
+                results.pass();
+            } else {
+                results.fail(&stem);
+            }
         }
     }
 

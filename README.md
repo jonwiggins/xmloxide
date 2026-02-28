@@ -164,7 +164,7 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 
 ## Testing
 
-- **609 unit tests** across all modules
+- **769 unit tests** across all modules
 - **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **Integration tests** covering real-world XML documents, edge cases, and error recovery
@@ -222,7 +222,7 @@ cargo +nightly fuzz run fuzz_roundtrip
 ```sh
 cargo build
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo bench
 ```
 
@@ -234,6 +234,14 @@ Minimum supported Rust version: **1.81**
 - **No XSLT** — XSLT is a separate specification (libxslt) and is out of scope.
 - **No Schematron** — Schematron validation is not implemented. DTD, RelaxNG, and XSD are supported.
 - **HTML 4.01 only** — the HTML parser targets HTML 4.01, not the HTML5 parsing algorithm.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## License
 
