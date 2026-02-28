@@ -36,14 +36,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, "1.81"]
+        include:
+          - rust: stable
+            features: --all-features
+          - rust: "1.81"
+            features: --features cli,ffi
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - run: cargo test ${{ matrix.features }}
 
   doc:
     name: Documentation
