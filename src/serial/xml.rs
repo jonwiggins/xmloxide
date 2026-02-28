@@ -37,13 +37,23 @@ impl Default for SerializeOptions {
 
 impl SerializeOptions {
     /// Enables or disables indented (pretty-printed) output.
+    ///
+    /// When enabled, child elements are placed on their own lines with
+    /// indentation (two spaces per level by default). Mixed-content elements
+    /// (those containing both text and element children) are not indented.
+    /// Use [`indent_str`](Self::indent_str) to customize the indentation
+    /// string. Disabled by default.
     #[must_use]
     pub fn indent(mut self, indent: bool) -> Self {
         self.indent = indent;
         self
     }
 
-    /// Sets the indentation string (e.g., `"  "` or `"\t"`).
+    /// Sets the indentation string used for each nesting level.
+    ///
+    /// The default is two spaces (`"  "`). Common alternatives include a tab
+    /// (`"\t"`) or four spaces (`"    "`). This only takes effect when
+    /// [`indent`](Self::indent) is enabled.
     #[must_use]
     pub fn indent_str(mut self, s: &str) -> Self {
         self.indent_str = s.to_string();

@@ -71,27 +71,50 @@ impl Default for HtmlParseOptions {
 
 impl HtmlParseOptions {
     /// Enables or disables error recovery mode.
+    ///
+    /// When enabled, the parser attempts to produce a partial tree even when
+    /// it encounters malformed markup, collecting errors as diagnostics on
+    /// the resulting [`Document`]. HTML parsing is inherently error-tolerant,
+    /// but disabling this makes the parser stricter about certain issues.
+    /// Enabled by default.
     #[must_use]
     pub fn recover(mut self, yes: bool) -> Self {
         self.recover = yes;
         self
     }
 
-    /// Enables or disables stripping of blank text nodes.
+    /// Enables or disables stripping of blank (whitespace-only) text nodes.
+    ///
+    /// When enabled, text nodes that contain only whitespace (spaces, tabs,
+    /// newlines) are discarded during parsing. This is useful for reducing
+    /// tree size when whitespace between elements is not significant.
+    /// Disabled by default.
     #[must_use]
     pub fn no_blanks(mut self, yes: bool) -> Self {
         self.no_blanks = yes;
         self
     }
 
-    /// Enables or disables generation of implied elements (html, head, body).
+    /// Enables or disables generation of implied `<html>`, `<head>`, and
+    /// `<body>` elements.
+    ///
+    /// By default, the HTML parser automatically wraps content in these
+    /// structural elements when they are missing (matching browser behavior).
+    /// When enabled, the parser omits these implied wrappers, producing a
+    /// tree that more closely reflects the literal input.
+    /// Disabled by default.
     #[must_use]
     pub fn no_implied(mut self, yes: bool) -> Self {
         self.no_implied = yes;
         self
     }
 
-    /// Enables or disables warning suppression.
+    /// Enables or disables suppression of warning-level diagnostics.
+    ///
+    /// When enabled, only errors and fatal issues are recorded in
+    /// [`Document::diagnostics`]; warnings about non-critical issues (e.g.,
+    /// missing optional closing tags) are silently discarded.
+    /// Disabled by default.
     #[must_use]
     pub fn no_warnings(mut self, yes: bool) -> Self {
         self.no_warnings = yes;

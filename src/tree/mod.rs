@@ -327,7 +327,11 @@ impl Document {
         Self::parse_bytes(&bytes)
     }
 
-    /// Returns the document root node id.
+    /// Returns the document root `NodeId`.
+    ///
+    /// This is the synthetic `Document` node that sits above the root element,
+    /// processing instructions, comments, and DOCTYPE in the prolog. To get the
+    /// root *element*, use [`root_element`](Self::root_element).
     #[must_use]
     pub fn root(&self) -> NodeId {
         self.root
@@ -342,11 +346,15 @@ impl Document {
             .find(|&id| matches!(self.node(id).kind, NodeKind::Element { .. }))
     }
 
-    /// Returns a reference to the `NodeData` for the given node.
+    /// Returns a reference to the [`NodeData`] for the given node.
+    ///
+    /// Use this to inspect a node's [`kind`](NodeData::kind) and navigation
+    /// links. For common queries, prefer the typed accessors like
+    /// [`node_name`](Self::node_name) and [`node_text`](Self::node_text).
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not refer to a valid node.
+    /// Panics if `id` does not refer to a valid node in this document.
     #[must_use]
     #[inline]
     pub fn node(&self, id: NodeId) -> &NodeData {
@@ -359,10 +367,11 @@ impl Document {
         &mut self.nodes[id.as_index()]
     }
 
-    /// Returns the name of a node, if applicable.
+    /// Returns the local name of a node, if applicable.
     ///
-    /// Elements and PIs have names; text, comments, CDATA, and document nodes
-    /// return `None`.
+    /// For elements, this is the tag name (e.g., `"div"`). For processing
+    /// instructions, this is the target (e.g., `"xml-stylesheet"`). Text,
+    /// comment, CDATA, and document nodes return `None`.
     #[must_use]
     pub fn node_name(&self, id: NodeId) -> Option<&str> {
         match &self.node(id).kind {
@@ -396,10 +405,13 @@ impl Document {
         }
     }
 
-    /// Returns the text content of a text, comment, or CDATA node.
+    /// Returns the direct text content of a text, comment, CDATA, or PI node.
     ///
-    /// For element nodes, returns `None` — use `text_content()` to get the
-    /// concatenated text of all descendant text nodes.
+    /// For text, comment, and CDATA nodes, returns their string content. For
+    /// processing instructions, returns the data portion (after the target).
+    /// For element nodes, returns `None` — use
+    /// [`text_content`](Self::text_content) to get the concatenated text of
+    /// all descendant text nodes.
     #[must_use]
     pub fn node_text(&self, id: NodeId) -> Option<&str> {
         match &self.node(id).kind {
@@ -412,6 +424,11 @@ impl Document {
     }
 
     /// Returns the concatenated text content of a node and all its descendants.
+    ///
+    /// Recursively collects text from all descendant text and CDATA nodes.
+    /// For a leaf text node, this is equivalent to [`node_text`](Self::node_text).
+    /// For an element, this concatenates all nested text content (matching
+    /// the DOM `textContent` property).
     #[must_use]
     pub fn text_content(&self, id: NodeId) -> String {
         let mut result = String::new();
@@ -437,9 +454,10 @@ impl Document {
         }
     }
 
-    /// Returns the attributes of an element node.
+    /// Returns the attributes of an element node as a slice.
     ///
-    /// Returns an empty slice for non-element nodes.
+    /// Each [`Attribute`] contains the name, value, optional namespace prefix,
+    /// and namespace URI. Returns an empty slice for non-element nodes.
     #[must_use]
     pub fn attributes(&self, id: NodeId) -> &[Attribute] {
         match &self.node(id).kind {
@@ -448,7 +466,10 @@ impl Document {
         }
     }
 
-    /// Returns the value of an attribute by name on an element node.
+    /// Returns the value of an attribute by local name on an element node.
+    ///
+    /// Performs a linear scan of the element's attributes. Returns `None` if
+    /// the attribute is not present or the node is not an element.
     #[must_use]
     pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
         self.attributes(id)
@@ -480,42 +501,46 @@ impl Document {
 
     // --- Navigation ---
 
-    /// Returns the parent of a node.
+    /// Returns the parent of a node, or `None` for the document root.
     #[must_use]
     #[inline]
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).parent
     }
 
-    /// Returns the first child of a node.
+    /// Returns the first child of a node, or `None` if it has no children.
     #[inline]
     #[must_use]
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).first_child
     }
 
-    /// Returns the last child of a node.
+    /// Returns the last child of a node, or `None` if it has no children.
     #[inline]
     #[must_use]
     pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).last_child
     }
 
-    /// Returns the next sibling of a node.
+    /// Returns the next sibling of a node, or `None` if it is the last child.
     #[inline]
     #[must_use]
     pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).next_sibling
     }
 
-    /// Returns the previous sibling of a node.
+    /// Returns the previous sibling of a node, or `None` if it is the first child.
     #[inline]
     #[must_use]
     pub fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).prev_sibling
     }
 
-    /// Returns an iterator over the children of a node.
+    /// Returns an iterator over the direct children of a node.
+    ///
+    /// Yields each child `NodeId` in document order (first child to last).
+    /// For a depth-first traversal that includes nested descendants, use
+    /// [`descendants`](Self::descendants).
     pub fn children(&self, id: NodeId) -> Children<'_> {
         Children {
             doc: self,
@@ -523,7 +548,11 @@ impl Document {
         }
     }
 
-    /// Returns an iterator over a node and its ancestors (walking up to root).
+    /// Returns an iterator over a node and its ancestors, walking up to the
+    /// document root.
+    ///
+    /// The first item yielded is `id` itself, followed by its parent, then
+    /// grandparent, and so on up to the document root node.
     pub fn ancestors(&self, id: NodeId) -> Ancestors<'_> {
         Ancestors {
             doc: self,
@@ -531,7 +560,12 @@ impl Document {
         }
     }
 
-    /// Returns an iterator over all descendants of a node (depth-first).
+    /// Returns an iterator over all descendants of a node in depth-first
+    /// (pre-order) traversal.
+    ///
+    /// Does *not* yield `id` itself — only its children, grandchildren, etc.
+    /// For iterating only the direct children, use
+    /// [`children`](Self::children).
     pub fn descendants(&self, id: NodeId) -> Descendants<'_> {
         Descendants {
             doc: self,
@@ -543,6 +577,11 @@ impl Document {
     // --- Mutation ---
 
     /// Allocates a new node in the arena and returns its `NodeId`.
+    ///
+    /// The new node is detached (has no parent). Use
+    /// [`append_child`](Self::append_child),
+    /// [`prepend_child`](Self::prepend_child), or
+    /// [`insert_before`](Self::insert_before) to attach it to the tree.
     pub fn create_node(&mut self, kind: NodeKind) -> NodeId {
         let index = self.nodes.len();
         self.nodes.push(NodeData::new(kind));
@@ -551,9 +590,14 @@ impl Document {
 
     /// Appends a child node to the end of a parent's child list.
     ///
+    /// The child becomes the new [`last_child`](Self::last_child) of `parent`.
+    /// If the parent had no children, the child also becomes the
+    /// [`first_child`](Self::first_child).
+    ///
     /// # Panics
     ///
-    /// Panics if `child` already has a parent. Detach it first.
+    /// Panics (debug-only) if `child` already has a parent. Call
+    /// [`detach`](Self::detach) first to re-parent an existing node.
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         debug_assert!(
             self.node(child).parent.is_none(),
@@ -572,11 +616,15 @@ impl Document {
         }
     }
 
-    /// Inserts `new_child` before `reference` in the parent's child list.
+    /// Inserts `new_child` immediately before `reference` in the sibling list.
+    ///
+    /// The new child is given the same parent as `reference` and is linked as
+    /// its previous sibling.
     ///
     /// # Panics
     ///
-    /// Panics if `reference` has no parent or if `new_child` already has a parent.
+    /// Panics if `reference` has no parent or if `new_child` already has a
+    /// parent (detach it first).
     #[allow(clippy::expect_used)]
     pub fn insert_before(&mut self, reference: NodeId, new_child: NodeId) {
         debug_assert!(
@@ -602,6 +650,9 @@ impl Document {
     }
 
     /// Prepends a child node as the first child of a parent.
+    ///
+    /// If the parent already has children, the new child is inserted before
+    /// the current first child. Otherwise, it becomes the only child.
     pub fn prepend_child(&mut self, parent: NodeId, child: NodeId) {
         if let Some(first) = self.first_child(parent) {
             self.insert_before(first, child);
@@ -610,14 +661,21 @@ impl Document {
         }
     }
 
-    /// Detaches a node from its parent and removes it from the tree.
+    /// Removes a node from the tree by detaching it from its parent.
     ///
-    /// The node remains allocated in the arena but is unreachable.
+    /// The node and its subtree remain allocated in the arena but become
+    /// unreachable through tree navigation. This is an alias for
+    /// [`detach`](Self::detach).
     pub fn remove_node(&mut self, id: NodeId) {
         self.detach(id);
     }
 
-    /// Detaches a node from its parent (but does not free it from the arena).
+    /// Detaches a node from its parent without freeing it from the arena.
+    ///
+    /// Updates sibling and parent links so the node is no longer reachable
+    /// through tree traversal. The node's own children are left intact, so the
+    /// detached subtree remains internally connected. If the node has no
+    /// parent, this is a no-op.
     pub fn detach(&mut self, id: NodeId) {
         let Some(parent) = self.node(id).parent else {
             return;
@@ -734,7 +792,11 @@ impl Document {
         }
     }
 
-    /// Returns the total number of nodes in the arena (including placeholder).
+    /// Returns the total number of nodes in the document.
+    ///
+    /// This includes all node types (elements, text, comments, etc.) but
+    /// excludes the internal arena placeholder. Detached nodes that have not
+    /// been garbage-collected are still counted.
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len() - 1 // subtract placeholder at index 0
@@ -749,7 +811,10 @@ impl Default for Document {
 
 // --- Iterators ---
 
-/// Iterator over the children of a node.
+/// Iterator over the direct children of a node.
+///
+/// Created by [`Document::children`]. Yields each child's `NodeId` in
+/// document order by following `next_sibling` links.
 pub struct Children<'a> {
     doc: &'a Document,
     next: Option<NodeId>,
@@ -766,7 +831,10 @@ impl Iterator for Children<'_> {
     }
 }
 
-/// Iterator over a node and its ancestors.
+/// Iterator over a node and its ancestors, walking up toward the document root.
+///
+/// Created by [`Document::ancestors`]. The first item yielded is the starting
+/// node itself, followed by its parent, grandparent, etc.
 pub struct Ancestors<'a> {
     doc: &'a Document,
     next: Option<NodeId>,
@@ -783,7 +851,10 @@ impl Iterator for Ancestors<'_> {
     }
 }
 
-/// Depth-first iterator over all descendants of a node.
+/// Depth-first (pre-order) iterator over all descendants of a node.
+///
+/// Created by [`Document::descendants`]. Yields every node in the subtree
+/// below the starting node, but does *not* yield the starting node itself.
 pub struct Descendants<'a> {
     doc: &'a Document,
     root: NodeId,

@@ -382,12 +382,21 @@ impl<'a> XmlReader<'a> {
     }
 
     /// Returns the namespace prefix of the current node, if any.
+    ///
+    /// For elements and attributes with a prefix (e.g., `svg` in `<svg:rect>`),
+    /// returns the prefix string. For unprefixed elements, processing
+    /// instructions, text, comments, and other node types, returns `None`.
     #[must_use]
     pub fn prefix(&self) -> Option<&str> {
         self.current.prefix.as_deref()
     }
 
     /// Returns the namespace URI of the current node, if any.
+    ///
+    /// Namespace URIs are resolved for elements and attributes that are in a
+    /// namespace (either via a prefix or a default namespace declaration).
+    /// Returns `None` for nodes that have no namespace or for node types that
+    /// do not carry namespace information (text, comments, etc.).
     #[must_use]
     pub fn namespace_uri(&self) -> Option<&str> {
         self.current.namespace_uri.as_deref()
@@ -404,6 +413,10 @@ impl<'a> XmlReader<'a> {
     }
 
     /// Returns whether the current node has a value.
+    ///
+    /// Returns `true` for node types that carry text content: text, CDATA,
+    /// comment, whitespace, attribute, and processing instruction nodes.
+    /// Returns `false` for elements, end elements, and the document type.
     #[must_use]
     pub fn has_value(&self) -> bool {
         self.current.value.is_some()
