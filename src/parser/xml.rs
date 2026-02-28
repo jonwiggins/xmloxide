@@ -490,10 +490,11 @@ impl<'a> XmlParser<'a> {
         // --- Namespace processing (Namespaces in XML 1.0 section 3) ---
 
         // Check for namespace declarations to skip namespace scope push/pop
-        // when not needed. Uses short-circuiting .any() for fast exit.
-        let has_ns_decls = attributes.iter().any(|a| {
-            a.prefix.as_deref() == Some("xmlns") || (a.prefix.is_none() && a.name == "xmlns")
-        });
+        // when not needed. Skip the scan entirely when there are no attributes.
+        let has_ns_decls = !attributes.is_empty()
+            && attributes.iter().any(|a| {
+                a.prefix.as_deref() == Some("xmlns") || (a.prefix.is_none() && a.name == "xmlns")
+            });
         if has_ns_decls {
             self.ns.push_scope();
         }
@@ -733,9 +734,10 @@ impl<'a> XmlParser<'a> {
         // Resolve namespace URIs for non-xmlns prefixed attributes.
         // Unprefixed attributes do NOT inherit the default namespace (per spec).
         // Skip entirely when there are no prefixed non-xmlns attributes.
-        let has_prefixed_attrs = attributes
-            .iter()
-            .any(|a| a.prefix.is_some() && a.prefix.as_deref() != Some("xmlns"));
+        let has_prefixed_attrs = !attributes.is_empty()
+            && attributes
+                .iter()
+                .any(|a| a.prefix.is_some() && a.prefix.as_deref() != Some("xmlns"));
         if has_prefixed_attrs {
             for attr in &mut attributes {
                 if let Some(pfx) = &attr.prefix {
