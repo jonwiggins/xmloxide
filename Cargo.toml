@@ -53,7 +53,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [lib]
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib"]
 
 [package.metadata.docs.rs]
 all-features = true

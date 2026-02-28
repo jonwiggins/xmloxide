@@ -2,6 +2,8 @@
 #
 # Usage:
 #   make              - build shared and static libraries (release)
+#   make shared       - build shared library only (.so / .dylib / .dll)
+#   make static       - build static library only (.a / .lib)
 #   make debug        - build both in debug mode
 #   make example      - build and link the C FFI example
 #   make clean        - remove build artifacts
@@ -34,12 +36,17 @@ else
   DYLD =
 endif
 
-.PHONY: all debug example clean
+.PHONY: all shared static debug example clean
 
-all:
-	$(CARGO) build --lib $(CARGO_FLAGS)
+shared:
+	$(CARGO) rustc --lib $(CARGO_FLAGS) --crate-type=cdylib
 	@echo "Built: $(TARGET_DIR)/$(SHARED_LIB)"
+
+static:
+	$(CARGO) rustc --lib $(CARGO_FLAGS) --crate-type=staticlib
 	@echo "Built: $(TARGET_DIR)/libxmloxide.a"
+
+all: shared static
 
 debug:
 	$(MAKE) PROFILE=debug all
