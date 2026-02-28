@@ -144,14 +144,26 @@ pub(crate) fn find_invalid_xml_char(s: &str) -> Option<char> {
 
 /// Returns `true` if a byte slice might contain invalid XML characters.
 /// This is a fast pre-check: if all bytes are >= 0x20 (and no DEL 0x7F),
-/// the content is guaranteed valid for the ASCII range.
-fn may_contain_invalid_xml_chars(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .any(|&b| (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F)
-        || bytes
-            .windows(3)
-            .any(|w| w[0] == 0xEF && w[1] == 0xBF && (w[2] == 0xBE || w[2] == 0xBF))
+/// the content is guaranteed valid for the ASCII range. Also detects
+/// the UTF-8 encodings of U+FFFE and U+FFFF (0xEF 0xBF 0xBE/0xBF).
+pub(crate) fn may_contain_invalid_xml_chars(bytes: &[u8]) -> bool {
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7F {
+            return true;
+        }
+        if b == 0xEF
+            && i + 2 < len
+            && bytes[i + 1] == 0xBF
+            && (bytes[i + 2] == 0xBE || bytes[i + 2] == 0xBF)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Splits a qualified name into optional prefix and local part.
@@ -1479,9 +1491,12 @@ impl<'a> ParserInput<'a> {
                 let start = self.pos;
                 let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
                     .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
-                // Validate XML chars: check for illegal multi-byte characters
-                // (e.g. U+FFFE, U+FFFF) that pass through the bulk scanner.
-                if let Some(bad) = find_invalid_xml_char(chunk) {
+                // Fast byte-level pre-check: only validate when bytes suggest
+                // possible invalid chars (0x7F or U+FFFE/U+FFFF sequences).
+                if let Some(bad) = may_contain_invalid_xml_chars(chunk.as_bytes())
+                    .then(|| find_invalid_xml_char(chunk))
+                    .flatten()
+                {
                     if self.recover {
                         self.push_diagnostic(
                             ErrorSeverity::Error,

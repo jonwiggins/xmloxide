@@ -9,4 +9,4 @@ pub mod c14n;
 pub mod html;
 pub mod xml;
 
-pub use xml::serialize;
+pub use xml::{serialize, serialize_with_options, SerializeOptions};

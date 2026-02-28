@@ -4,6 +4,53 @@
 
 use crate::tree::{Document, NodeId, NodeKind};
 
+/// Options controlling XML serialization output.
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::Document;
+/// use xmloxide::serial::{serialize_with_options, SerializeOptions};
+///
+/// let doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
+/// let xml = serialize_with_options(&doc, &SerializeOptions::default().indent(true));
+/// assert!(xml.contains("  <child>"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct SerializeOptions {
+    /// Whether to produce indented (pretty-printed) output.
+    /// Defaults to `false`.
+    pub indent: bool,
+    /// The indentation string used for each level when `indent` is `true`.
+    /// Defaults to two spaces.
+    pub indent_str: String,
+}
+
+impl Default for SerializeOptions {
+    fn default() -> Self {
+        Self {
+            indent: false,
+            indent_str: "  ".to_string(),
+        }
+    }
+}
+
+impl SerializeOptions {
+    /// Enables or disables indented (pretty-printed) output.
+    #[must_use]
+    pub fn indent(mut self, indent: bool) -> Self {
+        self.indent = indent;
+        self
+    }
+
+    /// Sets the indentation string (e.g., `"  "` or `"\t"`).
+    #[must_use]
+    pub fn indent_str(mut self, s: &str) -> Self {
+        self.indent_str = s.to_string();
+        self
+    }
+}
+
 /// Serializes a document to an XML string.
 ///
 /// # Examples
@@ -18,6 +65,26 @@ use crate::tree::{Document, NodeId, NodeKind};
 /// ```
 #[must_use]
 pub fn serialize(doc: &Document) -> String {
+    serialize_with_options(doc, &SerializeOptions::default())
+}
+
+/// Serializes a document to an XML string with the given options.
+///
+/// When `options.indent` is `true`, produces pretty-printed output with
+/// newlines and indentation between elements.
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::Document;
+/// use xmloxide::serial::{serialize_with_options, SerializeOptions};
+///
+/// let doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
+/// let xml = serialize_with_options(&doc, &SerializeOptions::default().indent(true));
+/// assert!(xml.contains("  <child>"));
+/// ```
+#[must_use]
+pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> String {
     let mut output = String::new();
 
     // XML declaration — always emit, defaulting to version 1.0 (matches libxml2)
@@ -43,7 +110,15 @@ pub fn serialize(doc: &Document) -> String {
 
     // Serialize children of the document root
     for child in doc.children(doc.root()) {
-        serialize_node(doc, child, &mut output, reencode_non_ascii);
+        serialize_node(
+            doc,
+            child,
+            &mut output,
+            reencode_non_ascii,
+            options,
+            0,
+            false,
+        );
     }
 
     // Trailing newline (matches libxml2 output convention)
@@ -52,8 +127,36 @@ pub fn serialize(doc: &Document) -> String {
     output
 }
 
+/// Returns `true` if the element contains only other elements (and optional
+/// whitespace text), meaning it's safe to add indentation.
+fn is_element_only(doc: &Document, id: NodeId) -> bool {
+    let mut has_element_child = false;
+    for child in doc.children(id) {
+        match &doc.node(child).kind {
+            NodeKind::Element { .. } => has_element_child = true,
+            NodeKind::Text { content } => {
+                if !content.trim().is_empty() {
+                    return false;
+                }
+            }
+            NodeKind::CData { .. } | NodeKind::EntityRef { .. } => return false,
+            _ => {}
+        }
+    }
+    has_element_child
+}
+
 #[allow(clippy::too_many_lines)]
-fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_ascii: bool) {
+fn serialize_node(
+    doc: &Document,
+    id: NodeId,
+    out: &mut String,
+    reencode_non_ascii: bool,
+    options: &SerializeOptions,
+    depth: usize,
+    parent_is_element_only: bool,
+) {
+    let indent = options.indent;
     match &doc.node(id).kind {
         NodeKind::Element {
             name,
@@ -61,6 +164,11 @@ fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_asc
             attributes,
             ..
         } => {
+            if indent && parent_is_element_only {
+                for _ in 0..depth {
+                    out.push_str(&options.indent_str);
+                }
+            }
             out.push('<');
             if let Some(pfx) = prefix {
                 out.push_str(pfx);
@@ -76,9 +184,6 @@ fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_asc
                 }
                 out.push_str(&attr.name);
                 out.push_str("=\"");
-                // Use raw_value (with entity references preserved) when available,
-                // but NOT for namespace declarations — namespace URIs should
-                // always use the fully expanded value.
                 let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
                 if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
                     write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
@@ -88,13 +193,39 @@ fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_asc
                 out.push('"');
             }
 
-            // Check for self-closing
             if doc.first_child(id).is_none() {
                 out.push_str("/>");
+                if indent && parent_is_element_only {
+                    out.push('\n');
+                }
             } else {
                 out.push('>');
+                let element_only = indent && is_element_only(doc, id);
+                if element_only {
+                    out.push('\n');
+                }
                 for child in doc.children(id) {
-                    serialize_node(doc, child, out, reencode_non_ascii);
+                    if element_only {
+                        if let NodeKind::Text { content } = &doc.node(child).kind {
+                            if content.trim().is_empty() {
+                                continue;
+                            }
+                        }
+                    }
+                    serialize_node(
+                        doc,
+                        child,
+                        out,
+                        reencode_non_ascii,
+                        options,
+                        depth + 1,
+                        element_only,
+                    );
+                }
+                if element_only {
+                    for _ in 0..depth {
+                        out.push_str(&options.indent_str);
+                    }
                 }
                 out.push_str("</");
                 if let Some(pfx) = prefix {
@@ -103,6 +234,9 @@ fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_asc
                 }
                 out.push_str(name);
                 out.push('>');
+                if indent && parent_is_element_only {
+                    out.push('\n');
+                }
             }
         }
         NodeKind::Text { content } => {
@@ -114,11 +248,24 @@ fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_asc
             out.push_str("]]>");
         }
         NodeKind::Comment { content } => {
+            if indent && parent_is_element_only {
+                for _ in 0..depth {
+                    out.push_str(&options.indent_str);
+                }
+            }
             out.push_str("<!--");
             out.push_str(content);
             out.push_str("-->");
+            if indent && parent_is_element_only {
+                out.push('\n');
+            }
         }
         NodeKind::ProcessingInstruction { target, data } => {
+            if indent && parent_is_element_only {
+                for _ in 0..depth {
+                    out.push_str(&options.indent_str);
+                }
+            }
             out.push_str("<?");
             out.push_str(target);
             if let Some(d) = data {
@@ -126,6 +273,9 @@ fn serialize_node(doc: &Document, id: NodeId, out: &mut String, reencode_non_asc
                 out.push_str(d);
             }
             out.push_str("?>");
+            if indent && parent_is_element_only {
+                out.push('\n');
+            }
         }
         NodeKind::EntityRef { name, .. } => {
             out.push('&');
@@ -388,6 +538,7 @@ fn write_escaped_attr(out: &mut String, text: &str, reencode_non_ascii: bool) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::tree::Attribute;
@@ -567,5 +718,43 @@ mod tests {
             serialize(&doc),
             "<?xml version=\"1.0\"?>\n<a title=\"He said &quot;hello&quot; &amp; &lt;bye&gt;\"/>\n"
         );
+    }
+
+    #[test]
+    fn test_serialize_pretty_print() {
+        let doc = Document::parse_str("<root><child><inner>text</inner></child></root>").unwrap();
+        let opts = SerializeOptions::default().indent(true);
+        let xml = serialize_with_options(&doc, &opts);
+        assert_eq!(
+            xml,
+            "<?xml version=\"1.0\"?>\n<root>\n  <child>\n    <inner>text</inner>\n  </child>\n</root>\n"
+        );
+    }
+
+    #[test]
+    fn test_serialize_pretty_print_mixed_content() {
+        // Mixed content (element + non-whitespace text) should not be indented
+        let doc = Document::parse_str("<root><p>Hello <b>world</b></p></root>").unwrap();
+        let opts = SerializeOptions::default().indent(true);
+        let xml = serialize_with_options(&doc, &opts);
+        // Mixed content children are not indented
+        assert!(xml.contains("  <p>Hello <b>world</b></p>"));
+    }
+
+    #[test]
+    fn test_serialize_pretty_print_custom_indent() {
+        let doc = Document::parse_str("<root><child/></root>").unwrap();
+        let opts = SerializeOptions::default().indent(true).indent_str("\t");
+        let xml = serialize_with_options(&doc, &opts);
+        assert!(xml.contains("\t<child/>"));
+    }
+
+    #[test]
+    fn test_serialize_no_indent_unchanged() {
+        // Default (no indent) should produce same output as serialize()
+        let doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
+        let xml1 = serialize(&doc);
+        let xml2 = serialize_with_options(&doc, &SerializeOptions::default());
+        assert_eq!(xml1, xml2);
     }
 }

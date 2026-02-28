@@ -284,3 +284,333 @@ pub unsafe extern "C" fn xmloxide_node_attribute_count(doc: *const Document, nod
     };
     doc.attributes(node_id).len()
 }
+
+/// Returns the name of the attribute at the given index.
+///
+/// Returns null if the index is out of range. The returned string must
+/// be freed with `xmloxide_free_string`.
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_node_attribute_name_at(
+    doc: *const Document,
+    node: u32,
+    index: usize,
+) -> *mut c_char {
+    let Some((doc, node_id)) = (unsafe { doc_and_node(doc, node) }) else {
+        return std::ptr::null_mut();
+    };
+    let attrs = doc.attributes(node_id);
+    match attrs.get(index) {
+        Some(attr) => to_c_string(&attr.name),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the value of the attribute at the given index.
+///
+/// Returns null if the index is out of range. The returned string must
+/// be freed with `xmloxide_free_string`.
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_node_attribute_value_at(
+    doc: *const Document,
+    node: u32,
+    index: usize,
+) -> *mut c_char {
+    let Some((doc, node_id)) = (unsafe { doc_and_node(doc, node) }) else {
+        return std::ptr::null_mut();
+    };
+    let attrs = doc.attributes(node_id);
+    match attrs.get(index) {
+        Some(attr) => to_c_string(&attr.value),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Helper to safely dereference a mutable document pointer and node id.
+unsafe fn doc_and_node_mut(
+    doc: *mut Document,
+    raw_node: u32,
+) -> Option<(&'static mut Document, NodeId)> {
+    if doc.is_null() {
+        return None;
+    }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
+    let doc = unsafe { &mut *doc };
+    let node_id = NodeId::from_raw(raw_node)?;
+    Some((doc, node_id))
+}
+
+/// Creates a new element node and returns its id (0 on failure).
+///
+/// The node is detached — use `xmloxide_append_child` to add it to the tree.
+/// The returned node is owned by the document and freed when the document is freed.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `name` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_create_element(doc: *mut Document, name: *const c_char) -> u32 {
+    if doc.is_null() || name.is_null() {
+        return 0;
+    }
+    // SAFETY: Null checks above. Caller guarantees valid pointers.
+    let doc = unsafe { &mut *doc };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let Ok(name_str) = c_name.to_str() else {
+        return 0;
+    };
+    let node = doc.create_node(NodeKind::Element {
+        name: name_str.to_string(),
+        prefix: None,
+        namespace: None,
+        attributes: vec![],
+    });
+    node.into_raw()
+}
+
+/// Creates a new text node and returns its id (0 on failure).
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `content` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_create_text(doc: *mut Document, content: *const c_char) -> u32 {
+    if doc.is_null() || content.is_null() {
+        return 0;
+    }
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_content = unsafe { std::ffi::CStr::from_ptr(content) };
+    let Ok(text) = c_content.to_str() else {
+        return 0;
+    };
+    let node = doc.create_node(NodeKind::Text {
+        content: text.to_string(),
+    });
+    node.into_raw()
+}
+
+/// Creates a new comment node and returns its id (0 on failure).
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `content` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_create_comment(
+    doc: *mut Document,
+    content: *const c_char,
+) -> u32 {
+    if doc.is_null() || content.is_null() {
+        return 0;
+    }
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_content = unsafe { std::ffi::CStr::from_ptr(content) };
+    let Ok(text) = c_content.to_str() else {
+        return 0;
+    };
+    let node = doc.create_node(NodeKind::Comment {
+        content: text.to_string(),
+    });
+    node.into_raw()
+}
+
+/// Appends a child node to a parent. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_append_child(doc: *mut Document, parent: u32, child: u32) -> i32 {
+    let Some((doc, parent_id)) = (unsafe { doc_and_node_mut(doc, parent) }) else {
+        return 0;
+    };
+    let Some(child_id) = NodeId::from_raw(child) else {
+        return 0;
+    };
+    doc.append_child(parent_id, child_id);
+    1
+}
+
+/// Removes a node from the tree. Returns 1 on success, 0 on failure.
+///
+/// The node remains in the arena but is detached from the tree.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_remove_node(doc: *mut Document, node: u32) -> i32 {
+    let Some((doc, node_id)) = (unsafe { doc_and_node_mut(doc, node) }) else {
+        return 0;
+    };
+    doc.remove_node(node_id);
+    1
+}
+
+/// Deep-clones a node and its descendants. Returns the new node id (0 on failure).
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_clone_node(doc: *mut Document, node: u32, deep: i32) -> u32 {
+    let Some((doc, node_id)) = (unsafe { doc_and_node_mut(doc, node) }) else {
+        return 0;
+    };
+    let cloned = doc.clone_node(node_id, deep != 0);
+    cloned.into_raw()
+}
+
+/// Sets the text content of a node. Returns 1 on success, 0 on failure.
+///
+/// For text, CDATA, and comment nodes, updates the content directly.
+/// For element nodes, removes all children and replaces with a text node.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `content` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_set_text_content(
+    doc: *mut Document,
+    node: u32,
+    content: *const c_char,
+) -> i32 {
+    if doc.is_null() || content.is_null() {
+        return 0;
+    }
+    let Some(node_id) = NodeId::from_raw(node) else {
+        return 0;
+    };
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_content = unsafe { std::ffi::CStr::from_ptr(content) };
+    let Ok(text) = c_content.to_str() else {
+        return 0;
+    };
+    i32::from(doc.set_text_content(node_id, text))
+}
+
+/// Sets an attribute on an element node. Returns 1 on success, 0 on failure.
+///
+/// If the attribute already exists, its value is updated.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `name` and `value` must
+/// be valid null-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_set_attribute(
+    doc: *mut Document,
+    node: u32,
+    name: *const c_char,
+    value: *const c_char,
+) -> i32 {
+    if doc.is_null() || name.is_null() || value.is_null() {
+        return 0;
+    }
+    let Some(node_id) = NodeId::from_raw(node) else {
+        return 0;
+    };
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let c_value = unsafe { std::ffi::CStr::from_ptr(value) };
+    let Ok(name_str) = c_name.to_str() else {
+        return 0;
+    };
+    let Ok(value_str) = c_value.to_str() else {
+        return 0;
+    };
+    if let NodeKind::Element { attributes, .. } = &mut doc.node_mut(node_id).kind {
+        if let Some(attr) = attributes.iter_mut().find(|a| a.name == name_str) {
+            attr.value = value_str.to_string();
+            attr.raw_value = None;
+        } else {
+            attributes.push(crate::tree::Attribute {
+                name: name_str.to_string(),
+                value: value_str.to_string(),
+                prefix: None,
+                namespace: None,
+                raw_value: None,
+            });
+        }
+        1
+    } else {
+        0
+    }
+}
+
+/// Inserts a node before a reference sibling. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_insert_before(
+    doc: *mut Document,
+    reference: u32,
+    new_child: u32,
+) -> i32 {
+    let Some((doc, ref_id)) = (unsafe { doc_and_node_mut(doc, reference) }) else {
+        return 0;
+    };
+    let Some(child_id) = NodeId::from_raw(new_child) else {
+        return 0;
+    };
+    doc.insert_before(ref_id, child_id);
+    1
+}
+
+/// Returns the element with the given ID attribute, or 0 if not found.
+///
+/// Note: the document's `id_map` must be populated first, typically by
+/// running DTD validation with `xmloxide_validate_dtd`.
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer. `id` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_element_by_id(doc: *const Document, id: *const c_char) -> u32 {
+    if doc.is_null() || id.is_null() {
+        return 0;
+    }
+    // SAFETY: Null checks above.
+    let doc = unsafe { &*doc };
+    let c_id = unsafe { std::ffi::CStr::from_ptr(id) };
+    let Ok(id_str) = c_id.to_str() else {
+        return 0;
+    };
+    node_id_to_raw(doc.element_by_id(id_str))
+}
+
+/// Returns the namespace prefix of an element node, or null if none.
+///
+/// For example, returns `"svg"` for `<svg:rect>`.
+/// The returned string must be freed with `xmloxide_free_string`.
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_node_prefix(doc: *const Document, node: u32) -> *mut c_char {
+    let Some((doc, node_id)) = (unsafe { doc_and_node(doc, node) }) else {
+        return std::ptr::null_mut();
+    };
+    match doc.node_prefix(node_id) {
+        Some(prefix) => to_c_string(prefix),
+        None => std::ptr::null_mut(),
+    }
+}

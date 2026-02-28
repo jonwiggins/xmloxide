@@ -53,6 +53,9 @@ expect_used = "warn"
 [lib]
 crate-type = ["lib"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [[bin]]
 name = "xmllint"
 path = "src/bin/xmllint.rs"

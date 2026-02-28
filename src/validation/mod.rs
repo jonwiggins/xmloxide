@@ -1,17 +1,17 @@
 //! Document validation framework.
 //!
-//! This module provides DTD (Document Type Definition) validation for XML
-//! documents. It includes a DTD parser that processes internal subset
-//! declarations and a validator that checks document conformance against
-//! the parsed DTD.
+//! This module provides schema validation for XML documents, supporting
+//! DTD, `RelaxNG`, and XML Schema (XSD). Each validator parses its schema
+//! format and checks document conformance, returning a `ValidationResult`
+//! with errors and warnings.
 //!
 //! # Architecture
 //!
 //! The validation module is organized into:
 //! - Common types (`ValidationResult`, `ValidationError`) used across all validators
 //! - DTD validation (`dtd` submodule) for XML 1.0 DTD processing
-//!
-//! Future phases will add `RelaxNG` and XML Schema validation.
+//! - `RelaxNG` validation (`relaxng` submodule) for `RelaxNG` schema validation
+//! - XML Schema validation (`xsd` submodule) for XSD 1.0 validation
 
 pub mod dtd;
 pub mod relaxng;

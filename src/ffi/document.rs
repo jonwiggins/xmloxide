@@ -131,3 +131,69 @@ pub unsafe extern "C" fn xmloxide_doc_encoding(doc: *const Document) -> *mut c_c
         None => std::ptr::null_mut(),
     }
 }
+
+/// Parses an HTML string into a document.
+///
+/// Returns a pointer to the document on success, or null on failure.
+/// The returned document must be freed with [`xmloxide_free_doc`].
+///
+/// # Safety
+///
+/// `input` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_parse_html(input: *const c_char) -> *mut Document {
+    clear_last_error();
+    if input.is_null() {
+        set_last_error("null input pointer");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: Null check above. Caller guarantees valid null-terminated string.
+    let c_str = unsafe { CStr::from_ptr(input) };
+    let s = match c_str.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(&format!("invalid UTF-8: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    match crate::html::parse_html(s) {
+        Ok(doc) => Box::into_raw(Box::new(doc)),
+        Err(e) => {
+            set_last_error(&e.message);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Parses an XML file from a filesystem path.
+///
+/// Returns a pointer to the document on success, or null on failure.
+/// The returned document must be freed with [`xmloxide_free_doc`].
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_parse_file(path: *const c_char) -> *mut Document {
+    clear_last_error();
+    if path.is_null() {
+        set_last_error("null path pointer");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: Null check above. Caller guarantees valid null-terminated string.
+    let c_str = unsafe { CStr::from_ptr(path) };
+    let s = match c_str.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(&format!("invalid UTF-8 in path: {e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    match Document::parse_file(s) {
+        Ok(doc) => Box::into_raw(Box::new(doc)),
+        Err(e) => {
+            set_last_error(&e.message);
+            std::ptr::null_mut()
+        }
+    }
+}

@@ -10,9 +10,10 @@ use crate::tree::{Attribute, Document, NodeId, NodeKind};
 use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
 
 use super::input::{
-    find_invalid_xml_char, parse_cdata_content, parse_comment_content, parse_pi_content,
-    parse_xml_decl, split_name, split_owned_name, validate_pubid, ExternalEntityInfo,
-    NamespaceResolver, ParserInput, XMLNS_NAMESPACE, XML_NAMESPACE,
+    find_invalid_xml_char, may_contain_invalid_xml_chars, parse_cdata_content,
+    parse_comment_content, parse_pi_content, parse_xml_decl, split_name, split_owned_name,
+    validate_pubid, ExternalEntityInfo, NamespaceResolver, ParserInput, XMLNS_NAMESPACE,
+    XML_NAMESPACE,
 };
 use super::ParseOptions;
 
@@ -947,14 +948,35 @@ impl<'a> XmlParser<'a> {
             let safe_len = self.input.scan_char_data();
             if safe_len > 0 {
                 let start = self.input.pos();
-                // Copy chunk into an owned String to release the borrow on self.input
-                // before any potential diagnostic calls.
                 let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
-                    .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?
-                    .to_string();
-                // Validate XML chars: check for illegal multi-byte characters
-                // (e.g. U+FFFE, U+FFFF) that pass through the bulk scanner.
-                if let Some(bad) = find_invalid_xml_char(&chunk) {
+                    .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                // Fast byte-level pre-check for invalid XML chars (0x7F,
+                // U+FFFE, U+FFFF). Skips the expensive char-by-char
+                // validation for the 99.9% of chunks that are clean.
+                let bad_char = if may_contain_invalid_xml_chars(chunk.as_bytes()) {
+                    find_invalid_xml_char(chunk)
+                } else {
+                    None
+                };
+                // Append text with CR normalization if needed (XML 1.0 §2.11)
+                if chunk.as_bytes().contains(&b'\r') {
+                    let mut chars = chunk.chars().peekable();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\r' {
+                            if chars.peek() == Some(&'\n') {
+                                chars.next();
+                            }
+                            text.push('\n');
+                        } else {
+                            text.push(ch);
+                        }
+                    }
+                } else {
+                    text.push_str(chunk);
+                }
+                // chunk borrow released — safe to mutably borrow self.input
+                self.input.advance_counting_lines(safe_len);
+                if let Some(bad) = bad_char {
                     if self.options.recover {
                         self.input.push_diagnostic(
                             ErrorSeverity::Error,
@@ -966,24 +988,6 @@ impl<'a> XmlParser<'a> {
                             .fatal(format!("invalid XML character: U+{:04X}", bad as u32)));
                     }
                 }
-                // Check if CR normalization is needed (rare in practice)
-                if chunk.contains('\r') {
-                    let mut chars = chunk.chars().peekable();
-                    while let Some(ch) = chars.next() {
-                        if ch == '\r' {
-                            // \r\n → \n, bare \r → \n (XML 1.0 §2.11)
-                            if chars.peek() == Some(&'\n') {
-                                chars.next();
-                            }
-                            text.push('\n');
-                        } else {
-                            text.push(ch);
-                        }
-                    }
-                } else {
-                    text.push_str(&chunk);
-                }
-                self.input.advance_counting_lines(safe_len);
                 continue;
             }
 

@@ -22,10 +22,14 @@
 // FFI functions require unsafe blocks throughout.
 #![allow(unsafe_code, clippy::missing_safety_doc)]
 
+pub mod c14n;
+pub mod catalog;
 pub mod document;
 pub mod serial;
 pub mod strings;
 pub mod tree;
+pub mod validation;
+pub mod xinclude;
 pub mod xpath;
 
 use std::cell::RefCell;

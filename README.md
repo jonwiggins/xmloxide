@@ -144,27 +144,27 @@ xmllint --html page.html
 
 ## Performance
 
-Parsing throughput is competitive with libxml2, with stricter conformance validation adding some overhead. Serialization is **1.6-2.5x faster** thanks to the arena-based tree design.
+Parsing throughput is competitive with libxml2 — within 3-11% on most documents, and **15% faster** on SVG. Serialization is **1.5-2.4x faster** thanks to the arena-based tree design.
 
 **Parsing:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 31.2 µs | 24.5 µs | ~27% slower |
-| SVG drawing | 6.3 KB | 61.6 µs | 63.1 µs | **~2% faster** |
-| Maven POM | 11.5 KB | 92.4 µs | 71.9 µs | ~28% slower |
-| XHTML page | 10.2 KB | 79.6 µs | 59.6 µs | ~34% slower |
-| Large (374 KB) | 374 KB | 2.36 ms | 2.00 ms | ~18% slower |
+| Atom feed | 4.9 KB | 26.3 µs (178 MiB/s) | 24.3 µs (193 MiB/s) | ~8% slower |
+| SVG drawing | 6.3 KB | 55.6 µs (108 MiB/s) | 63.8 µs (94 MiB/s) | **15% faster** |
+| Maven POM | 11.5 KB | 74.6 µs (147 MiB/s) | 71.7 µs (153 MiB/s) | ~4% slower |
+| XHTML page | 10.2 KB | 67.3 µs (144 MiB/s) | 59.8 µs (162 MiB/s) | ~11% slower |
+| Large (374 KB) | 374 KB | 2.13 ms (171 MiB/s) | 2.07 ms (177 MiB/s) | ~3% slower |
 
 **Serialization:**
 
 | Document | Size | xmloxide | libxml2 | Result |
 |----------|------|----------|---------|--------|
-| Atom feed | 4.9 KB | 10.8 µs | 16.8 µs | **1.6x faster** |
-| Maven POM | 11.5 KB | 18.7 µs | 46.1 µs | **2.5x faster** |
-| Large (374 KB) | 374 KB | 577 µs | 1370 µs | **2.4x faster** |
+| Atom feed | 4.9 KB | 11.4 µs | 17.6 µs | **1.5x faster** |
+| Maven POM | 11.5 KB | 19.5 µs | 46.4 µs | **2.4x faster** |
+| Large (374 KB) | 374 KB | 608 µs | 1367 µs | **2.3x faster** |
 
-Key optimizations: arena-based tree for fast serialization, O(1) character peek, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, and inline entity resolution.
+Key optimizations: arena-based tree for fast serialization, byte-level pre-checks for character validation, bulk text scanning, ASCII fast paths for name parsing, zero-copy element name splitting, and inline entity resolution.
 
 ```sh
 # Run benchmarks (requires libxml2 system library)
@@ -173,7 +173,7 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 
 ## Testing
 
-- **769 unit tests** across all modules
+- **778 unit tests** across all modules
 - **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **Integration tests** covering real-world XML documents, edge cases, and error recovery
@@ -209,7 +209,44 @@ xmloxide_free_string(text);
 xmloxide_free_doc(doc);
 ```
 
-The full API — including tree navigation, XPath evaluation, and serialization — is declared in [`include/xmloxide.h`](include/xmloxide.h).
+The full API — including tree navigation and mutation, XPath evaluation, serialization (plain and pretty-printed), HTML parsing, DTD/RelaxNG/XSD validation, C14N, and XML Catalogs — is declared in [`include/xmloxide.h`](include/xmloxide.h).
+
+## Migrating from libxml2
+
+| libxml2 | xmloxide (Rust) | xmloxide (C FFI) |
+|---------|----------------|------------------|
+| `xmlReadMemory` | `Document::parse_str` | `xmloxide_parse_str` |
+| `xmlReadFile` | `Document::parse_file` | `xmloxide_parse_file` |
+| `xmlParseDoc` | `Document::parse_bytes` | `xmloxide_parse_bytes` |
+| `htmlReadMemory` | `html::parse_html` | `xmloxide_parse_html` |
+| `xmlFreeDoc` | (drop `Document`) | `xmloxide_free_doc` |
+| `xmlDocGetRootElement` | `doc.root_element()` | `xmloxide_doc_root_element` |
+| `xmlNodeGetContent` | `doc.text_content(id)` | `xmloxide_node_text_content` |
+| `xmlNodeSetContent` | `doc.set_text_content(id, s)` | `xmloxide_set_text_content` |
+| `xmlGetProp` | `doc.attribute(id, name)` | `xmloxide_node_attribute` |
+| `xmlSetProp` | `doc.set_attribute(...)` | `xmloxide_set_attribute` |
+| `xmlNewNode` | `doc.create_node(...)` | `xmloxide_create_element` |
+| `xmlNewText` | `doc.create_node(Text{..})` | `xmloxide_create_text` |
+| `xmlAddChild` | `doc.append_child(p, c)` | `xmloxide_append_child` |
+| `xmlAddPrevSibling` | `doc.insert_before(ref, c)` | `xmloxide_insert_before` |
+| `xmlUnlinkNode` | `doc.remove_node(id)` | `xmloxide_remove_node` |
+| `xmlCopyNode` | `doc.clone_node(id, deep)` | `xmloxide_clone_node` |
+| `xmlGetID` | `doc.element_by_id(s)` | `xmloxide_element_by_id` |
+| `xmlDocDumpMemory` | `serial::serialize(&doc)` | `xmloxide_serialize` |
+| `xmlDocDumpFormatMemory` | `serial::serialize_with_options` | `xmloxide_serialize_pretty` |
+| `htmlDocDumpMemory` | `serial::html::serialize_html` | `xmloxide_serialize_html` |
+| `xmlC14NDocDumpMemory` | `serial::c14n::canonicalize` | `xmloxide_canonicalize` |
+| `xmlXPathEvalExpression` | `xpath::evaluate` | `xmloxide_xpath_eval` |
+| `xmlValidateDtd` | `validation::dtd::validate` | `xmloxide_validate_dtd` |
+| `xmlRelaxNGValidateDoc` | `validation::relaxng::validate` | `xmloxide_validate_relaxng` |
+| `xmlSchemaValidateDoc` | `validation::xsd::validate_xsd` | `xmloxide_validate_xsd` |
+| `xmlXIncludeProcess` | `xinclude::process_xincludes` | `xmloxide_process_xincludes` |
+| `xmlLoadCatalog` | `Catalog::parse` | `xmloxide_parse_catalog` |
+| `xmlSAX2...` callbacks | `sax::SaxHandler` trait | — |
+| `xmlTextReaderRead` | `reader::XmlReader` | — |
+| `xmlCreatePushParserCtxt` | `parser::PushParser` | — |
+
+**Thread safety:** Unlike libxml2, xmloxide has no global state. Each `Document` is self-contained and `Send + Sync`. The FFI layer uses thread-local storage for the last error message — each thread has its own error state. No initialization or cleanup functions are needed.
 
 ## Fuzzing
 
@@ -243,6 +280,8 @@ Minimum supported Rust version: **1.81**
 - **No XSLT** — XSLT is a separate specification (libxslt) and is out of scope.
 - **No Schematron** — Schematron validation is not implemented. DTD, RelaxNG, and XSD are supported.
 - **HTML 4.01 only** — the HTML parser targets HTML 4.01, not the HTML5 parsing algorithm.
+- **Push parser buffers internally** — the push/incremental parser API (`PushParser`) currently buffers all pushed data and performs the full parse on `finish()`, rather than truly streaming like libxml2's `xmlParseChunk`. SAX streaming (`parse_sax`) is available as an alternative for memory-constrained large-document processing.
+- **XPath `namespace::` axis** — the `namespace::` axis is not implemented; queries using it return an empty node set rather than an error.
 
 ## Contributing
 

@@ -299,6 +299,34 @@ impl Document {
         crate::parser::parse_str(text)
     }
 
+    /// Parses an XML file from the filesystem.
+    ///
+    /// Reads the file as raw bytes and uses automatic encoding detection
+    /// (BOM sniffing and XML declaration inspection) before parsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the file cannot be read, the encoding
+    /// cannot be determined, or the XML is not well-formed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use xmloxide::Document;
+    ///
+    /// let doc = Document::parse_file("document.xml").unwrap();
+    /// ```
+    pub fn parse_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ParseError> {
+        use crate::error::SourceLocation;
+
+        let bytes = std::fs::read(path.as_ref()).map_err(|e| ParseError {
+            message: format!("failed to read file: {e}"),
+            location: SourceLocation::default(),
+            diagnostics: Vec::new(),
+        })?;
+        Self::parse_bytes(&bytes)
+    }
+
     /// Returns the document root node id.
     #[must_use]
     pub fn root(&self) -> NodeId {
@@ -350,6 +378,18 @@ impl Document {
     pub fn node_namespace(&self, id: NodeId) -> Option<&str> {
         match &self.node(id).kind {
             NodeKind::Element { namespace, .. } => namespace.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the namespace prefix of an element node, if any.
+    ///
+    /// For example, returns `Some("svg")` for `<svg:rect>`.
+    /// Non-element nodes always return `None`.
+    #[must_use]
+    pub fn node_prefix(&self, id: NodeId) -> Option<&str> {
+        match &self.node(id).kind {
+            NodeKind::Element { prefix, .. } => prefix.as_deref(),
             _ => None,
         }
     }
@@ -594,6 +634,99 @@ impl Document {
         self.node_mut(id).next_sibling = None;
     }
 
+    /// Deep-copies a node and all its descendants within this document.
+    ///
+    /// The cloned subtree is detached (has no parent). If `deep` is `false`,
+    /// only the node itself is cloned without its children.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::Document;
+    ///
+    /// let mut doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
+    /// let root = doc.root_element().unwrap();
+    /// let child = doc.first_child(root).unwrap();
+    /// let cloned = doc.clone_node(child, true);
+    /// doc.append_child(root, cloned);
+    /// ```
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> NodeId {
+        let kind = self.node(id).kind.clone();
+        let new_id = self.create_node(kind);
+        if deep {
+            // Clone children recursively
+            let children: Vec<NodeId> = self.children(id).collect();
+            for child_id in children {
+                let cloned_child = self.clone_node(child_id, true);
+                self.append_child(new_id, cloned_child);
+            }
+        }
+        new_id
+    }
+
+    /// Sets the text content of a text, CDATA, or comment node.
+    ///
+    /// For element nodes, this removes all children and replaces them with
+    /// a single text node containing the given content.
+    ///
+    /// Returns `true` if the content was set, `false` if the node type does
+    /// not support text content (e.g., the document root).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::Document;
+    ///
+    /// let mut doc = Document::parse_str("<root>old</root>").unwrap();
+    /// let root = doc.root_element().unwrap();
+    /// let text_node = doc.first_child(root).unwrap();
+    /// assert!(doc.set_text_content(text_node, "new"));
+    /// assert_eq!(doc.text_content(root), "new");
+    /// ```
+    pub fn set_text_content(&mut self, id: NodeId, content: &str) -> bool {
+        match &self.node(id).kind {
+            NodeKind::Text { .. } | NodeKind::CData { .. } | NodeKind::Comment { .. } => {
+                match &mut self.node_mut(id).kind {
+                    NodeKind::Text {
+                        content: ref mut c, ..
+                    }
+                    | NodeKind::CData {
+                        content: ref mut c, ..
+                    }
+                    | NodeKind::Comment {
+                        content: ref mut c, ..
+                    } => {
+                        *c = content.to_string();
+                    }
+                    _ => unreachable!(),
+                }
+                true
+            }
+            NodeKind::Element { .. } => {
+                // Remove all children
+                let children: Vec<NodeId> = self.children(id).collect();
+                for child in children {
+                    self.remove_node(child);
+                }
+                // Add a single text node
+                let text = self.create_node(NodeKind::Text {
+                    content: content.to_string(),
+                });
+                self.append_child(id, text);
+                true
+            }
+            NodeKind::ProcessingInstruction { .. } => {
+                if let NodeKind::ProcessingInstruction { data, .. } = &mut self.node_mut(id).kind {
+                    *data = Some(content.to_string());
+                }
+                true
+            }
+            NodeKind::Document | NodeKind::DocumentType { .. } | NodeKind::EntityRef { .. } => {
+                false
+            }
+        }
+    }
+
     /// Returns the total number of nodes in the arena (including placeholder).
     #[must_use]
     pub fn node_count(&self) -> usize {
@@ -686,6 +819,7 @@ impl Iterator for Descendants<'_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1575,5 +1709,79 @@ mod tests {
         // Removing a node does not free it from the arena
         doc.remove_node(a);
         assert_eq!(doc.node_count(), 2);
+    }
+
+    #[test]
+    fn test_clone_node_shallow() {
+        let mut doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
+        let root = doc.root_element().unwrap();
+        let child = doc.first_child(root).unwrap();
+
+        let cloned = doc.clone_node(child, false);
+        assert_eq!(doc.node_name(cloned), Some("child"));
+        // Shallow clone has no children
+        assert!(doc.first_child(cloned).is_none());
+        // Clone is detached
+        assert!(doc.parent(cloned).is_none());
+    }
+
+    #[test]
+    fn test_clone_node_deep() {
+        let mut doc =
+            Document::parse_str("<root><parent><child>Hello</child></parent></root>").unwrap();
+        let root = doc.root_element().unwrap();
+        let parent_elem = doc.first_child(root).unwrap();
+
+        let cloned = doc.clone_node(parent_elem, true);
+        assert_eq!(doc.node_name(cloned), Some("parent"));
+        // Deep clone has children
+        let cloned_child = doc.first_child(cloned).unwrap();
+        assert_eq!(doc.node_name(cloned_child), Some("child"));
+        let cloned_text = doc.first_child(cloned_child).unwrap();
+        assert_eq!(doc.node_text(cloned_text), Some("Hello"));
+        // Clone is detached
+        assert!(doc.parent(cloned).is_none());
+        // Original is unchanged
+        assert!(doc.first_child(parent_elem).is_some());
+    }
+
+    #[test]
+    fn test_clone_node_and_append() {
+        let mut doc = Document::parse_str("<root><item>A</item></root>").unwrap();
+        let root = doc.root_element().unwrap();
+        let item = doc.first_child(root).unwrap();
+
+        let cloned = doc.clone_node(item, true);
+        doc.append_child(root, cloned);
+
+        let children: Vec<_> = doc.children(root).collect();
+        assert_eq!(children.len(), 2);
+        assert_eq!(doc.text_content(children[0]), "A");
+        assert_eq!(doc.text_content(children[1]), "A");
+    }
+
+    #[test]
+    fn test_parse_file_nonexistent() {
+        let result = Document::parse_file("/nonexistent/path.xml");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("failed to read file"));
+    }
+
+    #[test]
+    fn test_parse_file_valid() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("xmloxide_test_parse_file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.xml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"<root>Hello</root>").unwrap();
+        drop(f);
+
+        let doc = Document::parse_file(&path).unwrap();
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.node_name(root), Some("root"));
+        assert_eq!(doc.text_content(root), "Hello");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
