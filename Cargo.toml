@@ -13,6 +13,8 @@ keywords = ["xml", "html", "parser", "dom", "xpath"]
 categories = ["parser-implementations", "web-programming"]
 include = [
     "src/**/*.rs",
+    "examples/**/*.rs",
+    "benches/**/*.rs",
     "include/*.h",
     "Cargo.toml",
     "LICENSE",
