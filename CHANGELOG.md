@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-03-02
+
+### Fixed
+
+- Fix docs.rs build failure caused by `all-features = true` pulling in the
+  `bench-libxml2` feature, which requires system libxml2 headers unavailable
+  in the docs.rs sandbox. Now explicitly lists `cli` and `ffi` features.
+
+### Improved
+
+- Expanded doc comments on `Document` navigation, iteration, and mutation
+  methods, `HtmlParseOptions` builder methods, `XmlReader` accessors, and
+  `SerializeOptions` builder methods.
+
 ## [0.1.0] - 2026-03-01
 
 Initial release of xmloxide — a pure Rust reimplementation of libxml2.
@@ -63,4 +77,5 @@ Initial release of xmloxide — a pure Rust reimplementation of libxml2.
 - 119/119 libxml2 compatibility tests (100%)
 - Real-world XML, security/DoS, and entity resolver integration tests
 
+[0.1.1]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.0
