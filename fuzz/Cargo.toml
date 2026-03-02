@@ -33,5 +33,25 @@ name = "fuzz_roundtrip"
 path = "fuzz_targets/fuzz_roundtrip.rs"
 doc = false
 
+[[bin]]
+name = "fuzz_sax"
+path = "fuzz_targets/fuzz_sax.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_reader"
+path = "fuzz_targets/fuzz_reader.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_push"
+path = "fuzz_targets/fuzz_push.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_validation"
+path = "fuzz_targets/fuzz_validation.rs"
+doc = false
+
 [workspace]
 members = ["."]
