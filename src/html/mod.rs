@@ -482,6 +482,26 @@ impl<'a> HtmlParser<'a> {
                 }
             } else if self.input.peek() == Some(b'<') && self.input.peek_at(1) == Some(b'?') {
                 self.parse_processing_instruction();
+            } else if self.input.peek() == Some(b'<') {
+                // Bare '<' not followed by alpha, '/', '!', or '?' — treat as text.
+                // We must consume it here to avoid an infinite loop, since
+                // parse_text() breaks on '<' without advancing.
+                self.input.advance(1);
+                if !self.options.no_implied && self.open_elements.is_empty() {
+                    self.ensure_body();
+                }
+                let parent = self.current_parent();
+                // Merge with previous text node if possible
+                if let Some(last_child) = self.doc.last_child(parent) {
+                    if let NodeKind::Text { content } = &mut self.doc.node_mut(last_child).kind {
+                        content.push('<');
+                        continue;
+                    }
+                }
+                let text_id = self.doc.create_node(NodeKind::Text {
+                    content: "<".to_string(),
+                });
+                self.doc.append_child(parent, text_id);
             } else {
                 self.parse_text();
             }

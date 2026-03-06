@@ -424,6 +424,12 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
     #[test]
+    fn html_parser_does_not_panic(input in "[a-zA-Z0-9 <>/=\"'&;!?.-]{0,60}") {
+        // HTML parser is error-tolerant — it should never panic or hang
+        let _ = xmloxide::html::parse_html(&input);
+    }
+
+    #[test]
     fn html5_parser_does_not_panic(input in ".{0,100}") {
         let _ = xmloxide::html5::parse_html5(&input);
     }
