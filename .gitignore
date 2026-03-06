@@ -15,6 +15,9 @@ tests/conformance/xmlconf/
 # libxml2 regression test data (downloaded by scripts/download-libxml2-tests.sh)
 tests/libxml2-compat/libxml2/
 
+# html5lib test suite (downloaded by scripts/download-html5lib-tests.sh)
+tests/html5lib-tests/
+
 # Fuzz corpus, artifacts, and lock file
 fuzz/corpus/
 fuzz/artifacts/

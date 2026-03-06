@@ -3,6 +3,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::fmt::Write;
 use xmloxide::html::parse_html;
+use xmloxide::html5::{parse_html5, parse_html5_with_options, Html5ParseOptions};
 use xmloxide::parser::{ParseOptions, PushParser};
 use xmloxide::reader::XmlReader;
 use xmloxide::sax::{parse_sax, SaxHandler};
@@ -375,7 +376,31 @@ criterion_group!(
 
 criterion_group!(serialization, bench_serialize_small, bench_serialize_large,);
 
+// ---------------------------------------------------------------------------
+// HTML5 parsing benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_parse_html5(c: &mut Criterion) {
+    let html = make_html_doc();
+    c.bench_function("parse_html5", |b| {
+        b.iter(|| parse_html5(black_box(&html)));
+    });
+}
+
+fn bench_parse_html5_fragment(c: &mut Criterion) {
+    let html = make_html_doc();
+    let opts = Html5ParseOptions {
+        scripting: false,
+        fragment_context: Some("body".to_string()),
+    };
+    c.bench_function("parse_html5_fragment", |b| {
+        b.iter(|| parse_html5_with_options(black_box(&html), &opts));
+    });
+}
+
 criterion_group!(html_parsing, bench_parse_html);
+
+criterion_group!(html5_parsing, bench_parse_html5, bench_parse_html5_fragment);
 
 criterion_group!(sax, bench_sax_parse);
 
@@ -391,6 +416,7 @@ criterion_main!(
     parsing,
     serialization,
     html_parsing,
+    html5_parsing,
     sax,
     reader,
     xpath,

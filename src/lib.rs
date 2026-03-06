@@ -9,6 +9,7 @@
 //! - [`tree`] — DOM tree representation with arena-allocated nodes ([`Document`], [`NodeId`])
 //! - [`parser`] — XML 1.0 parser with error recovery and push/incremental parsing
 //! - [`html`] — Error-tolerant HTML 4.01 parser
+//! - [`html5`] — WHATWG HTML5 parser (tokenizer + tree construction)
 //! - [`sax`] — SAX2 event-driven streaming parser
 //! - [`reader`] — `XmlReader` pull-based parsing API
 //! - [`xpath`] — `XPath` 1.0 expression evaluation
@@ -35,6 +36,7 @@ pub mod error;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod html;
+pub mod html5;
 pub mod parser;
 pub mod reader;
 pub mod sax;

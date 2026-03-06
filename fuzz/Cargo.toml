@@ -53,5 +53,15 @@ name = "fuzz_validation"
 path = "fuzz_targets/fuzz_validation.rs"
 doc = false
 
+[[bin]]
+name = "fuzz_html5_parse"
+path = "fuzz_targets/fuzz_html5_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_html5_fragment"
+path = "fuzz_targets/fuzz_html5_fragment.rs"
+doc = false
+
 [workspace]
 members = ["."]

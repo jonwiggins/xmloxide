@@ -12,6 +12,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use xmloxide::html::parse_html_with_options;
+use xmloxide::html5::parse_html5;
 use xmloxide::parser::{self, ParseOptions};
 use xmloxide::serial::c14n::{canonicalize, C14nOptions};
 use xmloxide::serial::serialize;
@@ -38,9 +39,13 @@ struct Cli {
     verbose: bool,
 
     // -- Parsing options ---------------------------------------------------
-    /// Parse input as HTML instead of XML.
+    /// Parse input as HTML 4.01 instead of XML.
     #[arg(long)]
     html: bool,
+
+    /// Parse input as HTML5 (WHATWG) instead of XML.
+    #[arg(long)]
+    html5: bool,
 
     /// Recover from parsing errors (produce partial tree).
     #[arg(long)]
@@ -156,7 +161,9 @@ fn process_file(cli: &Cli, filename: &str) -> u8 {
     // -- Parse -------------------------------------------------------------
     let start_parse = Instant::now();
 
-    let doc = if cli.html {
+    let doc = if cli.html5 {
+        parse_as_html5(&input)
+    } else if cli.html {
         parse_as_html(cli, &input)
     } else {
         parse_as_xml(cli, &input)
@@ -267,12 +274,17 @@ fn parse_as_xml(cli: &Cli, input: &str) -> Result<Document, String> {
     parser::parse_str_with_options(input, &opts).map_err(|e| e.to_string())
 }
 
-/// Parses input as HTML with the configured options.
+/// Parses input as HTML 4.01 with the configured options.
 fn parse_as_html(cli: &Cli, input: &str) -> Result<Document, String> {
     let opts = xmloxide::html::HtmlParseOptions::default()
         .recover(cli.recover)
         .no_blanks(cli.noblanks);
     parse_html_with_options(input, &opts).map_err(|e| e.to_string())
+}
+
+/// Parses input as HTML5 (WHATWG parsing algorithm).
+fn parse_as_html5(input: &str) -> Result<Document, String> {
+    parse_html5(input).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -777,6 +777,7 @@ dependencies = [
  "encoding_rs",
  "libxml",
  "pretty_assertions",
+ "serde_json",
 ]
 
 [[package]]
