@@ -33,6 +33,7 @@
 #[cfg(feature = "async")]
 pub mod async_xml;
 pub mod catalog;
+pub mod css;
 pub mod encoding;
 pub mod error;
 #[cfg(feature = "ffi")]
