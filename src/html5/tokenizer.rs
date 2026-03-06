@@ -2676,12 +2676,11 @@ impl<'a> Tokenizer<'a> {
                 self.reconsume(';');
                 self.state = self.return_state;
             }
-            _ => {
-                if let Some(c) = self.input[self.pos.saturating_sub(1)..].chars().next() {
-                    if self.pos > 0 && c != ';' && !c.is_ascii_alphanumeric() {
-                        self.reconsume(c);
-                    }
-                }
+            Some(c) => {
+                self.reconsume(c);
+                self.state = self.return_state;
+            }
+            None => {
                 self.state = self.return_state;
             }
         }
