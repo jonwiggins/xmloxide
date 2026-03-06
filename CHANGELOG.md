@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-03-06
+
+### Added
+
+- **CSS selector engine** (`css` module) — query document trees with familiar CSS
+  syntax including tag, class, ID, attribute, descendant, child, adjacent sibling,
+  general sibling combinators, `:first-child`, `:last-child`, `:only-child`,
+  `:empty`, `:not()`, `:nth-child()`, `:nth-last-child()`, and selector groups
+- **Streaming HTML5 SAX API** (`html5::sax` module) — callback-driven API that
+  wraps the WHATWG HTML5 tokenizer directly without building a DOM tree, with
+  automatic character coalescing for efficient text handling
+- **Auto-populated `id_map`** — `element_by_id()` now works out of the box for
+  XML, HTML 4, and HTML5 documents without requiring DTD validation; the parser
+  automatically indexes `id` attributes during tree construction
+- **Fast `#id` CSS selector path** — pure `#id` selectors use O(1) hash lookup
+  via `element_by_id()` instead of tree traversal
+- **Tree mutation API** — `Document::create_element()`, `create_text()`,
+  `create_comment()`, `append_child()`, `insert_before()`, `remove_node()`,
+  `clone_node()`, `set_text_content()`, `set_attribute()`, `remove_attribute()`
+- **`Document::with_capacity(n)`** — pre-size the arena when expected node count
+  is known
+- **`Document::is_element(id)`** — convenience method for checking node type
+- **Serde XML support** (`serde` feature) — serialize/deserialize Rust types
+  to/from XML via `serde_xml` module
+- **Async XML parsing** (`async` feature) — `parse_async()` for parsing from
+  `tokio::io::AsyncRead` sources
+- **WebAssembly bindings** (`xmloxide-wasm` subcrate) — parse, query, and
+  serialize XML/HTML from JavaScript via `wasm-bindgen`
+- **Python bindings** (`pyxmloxide` subcrate) — parse, query, and serialize
+  XML/HTML from Python via PyO3
+- **Property-based testing** — 20 proptest properties covering roundtrip parsing,
+  serialization invariants, and edge cases
+- **Ecosystem benchmarks** — head-to-head benchmarks against `roxmltree` and
+  `quick-xml`
+
+### Fixed
+
+- HTML 4 parser infinite loop on bare `<` not followed by a valid tag start
+- HTML5 tokenizer panic on multi-byte characters in the ambiguous ampersand state
+
+### Improved
+
+- **Parser performance** — `#[inline]` annotations on hot-path tree accessors
+  (`node_name`, `attributes`, `attribute`, `NodeId::as_index`/`from_index`),
+  direct node field access in `Descendants` and `Children` iterators (avoiding
+  method-call indirection), arena pre-sizing from estimated input node count
+- Unit tests expanded from 848 to 936
+- FFI tests expanded from 112 to 128
+
 ## [0.2.0] - 2026-03-05
 
 ### Added
@@ -113,6 +162,7 @@ Initial release of xmloxide — a pure Rust reimplementation of libxml2.
 - 119/119 libxml2 compatibility tests (100%)
 - Real-world XML, security/DoS, and entity resolver integration tests
 
+[0.3.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.2.0
 [0.1.1]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.0

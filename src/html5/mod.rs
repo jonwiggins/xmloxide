@@ -50,9 +50,31 @@
 //! let _doc = result.document;
 //! ```
 //!
+//! # Streaming (SAX-like) API
+//!
+//! For large documents where building a full DOM tree is unnecessary, the
+//! [`sax`] submodule provides a callback-driven API that wraps the tokenizer
+//! directly:
+//!
+//! ```
+//! use xmloxide::html5::sax::{Html5SaxHandler, parse_html5_sax};
+//!
+//! struct Counter { elements: usize }
+//! impl Html5SaxHandler for Counter {
+//!     fn start_element(&mut self, _name: &str, _attrs: &[(String, String)], _sc: bool) {
+//!         self.elements += 1;
+//!     }
+//! }
+//!
+//! let mut h = Counter { elements: 0 };
+//! parse_html5_sax("<div><p>Hello</p></div>", &mut h);
+//! assert_eq!(h.elements, 2);
+//! ```
+//!
 //! [WHATWG HTML Living Standard]: https://html.spec.whatwg.org/
 
 pub mod entities;
+pub mod sax;
 pub mod tokenizer;
 pub(crate) mod tree_builder;
 

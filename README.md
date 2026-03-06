@@ -18,6 +18,8 @@ libxml2 became officially unmaintained in December 2025 with known security issu
 - **Multiple parsing APIs** — DOM tree, SAX2 streaming, XmlReader pull, push/incremental
 - **HTML parser** — error-tolerant HTML 4.01 parsing with auto-closing and void elements
 - **WHATWG HTML5 parser** — full [HTML Living Standard](https://html.spec.whatwg.org/) tokenizer and tree builder (8810/8810 html5lib-tests passing)
+- **HTML5 streaming** — SAX-like callback API for HTML5 (`html5::sax`) that wraps the tokenizer without building a DOM tree
+- **CSS selectors** — query elements with familiar CSS syntax (`css::select`) including combinators, pseudo-classes, and fast `#id` lookup
 - **XPath 1.0** — full expression parser and evaluator with all core functions
 - **Validation** — DTD, RelaxNG, and XML Schema (XSD) validation
 - **Canonical XML** — C14N 1.0 and Exclusive C14N serialization
@@ -90,6 +92,19 @@ let root = doc.root_element().unwrap();
 assert_eq!(doc.node_name(root), Some("html"));
 ```
 
+### CSS Selectors
+
+```rust
+use xmloxide::css::select;
+use xmloxide::Document;
+
+let doc = Document::parse_str(r#"<div><p class="intro">Hello</p><p>World</p></div>"#).unwrap();
+let root = doc.root_element().unwrap();
+let intros = select(&doc, root, "p.intro").unwrap();
+assert_eq!(intros.len(), 1);
+assert_eq!(doc.text_content(intros[0]), "Hello");
+```
+
 ### HTML5 Parsing (WHATWG)
 
 ```rust
@@ -110,6 +125,27 @@ let opts = Html5ParseOptions {
     fragment_context: Some("body".to_string()),
 };
 let doc = parse_html5_with_options("<p>fragment</p>", &opts).unwrap();
+```
+
+### HTML5 Streaming (SAX-like)
+
+```rust
+use xmloxide::html5::sax::{Html5SaxHandler, parse_html5_sax};
+
+struct LinkExtractor { hrefs: Vec<String> }
+impl Html5SaxHandler for LinkExtractor {
+    fn start_element(&mut self, name: &str, attrs: &[(String, String)], _sc: bool) {
+        if name == "a" {
+            if let Some((_, href)) = attrs.iter().find(|(n, _)| n == "href") {
+                self.hrefs.push(href.clone());
+            }
+        }
+    }
+}
+
+let mut handler = LinkExtractor { hrefs: Vec::new() };
+parse_html5_sax(r#"<a href="/page">Link</a>"#, &mut handler);
+assert_eq!(handler.hrefs, vec!["/page"]);
 ```
 
 ### Error Recovery
@@ -154,6 +190,8 @@ xmllint --html page.html
 | `parser::push` | Push/incremental parser for chunked input |
 | `html` | Error-tolerant HTML 4.01 parser |
 | `html5` | WHATWG HTML Living Standard parser (tokenizer + tree builder) |
+| `html5::sax` | Streaming SAX-like API for HTML5 (no DOM tree built) |
+| `css` | CSS selector engine for querying document trees |
 | `sax` | SAX2 streaming event-driven parser |
 | `reader` | XmlReader pull-based parsing API |
 | `serial` | XML, HTML, and HTML5 serializers, plus Canonical XML (C14N) |
@@ -206,8 +244,8 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 
 ## Testing
 
-- **848 unit tests** across all modules
-- **112 FFI tests** covering the full C API surface (including SAX streaming)
+- **936 unit tests** across all modules
+- **128 FFI tests** covering the full C API surface (including SAX streaming)
 - **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **html5lib-tests** — 7032/7032 tokenizer tests + 1778/1778 tree construction tests (100%)
@@ -258,6 +296,8 @@ The full API — including tree navigation and mutation, XPath evaluation, seria
 | `htmlReadMemory` | `html::parse_html` | `xmloxide_parse_html` |
 | (HTML5 parsing) | `html5::parse_html5` | — |
 | (HTML5 fragment / innerHTML) | `html5::parse_html5_with_options` | — |
+| (HTML5 streaming) | `html5::sax::parse_html5_sax` | — |
+| (CSS selectors / `querySelector`) | `css::select` | — |
 | `xmlFreeDoc` | (drop `Document`) | `xmloxide_free_doc` |
 | `xmlDocGetRootElement` | `doc.root_element()` | `xmloxide_doc_root_element` |
 | `xmlNodeGetContent` | `doc.text_content(id)` | `xmloxide_node_text_content` |
@@ -326,7 +366,7 @@ Minimum supported Rust version: **1.81**
 - **No XSLT** — XSLT is a separate specification (libxslt) and is out of scope.
 - **No Schematron** — Schematron validation is not implemented. DTD, RelaxNG, and XSD are supported.
 - **HTML parsers** — both an HTML 4.01 parser (matching libxml2's behavior) and a full WHATWG HTML5 parser are provided. The HTML5 parser passes 100% of html5lib-tests.
-- **Push parser buffers internally** — the push/incremental parser API (`PushParser`) currently buffers all pushed data and performs the full parse on `finish()`, rather than truly streaming like libxml2's `xmlParseChunk`. SAX streaming (`parse_sax`) is available as an alternative for memory-constrained large-document processing.
+- **Push parser buffers internally** — the push/incremental parser API (`PushParser`) currently buffers all pushed data and performs the full parse on `finish()`, rather than truly streaming like libxml2's `xmlParseChunk`. SAX streaming (`parse_sax` for XML, `html5::sax::parse_html5_sax` for HTML5) is available as an alternative for memory-constrained large-document processing.
 - **XPath `namespace::` axis** — the `namespace::` axis returns the element node when in-scope namespaces match (rather than materializing separate namespace nodes), following the same pattern as the attribute axis.
 
 ## Contributing

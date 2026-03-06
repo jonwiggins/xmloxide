@@ -10,6 +10,8 @@
 //! - [`parser`] — XML 1.0 parser with error recovery and push/incremental parsing
 //! - [`html`] — Error-tolerant HTML 4.01 parser
 //! - [`html5`] — WHATWG HTML5 parser (tokenizer + tree construction)
+//! - [`html5::sax`] — Streaming SAX-like API for HTML5 (no DOM tree built)
+//! - [`css`] — CSS selector engine for querying document trees
 //! - [`sax`] — SAX2 event-driven streaming parser
 //! - [`reader`] — `XmlReader` pull-based parsing API
 //! - [`xpath`] — `XPath` 1.0 expression evaluation
