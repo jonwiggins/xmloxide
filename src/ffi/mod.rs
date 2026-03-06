@@ -40,14 +40,44 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::os::raw::c_char;
 
-thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+/// Structured error stored in thread-local storage.
+struct StructuredError {
+    message: CString,
+    line: u32,
+    column: u32,
+    severity: i32, // 0=warning, 1=error, 2=fatal
 }
 
-/// Stores an error message in thread-local storage.
+/// Severity constants matching libxml2's `xmlErrorLevel`.
+pub const XMLOXIDE_ERR_WARNING: i32 = 0;
+pub const XMLOXIDE_ERR_ERROR: i32 = 1;
+pub const XMLOXIDE_ERR_FATAL: i32 = 2;
+
+thread_local! {
+    static LAST_ERROR: RefCell<Option<StructuredError>> = const { RefCell::new(None) };
+}
+
+/// Stores an error message in thread-local storage (no location info).
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|cell| {
-        *cell.borrow_mut() = CString::new(msg).ok();
+        *cell.borrow_mut() = CString::new(msg).ok().map(|message| StructuredError {
+            message,
+            line: 0,
+            column: 0,
+            severity: XMLOXIDE_ERR_FATAL,
+        });
+    });
+}
+
+/// Stores a structured error with location in thread-local storage.
+fn set_last_error_structured(msg: &str, line: u32, column: u32, severity: i32) {
+    LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = CString::new(msg).ok().map(|message| StructuredError {
+            message,
+            line,
+            column,
+            severity,
+        });
     });
 }
 
@@ -67,8 +97,38 @@ pub extern "C" fn xmloxide_last_error() -> *const c_char {
     LAST_ERROR.with(|cell| {
         let borrow = cell.borrow();
         match borrow.as_ref() {
-            Some(cs) => cs.as_ptr(),
+            Some(e) => e.message.as_ptr(),
             None => std::ptr::null(),
         }
+    })
+}
+
+/// Returns the line number of the last error, or 0 if unknown.
+#[no_mangle]
+pub extern "C" fn xmloxide_last_error_line() -> u32 {
+    LAST_ERROR.with(|cell| {
+        let borrow = cell.borrow();
+        borrow.as_ref().map_or(0, |e| e.line)
+    })
+}
+
+/// Returns the column number of the last error, or 0 if unknown.
+#[no_mangle]
+pub extern "C" fn xmloxide_last_error_column() -> u32 {
+    LAST_ERROR.with(|cell| {
+        let borrow = cell.borrow();
+        borrow.as_ref().map_or(0, |e| e.column)
+    })
+}
+
+/// Returns the severity of the last error.
+///
+/// Returns `XMLOXIDE_ERR_WARNING` (0), `XMLOXIDE_ERR_ERROR` (1), or
+/// `XMLOXIDE_ERR_FATAL` (2). Returns -1 if no error occurred.
+#[no_mangle]
+pub extern "C" fn xmloxide_last_error_severity() -> i32 {
+    LAST_ERROR.with(|cell| {
+        let borrow = cell.borrow();
+        borrow.as_ref().map_or(-1, |e| e.severity)
     })
 }

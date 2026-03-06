@@ -76,6 +76,12 @@ typedef struct xmloxide_reader xmloxide_reader;
 #define XMLOXIDE_XPATH_NUMBER   3
 #define XMLOXIDE_XPATH_STRING   4
 
+/* ---------- Error severity constants ---------- */
+
+#define XMLOXIDE_ERR_WARNING  0
+#define XMLOXIDE_ERR_ERROR    1
+#define XMLOXIDE_ERR_FATAL    2
+
 /* ---------- Error handling ---------- */
 
 /**
@@ -85,6 +91,23 @@ typedef struct xmloxide_reader xmloxide_reader;
  * It is valid until the next xmloxide FFI call on the same thread.
  */
 const char *xmloxide_last_error(void);
+
+/**
+ * Returns the line number where the last error occurred, or 0 if unknown.
+ */
+uint32_t xmloxide_last_error_line(void);
+
+/**
+ * Returns the column number where the last error occurred, or 0 if unknown.
+ */
+uint32_t xmloxide_last_error_column(void);
+
+/**
+ * Returns the severity of the last error.
+ * Returns XMLOXIDE_ERR_WARNING (0), XMLOXIDE_ERR_ERROR (1),
+ * or XMLOXIDE_ERR_FATAL (2). Returns -1 if no error occurred.
+ */
+int32_t xmloxide_last_error_severity(void);
 
 /* ---------- Document lifecycle ---------- */
 
@@ -157,6 +180,34 @@ char *xmloxide_doc_version(const xmloxide_document *doc);
  * The returned string must be freed with xmloxide_free_string().
  */
 char *xmloxide_doc_encoding(const xmloxide_document *doc);
+
+/* ---------- Document diagnostics ---------- */
+
+/**
+ * Returns the number of parse diagnostics (warnings + recovered errors)
+ * on a document. Returns 0 if the document has no diagnostics.
+ */
+size_t xmloxide_doc_diagnostic_count(const xmloxide_document *doc);
+
+/**
+ * Returns the error message of the diagnostic at the given index.
+ * Returns NULL if out of range.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_doc_diagnostic_message(const xmloxide_document *doc, size_t index);
+
+/** Returns the line number of the diagnostic at the given index (0 if unknown). */
+uint32_t xmloxide_doc_diagnostic_line(const xmloxide_document *doc, size_t index);
+
+/** Returns the column number of the diagnostic at the given index (0 if unknown). */
+uint32_t xmloxide_doc_diagnostic_column(const xmloxide_document *doc, size_t index);
+
+/**
+ * Returns the severity of the diagnostic at the given index.
+ * Returns XMLOXIDE_ERR_WARNING, XMLOXIDE_ERR_ERROR, or XMLOXIDE_ERR_FATAL.
+ * Returns -1 if out of range.
+ */
+int32_t xmloxide_doc_diagnostic_severity(const xmloxide_document *doc, size_t index);
 
 /* ---------- Tree navigation ---------- */
 

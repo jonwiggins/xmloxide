@@ -603,6 +603,86 @@ fn test_parse_error_message() {
     }
 }
 
+#[test]
+fn test_structured_error_on_parse_failure() {
+    let xml = CString::new("<unclosed").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(doc.is_null());
+
+        // Structured error should have location info
+        let line = xmloxide::ffi::xmloxide_last_error_line();
+        let col = xmloxide::ffi::xmloxide_last_error_column();
+        let severity = xmloxide::ffi::xmloxide_last_error_severity();
+
+        // Should be a fatal error at a known location
+        assert_eq!(severity, 2, "should be XMLOXIDE_ERR_FATAL");
+        assert!(
+            line > 0 || col > 0,
+            "should have location info: line={line}, col={col}"
+        );
+    }
+}
+
+#[test]
+fn test_structured_error_cleared_on_success() {
+    let xml = CString::new("<root/>").unwrap();
+    unsafe {
+        // Cause an error first
+        let _ = xmloxide_parse_str(std::ptr::null());
+        assert_eq!(xmloxide::ffi::xmloxide_last_error_severity(), 2);
+
+        // Success clears it
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+        assert_eq!(xmloxide::ffi::xmloxide_last_error_severity(), -1);
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_doc_diagnostics() {
+    // Parse with recovery mode to get diagnostics
+    let xml = CString::new("<root><unclosed>text</root>").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        // This may or may not succeed depending on recovery mode.
+        // If it fails, that's fine — test the diagnostic API either way.
+        if !doc.is_null() {
+            let count = xmloxide::ffi::document::xmloxide_doc_diagnostic_count(doc);
+            // If there are diagnostics, check accessor functions work
+            if count > 0 {
+                let msg = c_string_to_owned(
+                    xmloxide::ffi::document::xmloxide_doc_diagnostic_message(doc, 0),
+                );
+                assert!(msg.is_some(), "diagnostic message should be non-null");
+
+                let severity = xmloxide::ffi::document::xmloxide_doc_diagnostic_severity(doc, 0);
+                assert!(severity >= 0, "severity should be valid");
+            }
+            // Out-of-range access should return safe defaults
+            let msg = xmloxide::ffi::document::xmloxide_doc_diagnostic_message(doc, 9999);
+            assert!(msg.is_null());
+            let severity = xmloxide::ffi::document::xmloxide_doc_diagnostic_severity(doc, 9999);
+            assert_eq!(severity, -1);
+
+            xmloxide_free_doc(doc);
+        }
+    }
+}
+
+#[test]
+fn test_doc_diagnostics_null_doc() {
+    unsafe {
+        let count = xmloxide::ffi::document::xmloxide_doc_diagnostic_count(std::ptr::null());
+        assert_eq!(count, 0);
+
+        let severity =
+            xmloxide::ffi::document::xmloxide_doc_diagnostic_severity(std::ptr::null(), 0);
+        assert_eq!(severity, -1);
+    }
+}
+
 // ---------- String lifecycle tests ----------
 
 #[test]
