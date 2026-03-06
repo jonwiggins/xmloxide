@@ -319,4 +319,22 @@ mod tests {
         let root = doc.root_element().unwrap();
         assert!(select(&doc, root, ">>>").is_err());
     }
+
+    #[test]
+    fn test_id_map_auto_populated() {
+        // Verify element_by_id works without DTD validation
+        let doc = test_doc();
+        let node = doc.element_by_id("main").unwrap();
+        assert_eq!(doc.node_name(node), Some("div"));
+    }
+
+    #[test]
+    fn test_fast_id_select() {
+        // Pure #id selector should use the fast path
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = select(&doc, root, "#main").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("div"));
+    }
 }

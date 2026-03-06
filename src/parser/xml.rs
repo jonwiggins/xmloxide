@@ -819,6 +819,16 @@ impl<'a> XmlParser<'a> {
         // re-allocation for unprefixed names (the common case). For unprefixed
         // names, split_owned_name returns (None, name) — just a move, zero copy.
         let (elem_prefix_owned, elem_local_owned) = split_owned_name(name);
+        // Auto-populate id_map for "id" attributes (enables element_by_id
+        // and fast CSS #id selectors without requiring DTD validation).
+        let id_value = attributes.iter().find_map(|a| {
+            if a.prefix.is_none() && a.name == "id" {
+                Some(a.value.clone())
+            } else {
+                None
+            }
+        });
+
         let elem_id = self.doc.create_node(NodeKind::Element {
             name: elem_local_owned,
             prefix: elem_prefix_owned,
@@ -826,6 +836,10 @@ impl<'a> XmlParser<'a> {
             attributes,
         });
         self.doc.append_child(parent, elem_id);
+
+        if let Some(id_val) = id_value {
+            self.doc.set_id(&id_val, elem_id);
+        }
 
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {

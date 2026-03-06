@@ -11,9 +11,57 @@ use super::types::{
 ///
 /// Returns all descendant nodes of `scope` that match any selector in the group.
 pub fn select(doc: &Document, scope: NodeId, group: &SelectorGroup) -> Vec<NodeId> {
+    // Fast path: if every selector in the group is a simple `#id` selector,
+    // use element_by_id for O(1) lookup instead of walking the tree.
+    if let Some(results) = try_fast_id_select(doc, scope, group) {
+        return results;
+    }
+
     let mut results = Vec::new();
     collect_descendants(doc, scope, group, &mut results);
     results
+}
+
+/// Attempts to use the fast `id_map` for pure `#id` selectors.
+/// Returns `None` if any selector is not a simple ID selector.
+fn try_fast_id_select(doc: &Document, scope: NodeId, group: &SelectorGroup) -> Option<Vec<NodeId>> {
+    let mut results = Vec::new();
+    for sel in &group.selectors {
+        // Must be a single compound with only an ID
+        if sel.compounds.len() != 1 {
+            return None;
+        }
+        let compound = &sel.compounds[0].compound;
+        let id = compound.id.as_ref()?;
+        if compound.tag.is_some()
+            || !compound.classes.is_empty()
+            || !compound.attrs.is_empty()
+            || !compound.pseudos.is_empty()
+        {
+            return None;
+        }
+
+        // Look up via id_map
+        if let Some(node) = doc.element_by_id(id) {
+            // Verify the node is a descendant of scope
+            if is_descendant_of(doc, node, scope) && !results.contains(&node) {
+                results.push(node);
+            }
+        }
+    }
+    Some(results)
+}
+
+/// Returns true if `node` is a descendant of `ancestor`.
+fn is_descendant_of(doc: &Document, node: NodeId, ancestor: NodeId) -> bool {
+    let mut current = doc.parent(node);
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = doc.parent(id);
+    }
+    false
 }
 
 /// Recursively collect matching descendants.
@@ -134,11 +182,20 @@ fn matches_compound(doc: &Document, node: NodeId, compound: &CompoundSelector) -
         }
     }
 
-    // ID
+    // ID — use element_by_id for O(1) lookup when the id_map is populated,
+    // falling back to attribute scan when it's not.
     if let Some(ref id) = compound.id {
-        let node_id = doc.attribute(node, "id").unwrap_or("");
-        if node_id != id {
-            return false;
+        if let Some(target) = doc.element_by_id(id) {
+            if target != node {
+                return false;
+            }
+        } else {
+            // id_map doesn't have this ID — either the element doesn't exist
+            // or the id_map wasn't populated. Fall back to attribute scan.
+            let node_id_attr = doc.attribute(node, "id").unwrap_or("");
+            if node_id_attr != id {
+                return false;
+            }
         }
     }
 

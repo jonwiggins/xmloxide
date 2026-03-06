@@ -556,6 +556,7 @@ impl<'a> HtmlParser<'a> {
 
     // --- Start Tag ---
 
+    #[allow(clippy::too_many_lines)]
     fn parse_start_tag(&mut self) {
         self.input.advance(1); // consume '<'
         if let Err(e) = self.input.increment_depth() {
@@ -656,6 +657,14 @@ impl<'a> HtmlParser<'a> {
 
         let parent = self.current_parent();
 
+        let id_value = attributes.iter().find_map(|a| {
+            if a.name == "id" {
+                Some(a.value.clone())
+            } else {
+                None
+            }
+        });
+
         let elem_id = self.doc.create_node(NodeKind::Element {
             name: lower_tag.clone(),
             prefix: None,
@@ -663,6 +672,10 @@ impl<'a> HtmlParser<'a> {
             attributes,
         });
         self.doc.append_child(parent, elem_id);
+
+        if let Some(id_val) = id_value {
+            self.doc.set_id(&id_val, elem_id);
+        }
 
         // Void elements and explicit self-close don't get pushed
         if is_void_element(&lower_tag) || explicit_self_close {
