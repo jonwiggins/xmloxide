@@ -29,6 +29,7 @@ default = ["cli"]
 cli = ["dep:clap"]
 ffi = []
 serde = ["dep:serde"]
+async = ["dep:tokio"]
 bench-libxml2 = ["dep:libxml"]
 
 [dependencies]
@@ -36,12 +37,14 @@ clap = { version = "4", features = ["derive"], optional = true }
 encoding_rs = "0.8"
 libxml = { version = "0.3", optional = true }
 serde = { version = "1", optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 pretty_assertions = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["io-util", "rt", "macros", "fs"] }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -61,7 +64,7 @@ expect_used = "warn"
 crate-type = ["lib"]
 
 [package.metadata.docs.rs]
-features = ["cli", "ffi", "serde"]
+features = ["cli", "ffi", "serde", "async"]
 
 [[bin]]
 name = "xmllint"

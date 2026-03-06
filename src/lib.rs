@@ -30,6 +30,8 @@
 //! assert_eq!(doc.node_name(root), Some("root"));
 //! ```
 
+#[cfg(feature = "async")]
+pub mod async_xml;
 pub mod catalog;
 pub mod encoding;
 pub mod error;
