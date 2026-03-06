@@ -4,7 +4,7 @@
 
 **xmloxide** is a pure Rust reimplementation of libxml2 — the de facto standard XML/HTML parsing library in the open-source world. libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide is a memory-safe, high-performance replacement that passes the same conformance test suites.
 
-**Version:** 0.1.0 (released 2026-02-23)
+**Version:** 0.2.0
 **License:** MIT
 **MSRV:** Rust 1.81+
 
@@ -14,6 +14,7 @@
 - **1727/1727** W3C XML Conformance Test Suite tests passing (100%)
 - **119/119** libxml2 regression tests passing (100%)
 - Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0, XmlReader, push parser, DTD/RelaxNG/XSD validation, C14N, XInclude, XML Catalogs
+- **WHATWG HTML5 parser** — full HTML Living Standard tokenizer (§13.2.5) and tree builder (§13.2.6) with 7032/7032 tokenizer tests + 1778/1778 tree construction tests passing (100% html5lib-tests)
 - Zero `unsafe` in public API surface (`unsafe_code = "deny"` in Cargo.toml)
 - No system dependencies — pure Rust (uses `encoding_rs` for character encoding)
 - C/C++ FFI layer with header file (`include/xmloxide.h`)
@@ -60,8 +61,13 @@ src/
 │   ├── push.rs         # Push/incremental parser wrapper
 │   └── input.rs        # Parser input stack (entity expansion, includes)
 ├── html/
-│   ├── mod.rs          # HTML parser (error-tolerant, auto-closing, void elements)
+│   ├── mod.rs          # HTML 4.01 parser (error-tolerant, auto-closing, void elements)
 │   └── entities.rs     # HTML named character references
+├── html5/
+│   ├── mod.rs          # WHATWG HTML5 parser public API and module docs
+│   ├── tokenizer.rs    # HTML5 tokenizer (all 80 states per §13.2.5)
+│   ├── tree_builder.rs # HTML5 tree construction (all insertion modes per §13.2.6)
+│   └── entities.rs     # HTML5 named character references (§13.5, 2231 entries)
 ├── sax/
 │   └── mod.rs          # SAX2 handler trait and streaming parser
 ├── reader/
@@ -83,7 +89,7 @@ src/
 ├── serial/
 │   ├── mod.rs          # Serialization options and entry points
 │   ├── xml.rs          # XML serializer
-│   ├── html.rs         # HTML serializer (void elements, attribute rules)
+│   ├── html.rs         # HTML 4.01 + HTML5 serializers (void elements, attribute rules)
 │   └── c14n.rs         # Canonical XML (C14N 1.0 / Exclusive C14N)
 ├── xinclude/
 │   └── mod.rs          # XInclude 1.0 document inclusion
@@ -211,7 +217,8 @@ These are the specs we implement against:
 - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) — canonical serialization
 - [RelaxNG](https://relaxng.org/spec-20011203.html) — schema language
 - [W3C XML Schema](https://www.w3.org/TR/xmlschema-1/) — XSD 1.0
-- [HTML 4.01](https://www.w3.org/TR/html401/) — libxml2's HTML parser targets HTML 4, not HTML5
+- [HTML 4.01](https://www.w3.org/TR/html401/) — libxml2-compatible HTML parser
+- [WHATWG HTML Living Standard](https://html.spec.whatwg.org/) — HTML5 tokenizer (§13.2.5), tree construction (§13.2.6), named character references (§13.5)
 - [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986) — URI syntax
 - [W3C XML Conformance Test Suite](https://www.w3.org/XML/Test/) — 1727 applicable test files
 - [libxml2 source](https://gitlab.gnome.org/GNOME/libxml2) — the reference implementation
@@ -256,11 +263,22 @@ cargo test --test conformance
 ./scripts/download-libxml2-tests.sh
 cargo test --test libxml2_compat
 
+# Run html5lib test suites (requires download first)
+./scripts/download-html5lib-tests.sh
+cargo test --test html5lib_tokenizer
+cargo test --test html5lib_tree_construction
+
 # Run fuzz targets
 cargo +nightly fuzz run fuzz_xml_parse
 cargo +nightly fuzz run fuzz_html_parse
+cargo +nightly fuzz run fuzz_html5_parse
+cargo +nightly fuzz run fuzz_html5_fragment
 cargo +nightly fuzz run fuzz_xpath
 cargo +nightly fuzz run fuzz_roundtrip
+cargo +nightly fuzz run fuzz_sax
+cargo +nightly fuzz run fuzz_reader
+cargo +nightly fuzz run fuzz_push
+cargo +nightly fuzz run fuzz_validation
 ```
 
 ---
@@ -338,11 +356,14 @@ Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, t
 
 | Suite | Location | Tests | Notes |
 |-------|----------|-------|-------|
-| Unit tests | `src/**/*.rs` (inline) | ~769 | All modules |
+| Unit tests | `src/**/*.rs` (inline) | 848 | All modules |
 | W3C Conformance | `tests/conformance.rs` | 1727/1727 | Requires `download-conformance-suite.sh` |
 | libxml2 Compat | `tests/libxml2_compat.rs` | 119/119 | Requires `download-libxml2-tests.sh` |
+| html5lib Tokenizer | `tests/html5lib_tokenizer.rs` | 7032/7032 | Requires `download-html5lib-tests.sh` |
+| html5lib Tree Construction | `tests/html5lib_tree_construction.rs` | 1778/1778 | Requires `download-html5lib-tests.sh` |
+| HTML5 Integration | `tests/html5_integration.rs` | 22 | Parsing, fragment, entities, serialization |
 | Real-world XML | `tests/real_world_xml.rs` | 22 | Atom, SVG, XHTML, Maven, SOAP, validation |
 | Security/DoS | `tests/security.rs` | 15 | Billion laughs, deep nesting, etc. |
 | Entity resolver | `tests/entity_resolver.rs` | 14 | Entity expansion edge cases |
-| FFI | `tests/ffi_tests.rs` | 40 | C API surface tests |
-| Fuzz targets | `fuzz/` | 4 targets | XML, HTML, XPath, roundtrip |
+| FFI | `tests/ffi_tests.rs` | 112 | C API surface tests (including SAX) |
+| Fuzz targets | `fuzz/` | 10 targets | XML, HTML, HTML5, XPath, roundtrip, SAX, reader, push, validation |

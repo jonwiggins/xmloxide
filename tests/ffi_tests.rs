@@ -11,6 +11,7 @@ use std::os::raw::c_char;
 use xmloxide::ffi::c14n::*;
 use xmloxide::ffi::catalog::*;
 use xmloxide::ffi::document::*;
+use xmloxide::ffi::html5::*;
 use xmloxide::ffi::push::*;
 use xmloxide::ffi::reader::*;
 use xmloxide::ffi::sax::*;
@@ -715,6 +716,90 @@ fn test_parse_html_null() {
         let doc = xmloxide_parse_html(std::ptr::null());
         assert!(doc.is_null());
         assert!(last_error().is_some());
+    }
+}
+
+// ---------- HTML5 parsing tests ----------
+
+#[test]
+fn test_parse_html5() {
+    let html = CString::new("<p>Hello <b>world</b>").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_html5(html.as_ptr());
+        assert!(!doc.is_null(), "HTML5 parse should succeed");
+
+        let root = xmloxide_doc_root_element(doc);
+        assert_ne!(root, 0);
+        let name = c_string_to_owned(xmloxide_node_name(doc, root));
+        assert_eq!(name.as_deref(), Some("html"));
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_parse_html5_null() {
+    unsafe {
+        let doc = xmloxide_parse_html5(std::ptr::null());
+        assert!(doc.is_null());
+        assert!(last_error().is_some());
+    }
+}
+
+#[test]
+fn test_parse_html5_fragment() {
+    let html = CString::new("<li>One<li>Two").unwrap();
+    let ctx = CString::new("ul").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_html5_fragment(html.as_ptr(), ctx.as_ptr());
+        assert!(!doc.is_null(), "HTML5 fragment parse should succeed");
+
+        // Fragment should produce a document with the parsed content
+        let root = xmloxide_doc_root_element(doc);
+        assert_ne!(root, 0);
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_parse_html5_fragment_null_input() {
+    let ctx = CString::new("body").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_html5_fragment(std::ptr::null(), ctx.as_ptr());
+        assert!(doc.is_null());
+        assert!(last_error().is_some());
+    }
+}
+
+#[test]
+fn test_parse_html5_fragment_null_context() {
+    let html = CString::new("<p>hello</p>").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_html5_fragment(html.as_ptr(), std::ptr::null());
+        assert!(doc.is_null());
+        assert!(last_error().is_some());
+    }
+}
+
+#[test]
+fn test_serialize_html5() {
+    let html = CString::new("<p>Hello <br> World</p>").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_html5(html.as_ptr());
+        assert!(!doc.is_null());
+
+        let output = c_string_to_owned(xmloxide_serialize_html5(doc));
+        assert!(output.is_some());
+        let output = output.unwrap();
+        // HTML5 serializer should produce valid HTML5 (br without closing tag)
+        assert!(
+            output.contains("<br>"),
+            "should contain void <br>, got: {output}"
+        );
+        assert!(!output.contains("</br>"), "should not contain </br>");
+
+        xmloxide_free_doc(doc);
     }
 }
 

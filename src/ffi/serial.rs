@@ -109,3 +109,28 @@ pub unsafe extern "C" fn xmloxide_serialize_html(doc: *const Document) -> *mut c
     let output = crate::serial::html::serialize_html(doc);
     to_c_string(&output)
 }
+
+/// Serializes a document to an HTML5 string.
+///
+/// Uses the WHATWG HTML serialization algorithm: void elements are not
+/// self-closed, raw text elements (`<script>`, `<style>`) are not escaped,
+/// and foreign content (`SVG`/`MathML`) uses self-closing tags when empty.
+///
+/// Returns a caller-owned C string that must be freed with
+/// `xmloxide_free_string`. Returns null on failure.
+///
+/// # Safety
+///
+/// `doc` must be a valid document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_serialize_html5(doc: *const Document) -> *mut c_char {
+    clear_last_error();
+    if doc.is_null() {
+        set_last_error("null document pointer");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: Null check above. Caller guarantees `doc` is a valid pointer from a parse function.
+    let doc = unsafe { &*doc };
+    let output = crate::serial::html::serialize_html5(doc);
+    to_c_string(&output)
+}

@@ -113,6 +113,24 @@ xmloxide_document *xmloxide_parse_bytes(const uint8_t *data, size_t len);
 xmloxide_document *xmloxide_parse_html(const char *input);
 
 /**
+ * Parses an HTML5 string using the WHATWG parsing algorithm.
+ *
+ * Returns a document pointer on success, or NULL on failure.
+ * The returned document must be freed with xmloxide_free_doc().
+ */
+xmloxide_document *xmloxide_parse_html5(const char *input);
+
+/**
+ * Parses an HTML5 fragment with a context element (the innerHTML algorithm).
+ *
+ * context_element is the tag name of the context (e.g., "body", "div", "table").
+ * Returns a document pointer on success, or NULL on failure.
+ * The returned document must be freed with xmloxide_free_doc().
+ */
+xmloxide_document *xmloxide_parse_html5_fragment(const char *input,
+                                                  const char *context_element);
+
+/**
  * Parses an XML file from a filesystem path.
  *
  * Returns a document pointer on success, or NULL on failure.
@@ -334,6 +352,13 @@ char *xmloxide_serialize_pretty_custom(const xmloxide_document *doc,
  * xmloxide_free_string(). Returns NULL on failure.
  */
 char *xmloxide_serialize_html(const xmloxide_document *doc);
+
+/**
+ * Serializes a document to an HTML5 string (WHATWG algorithm).
+ * Returns a caller-owned C string that must be freed with
+ * xmloxide_free_string(). Returns NULL on failure.
+ */
+char *xmloxide_serialize_html5(const xmloxide_document *doc);
 
 /* ---------- Validation ---------- */
 

@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-05
+
+### Added
+
+- **WHATWG HTML5 parser** — full implementation of the HTML Living Standard
+  parsing algorithm (§13.2.5 tokenizer, §13.2.6 tree construction, §13.5
+  named character references)
+  - 7032/7032 html5lib tokenizer tests passing (100%)
+  - 1778/1778 html5lib tree construction tests passing (100%)
+  - Fragment parsing (the `innerHTML` algorithm) via `Html5ParseOptions::fragment_context`
+  - Scripting flag support (`<noscript>` raw text vs normal parsing)
+  - `parse_html5()`, `parse_html5_with_options()`, `parse_html5_full()` API
+- **HTML5 serializer** — `serialize_html5()` with WHATWG-compliant output:
+  void elements without closing tags, raw text elements without escaping,
+  foreign content (`SVG`/`MathML`) self-closing tags
+- **HTML5 error reporting** — `parse_html5_full()` returns `Html5ParseResult`
+  with all parse errors as `ParseDiagnostic` values with source locations
+- **HTML5 FFI bindings** — `xmloxide_parse_html5()`,
+  `xmloxide_parse_html5_fragment()`, `xmloxide_serialize_html5()` C functions
+- **`xmllint --html5`** — CLI support for HTML5 parsing
+- **HTML5 fuzz targets** — `fuzz_html5_parse` and `fuzz_html5_fragment` for
+  security testing across 24 different fragment contexts
+- **HTML5 benchmarks** — full document and fragment parsing benchmarks
+- **html5lib-tests CI** — tokenizer and tree construction conformance suites
+  run on every push/PR and weekly
+
+### Improved
+
+- **HTML5 parser performance** — 24% faster than initial implementation via
+  bulk text scanning in Data state, fast-path tag name/attribute scanning,
+  and character batching in the tree builder (~197µs for a 50-section document)
+- Fuzz targets expanded from 4 to 10 (added SAX, reader, push, validation,
+  HTML5 parse, HTML5 fragment)
+- FFI tests expanded from 112 to 118 (6 new HTML5 tests)
+- Unit tests expanded from 785 to 848
+
 ## [0.1.1] - 2026-03-02
 
 ### Fixed
@@ -77,5 +113,6 @@ Initial release of xmloxide — a pure Rust reimplementation of libxml2.
 - 119/119 libxml2 compatibility tests (100%)
 - Real-world XML, security/DoS, and entity resolver integration tests
 
+[0.2.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.2.0
 [0.1.1]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.0

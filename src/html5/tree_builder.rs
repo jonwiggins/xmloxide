@@ -988,6 +988,57 @@ impl<'a> TreeBuilder<'a> {
                     continue;
                 }
             }
+
+            // Fast path: batch consecutive non-null Character tokens in InBody
+            // mode when there's no foreign content. This avoids per-character
+            // overhead from process_token dispatch and insertion point lookups.
+            if self.mode == InsertionMode::InBody && !in_foreign {
+                if let Token::Character(c) = token {
+                    if c != '\0' {
+                        let mut buf = String::new();
+                        if !is_ascii_whitespace(c) {
+                            self.frameset_ok = false;
+                        }
+                        buf.push(c);
+                        // Drain consecutive characters from the pending queue.
+                        loop {
+                            let next = self.tokenizer.next_token();
+                            if let Token::Character(c2) = next {
+                                if c2 == '\0' {
+                                    // Null in body: parse error, ignored per spec.
+                                } else {
+                                    if !is_ascii_whitespace(c2) {
+                                        self.frameset_ok = false;
+                                    }
+                                    buf.push(c2);
+                                }
+                            } else {
+                                // Non-character token: insert buffered text, then
+                                // process this token normally.
+                                if !buf.is_empty() {
+                                    self.reconstruct_formatting();
+                                    self.insert_characters(&buf);
+                                }
+                                if next == Token::Eof {
+                                    self.process_token(next);
+                                    self.populate_selectedcontent();
+                                    return;
+                                }
+                                // Re-check foreign state before processing next.
+                                let in_foreign_now = self
+                                    .open_elements
+                                    .last()
+                                    .is_some_and(|el| el.ns != Namespace::Html);
+                                self.tokenizer.set_allow_cdata(in_foreign_now);
+                                self.process_token(next);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let is_eof = token == Token::Eof;
             self.process_token(token);
             if is_eof {
@@ -1633,6 +1684,29 @@ impl<'a> TreeBuilder<'a> {
 
         let text_id = self.doc.create_node(NodeKind::Text {
             content: c.to_string(),
+        });
+        self.insert_node_at(text_id, parent, before);
+    }
+
+    /// Append a string of characters to the current insertion point.
+    ///
+    /// This is an optimization over calling `insert_character` per-char:
+    /// it computes the insertion point once and appends the whole string.
+    fn insert_characters(&mut self, s: &str) {
+        let (parent, before) = self.appropriate_insertion_point();
+        let adjacent_text = if let Some(ref_node) = before {
+            self.doc.prev_sibling(ref_node)
+        } else {
+            self.doc.last_child(parent)
+        };
+        if let Some(text_node) = adjacent_text {
+            if let NodeKind::Text { ref mut content } = &mut self.doc.node_mut(text_node).kind {
+                content.push_str(s);
+                return;
+            }
+        }
+        let text_id = self.doc.create_node(NodeKind::Text {
+            content: s.to_string(),
         });
         self.insert_node_at(text_id, parent, before);
     }

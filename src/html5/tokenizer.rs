@@ -613,6 +613,31 @@ impl<'a> Tokenizer<'a> {
 
     // 13.2.5.1 Data state
     fn state_data(&mut self) {
+        // Fast path: scan forward through bytes that don't need special
+        // handling (not '<', '&', or '\0'). This avoids per-character
+        // overhead for plain text runs.
+        let bytes = self.input.as_bytes();
+        let start = self.pos;
+        let mut i = start;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'<' || b == b'&' || b == 0 {
+                break;
+            }
+            i += 1;
+        }
+        if i > start {
+            // All bytes in start..i are safe plain text (no null, no < or &).
+            // Because we only break on ASCII bytes and skip non-ASCII bytes,
+            // start..i is always a valid UTF-8 slice boundary.
+            for c in self.input[start..i].chars() {
+                self.pending_tokens.push_back(Token::Character(c));
+            }
+            self.pos = i;
+            return;
+        }
+
+        // Slow path: handle special characters one at a time.
         match self.consume() {
             Some('&') => {
                 self.return_state = State::Data;
@@ -776,6 +801,27 @@ impl<'a> Tokenizer<'a> {
 
     // 13.2.5.8 Tag name state
     fn state_tag_name(&mut self) {
+        // Fast path: scan ahead through ASCII lowercase tag-name characters.
+        let bytes = self.input.as_bytes();
+        let start = self.pos;
+        let mut i = start;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'\t' | b'\n' | 0x0C | b' ' | b'/' | b'>' | 0 | 0x80..=0xFF => break,
+                b'A'..=b'Z' => {
+                    self.current_tag_name.push((b + 32) as char);
+                    i += 1;
+                }
+                _ => {
+                    self.current_tag_name.push(b as char);
+                    i += 1;
+                }
+            }
+        }
+        self.pos = i;
+
+        // Now handle the terminating character.
         match self.consume() {
             Some('\t' | '\n' | '\x0C' | ' ') => {
                 self.state = State::BeforeAttributeName;
@@ -1447,6 +1493,37 @@ impl<'a> Tokenizer<'a> {
 
     // 13.2.5.33 Attribute name state
     fn state_attribute_name(&mut self) {
+        // Fast path: scan ahead for ASCII lowercase attribute name bytes.
+        let bytes = self.input.as_bytes();
+        let start = self.pos;
+        let mut i = start;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'\t'
+                | b'\n'
+                | 0x0C
+                | b' '
+                | b'/'
+                | b'>'
+                | b'='
+                | 0
+                | b'"'
+                | b'\''
+                | b'<'
+                | 0x80..=0xFF => break,
+                b'A'..=b'Z' => {
+                    self.current_attr_name.push((b + 32) as char);
+                    i += 1;
+                }
+                _ => {
+                    self.current_attr_name.push(b as char);
+                    i += 1;
+                }
+            }
+        }
+        self.pos = i;
+
         match self.consume() {
             Some(c @ ('\t' | '\n' | '\x0C' | ' ' | '/' | '>')) => {
                 self.reconsume(c);
@@ -1533,6 +1610,21 @@ impl<'a> Tokenizer<'a> {
 
     // 13.2.5.36 Attribute value (double-quoted) state
     fn state_attribute_value_double_quoted(&mut self) {
+        // Fast path: scan ahead for plain attribute value bytes (no ", &, \0).
+        let bytes = self.input.as_bytes();
+        let start = self.pos;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' | b'&' | 0 => break,
+                _ => i += 1,
+            }
+        }
+        if i > start {
+            self.current_attr_value.push_str(&self.input[start..i]);
+            self.pos = i;
+        }
+
         match self.consume() {
             Some('"') => {
                 self.state = State::AfterAttributeValueQuoted;
@@ -1557,6 +1649,21 @@ impl<'a> Tokenizer<'a> {
 
     // 13.2.5.37 Attribute value (single-quoted) state
     fn state_attribute_value_single_quoted(&mut self) {
+        // Fast path: scan ahead for plain attribute value bytes (no ', &, \0).
+        let bytes = self.input.as_bytes();
+        let start = self.pos;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' | b'&' | 0 => break,
+                _ => i += 1,
+            }
+        }
+        if i > start {
+            self.current_attr_value.push_str(&self.input[start..i]);
+            self.pos = i;
+        }
+
         match self.consume() {
             Some('\'') => {
                 self.state = State::AfterAttributeValueQuoted;

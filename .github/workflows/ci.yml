@@ -49,6 +49,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test ${{ matrix.features }}
 
+  html5lib:
+    name: html5lib-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download html5lib-tests
+        run: ./scripts/download-html5lib-tests.sh
+
+      - name: Run tokenizer tests
+        run: cargo test --test html5lib_tokenizer -- --nocapture
+
+      - name: Run tree construction tests
+        run: cargo test --test html5lib_tree_construction -- --nocapture
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

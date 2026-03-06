@@ -25,6 +25,7 @@
 pub mod c14n;
 pub mod catalog;
 pub mod document;
+pub mod html5;
 pub mod push;
 pub mod reader;
 pub mod sax;
