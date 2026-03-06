@@ -40,6 +40,8 @@ pub mod html5;
 pub mod parser;
 pub mod reader;
 pub mod sax;
+#[cfg(feature = "serde")]
+pub mod serde_xml;
 pub mod serial;
 pub mod tree;
 #[allow(dead_code)]
