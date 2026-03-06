@@ -55,9 +55,11 @@ impl<'a> XmlParser<'a> {
         pi.set_max_entity_expansions(options.max_entity_expansions);
         pi.set_entity_resolver(options.entity_resolver.clone());
 
+        // Pre-size the node arena — roughly 1 node per 30 bytes of input.
+        let estimated_nodes = (input.len() / 30).max(64);
         Self {
             input: pi,
-            doc: Document::new(),
+            doc: Document::with_capacity(estimated_nodes),
             options: options.clone(),
             ns: NamespaceResolver::new(),
             attr_types: HashMap::new(),

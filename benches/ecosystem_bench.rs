@@ -109,7 +109,7 @@ fn bench_tree_walk(c: &mut Criterion) {
         b.iter(|| {
             let mut count = 0u64;
             for node in doc.descendants(black_box(root)) {
-                if doc.node_name(node).is_some() {
+                if doc.is_element(node) {
                     count += 1;
                 }
             }

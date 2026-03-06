@@ -38,11 +38,13 @@ impl NodeId {
     ///
     /// Panics if `index` is 0.
     #[allow(clippy::expect_used, clippy::cast_possible_truncation)]
+    #[inline]
     fn from_index(index: usize) -> Self {
         Self(NonZeroU32::new(index as u32).expect("NodeId index must be non-zero"))
     }
 
     /// Returns the raw index as a `usize` for indexing into the arena.
+    #[inline]
     fn as_index(self) -> usize {
         self.0.get() as usize
     }
@@ -159,7 +161,13 @@ impl Document {
     /// The document contains a single root Document node.
     #[must_use]
     pub fn new() -> Self {
-        let mut nodes = Vec::with_capacity(64);
+        Self::with_capacity(64)
+    }
+
+    /// Creates a new empty document with pre-allocated capacity for `n` nodes.
+    #[must_use]
+    pub fn with_capacity(n: usize) -> Self {
+        let mut nodes = Vec::with_capacity(n);
         // Index 0: placeholder (NodeId uses NonZeroU32)
         nodes.push(NodeData::new(NodeKind::Document));
         // Index 1: the document root node
@@ -367,12 +375,20 @@ impl Document {
         &mut self.nodes[id.as_index()]
     }
 
+    /// Returns `true` if the node is an element.
+    #[must_use]
+    #[inline]
+    pub fn is_element(&self, id: NodeId) -> bool {
+        matches!(self.node(id).kind, NodeKind::Element { .. })
+    }
+
     /// Returns the local name of a node, if applicable.
     ///
     /// For elements, this is the tag name (e.g., `"div"`). For processing
     /// instructions, this is the target (e.g., `"xml-stylesheet"`). Text,
     /// comment, CDATA, and document nodes return `None`.
     #[must_use]
+    #[inline]
     pub fn node_name(&self, id: NodeId) -> Option<&str> {
         match &self.node(id).kind {
             NodeKind::Element { name, .. }
@@ -459,6 +475,7 @@ impl Document {
     /// Each [`Attribute`] contains the name, value, optional namespace prefix,
     /// and namespace URI. Returns an empty slice for non-element nodes.
     #[must_use]
+    #[inline]
     pub fn attributes(&self, id: NodeId) -> &[Attribute] {
         match &self.node(id).kind {
             NodeKind::Element { attributes, .. } => attributes,
@@ -471,6 +488,7 @@ impl Document {
     /// Performs a linear scan of the element's attributes. Returns `None` if
     /// the attribute is not present or the node is not an element.
     #[must_use]
+    #[inline]
     pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
         self.attributes(id)
             .iter()
@@ -954,7 +972,7 @@ impl Iterator for Children<'_> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next?;
-        self.next = self.doc.node(current).next_sibling;
+        self.next = self.doc.nodes[current.as_index()].next_sibling;
         Some(current)
     }
 }
@@ -995,31 +1013,34 @@ impl Iterator for Descendants<'_> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.next?;
+        let nodes = &self.doc.nodes;
 
         // Try to go deeper first
-        if let Some(child) = self.doc.first_child(current) {
+        let node = &nodes[current.as_index()];
+        if let Some(child) = node.first_child {
             self.next = Some(child);
             return Some(current);
         }
 
         // Try next sibling
-        if let Some(sibling) = self.doc.next_sibling(current) {
+        if let Some(sibling) = node.next_sibling {
             self.next = Some(sibling);
             return Some(current);
         }
 
         // Walk up to find an ancestor with a next sibling
-        let mut ancestor = self.doc.parent(current);
+        let mut ancestor = node.parent;
         while let Some(anc) = ancestor {
             if anc == self.root {
                 self.next = None;
                 return Some(current);
             }
-            if let Some(sibling) = self.doc.next_sibling(anc) {
+            let anc_node = &nodes[anc.as_index()];
+            if let Some(sibling) = anc_node.next_sibling {
                 self.next = Some(sibling);
                 return Some(current);
             }
-            ancestor = self.doc.parent(anc);
+            ancestor = anc_node.parent;
         }
 
         self.next = None;
