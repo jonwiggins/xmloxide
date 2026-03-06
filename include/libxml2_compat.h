@@ -211,6 +211,14 @@ static inline int xmlSetProp(xmlNodePtr node, const char *name,
     return xmloxide_set_attribute(node->doc, node->id, name, value);
 }
 
+/**
+ * Remove an attribute by name. Returns 1 if removed, 0 otherwise.
+ */
+static inline int xmlUnsetProp(xmlNodePtr node, const char *name) {
+    if (!node) return 0;
+    return xmloxide_remove_attribute(node->doc, node->id, name);
+}
+
 /* ========================================================================
  * Serialization
  * ======================================================================== */

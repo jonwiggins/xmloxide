@@ -792,6 +792,134 @@ impl Document {
         }
     }
 
+    /// Creates a new element node (detached) and returns its `NodeId`.
+    ///
+    /// Use [`append_child`](Self::append_child), [`prepend_child`](Self::prepend_child),
+    /// or [`insert_before`](Self::insert_before) to attach it.
+    pub fn create_element(&mut self, name: &str) -> NodeId {
+        self.create_node(NodeKind::Element {
+            name: name.to_string(),
+            prefix: None,
+            namespace: None,
+            attributes: vec![],
+        })
+    }
+
+    /// Creates a new text node (detached) and returns its `NodeId`.
+    pub fn create_text(&mut self, content: &str) -> NodeId {
+        self.create_node(NodeKind::Text {
+            content: content.to_string(),
+        })
+    }
+
+    /// Creates a new comment node (detached) and returns its `NodeId`.
+    pub fn create_comment(&mut self, content: &str) -> NodeId {
+        self.create_node(NodeKind::Comment {
+            content: content.to_string(),
+        })
+    }
+
+    /// Creates a new processing instruction node (detached) and returns its `NodeId`.
+    pub fn create_processing_instruction(&mut self, target: &str, data: Option<&str>) -> NodeId {
+        self.create_node(NodeKind::ProcessingInstruction {
+            target: target.to_string(),
+            data: data.map(ToString::to_string),
+        })
+    }
+
+    /// Inserts `new_child` immediately after `reference` in the sibling list.
+    ///
+    /// If `reference` is the last child, this is equivalent to appending to the parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reference` has no parent or if `new_child` already has a parent.
+    #[allow(clippy::expect_used)]
+    pub fn insert_after(&mut self, reference: NodeId, new_child: NodeId) {
+        debug_assert!(
+            self.node(new_child).parent.is_none(),
+            "new_child already has a parent; detach it first"
+        );
+
+        let parent = self
+            .node(reference)
+            .parent
+            .expect("reference has no parent");
+        self.node_mut(new_child).parent = Some(parent);
+
+        if let Some(next) = self.node(reference).next_sibling {
+            self.node_mut(next).prev_sibling = Some(new_child);
+            self.node_mut(new_child).next_sibling = Some(next);
+        } else {
+            self.node_mut(parent).last_child = Some(new_child);
+        }
+
+        self.node_mut(new_child).prev_sibling = Some(reference);
+        self.node_mut(reference).next_sibling = Some(new_child);
+    }
+
+    /// Replaces `old_node` with `new_node` in the tree.
+    ///
+    /// The old node is detached and the new node takes its place in the
+    /// sibling list. Returns the id of the old (now detached) node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `old_node` has no parent or if `new_node` already has a parent.
+    pub fn replace_node(&mut self, old_node: NodeId, new_node: NodeId) -> NodeId {
+        self.insert_before(old_node, new_node);
+        self.detach(old_node);
+        old_node
+    }
+
+    /// Sets an attribute on an element node. If the attribute already exists,
+    /// its value is updated. Returns `true` on success, `false` if the node
+    /// is not an element.
+    pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) -> bool {
+        if let NodeKind::Element { attributes, .. } = &mut self.node_mut(id).kind {
+            if let Some(attr) = attributes.iter_mut().find(|a| a.name == name) {
+                attr.value = value.to_string();
+                attr.raw_value = None;
+            } else {
+                attributes.push(Attribute {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    prefix: None,
+                    namespace: None,
+                    raw_value: None,
+                });
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes an attribute by name from an element node.
+    ///
+    /// Returns `true` if the attribute was found and removed, `false` if the
+    /// attribute was not present or the node is not an element.
+    pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> bool {
+        if let NodeKind::Element { attributes, .. } = &mut self.node_mut(id).kind {
+            let len = attributes.len();
+            attributes.retain(|a| a.name != name);
+            attributes.len() < len
+        } else {
+            false
+        }
+    }
+
+    /// Renames an element node. Returns `true` on success, `false` if the
+    /// node is not an element.
+    pub fn rename_element(&mut self, id: NodeId, new_name: &str) -> bool {
+        if let NodeKind::Element { name, .. } = &mut self.node_mut(id).kind {
+            *name = new_name.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns the total number of nodes in the document.
     ///
     /// This includes all node types (elements, text, comments, etc.) but
@@ -1864,5 +1992,146 @@ mod tests {
         assert_eq!(doc.text_content(root), "Hello");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_create_element_convenience() {
+        let mut doc = Document::new();
+        let elem = doc.create_element("div");
+        assert_eq!(doc.node_name(elem), Some("div"));
+        assert!(matches!(doc.node(elem).kind, NodeKind::Element { .. }));
+    }
+
+    #[test]
+    fn test_create_text_convenience() {
+        let mut doc = Document::new();
+        let t = doc.create_text("hello");
+        assert_eq!(doc.node_text(t), Some("hello"));
+    }
+
+    #[test]
+    fn test_create_comment_convenience() {
+        let mut doc = Document::new();
+        let c = doc.create_comment("a comment");
+        assert_eq!(doc.node_text(c), Some("a comment"));
+        assert!(matches!(doc.node(c).kind, NodeKind::Comment { .. }));
+    }
+
+    #[test]
+    fn test_create_processing_instruction() {
+        let mut doc = Document::new();
+        let pi = doc.create_processing_instruction("target", Some("data"));
+        assert_eq!(doc.node_name(pi), Some("target"));
+        assert_eq!(doc.node_text(pi), Some("data"));
+    }
+
+    #[test]
+    fn test_insert_after() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.create_text("A");
+        let b = doc.create_text("B");
+        let c = doc.create_text("C");
+
+        doc.append_child(root, a);
+        doc.append_child(root, c);
+        doc.insert_after(a, b);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, b, c]);
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.next_sibling(b), Some(c));
+        assert_eq!(doc.prev_sibling(c), Some(b));
+    }
+
+    #[test]
+    fn test_insert_after_last() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.create_text("A");
+        let b = doc.create_text("B");
+
+        doc.append_child(root, a);
+        doc.insert_after(a, b);
+
+        assert_eq!(doc.last_child(root), Some(b));
+        assert_eq!(doc.next_sibling(a), Some(b));
+        assert_eq!(doc.prev_sibling(b), Some(a));
+    }
+
+    #[test]
+    fn test_replace_node() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let a = doc.create_text("A");
+        let b = doc.create_text("B");
+        let c = doc.create_text("C");
+        let new_b = doc.create_text("NEW_B");
+
+        doc.append_child(root, a);
+        doc.append_child(root, b);
+        doc.append_child(root, c);
+
+        doc.replace_node(b, new_b);
+
+        let children: Vec<NodeId> = doc.children(root).collect();
+        assert_eq!(children, vec![a, new_b, c]);
+        assert!(doc.parent(b).is_none()); // old node detached
+    }
+
+    #[test]
+    fn test_set_attribute() {
+        let mut doc = Document::new();
+        let elem = doc.create_element("div");
+        assert!(doc.set_attribute(elem, "class", "foo"));
+        assert_eq!(doc.attribute(elem, "class"), Some("foo"));
+
+        // Update existing
+        assert!(doc.set_attribute(elem, "class", "bar"));
+        assert_eq!(doc.attribute(elem, "class"), Some("bar"));
+    }
+
+    #[test]
+    fn test_set_attribute_on_non_element() {
+        let mut doc = Document::new();
+        let text = doc.create_text("hello");
+        assert!(!doc.set_attribute(text, "class", "foo"));
+    }
+
+    #[test]
+    fn test_remove_attribute() {
+        let mut doc = Document::new();
+        let elem = doc.create_element("div");
+        doc.set_attribute(elem, "class", "foo");
+        doc.set_attribute(elem, "id", "bar");
+
+        assert!(doc.remove_attribute(elem, "class"));
+        assert_eq!(doc.attribute(elem, "class"), None);
+        assert_eq!(doc.attribute(elem, "id"), Some("bar"));
+
+        // Removing non-existent returns false
+        assert!(!doc.remove_attribute(elem, "class"));
+    }
+
+    #[test]
+    fn test_remove_attribute_on_non_element() {
+        let mut doc = Document::new();
+        let text = doc.create_text("hello");
+        assert!(!doc.remove_attribute(text, "class"));
+    }
+
+    #[test]
+    fn test_rename_element() {
+        let mut doc = Document::new();
+        let elem = doc.create_element("div");
+        assert!(doc.rename_element(elem, "span"));
+        assert_eq!(doc.node_name(elem), Some("span"));
+    }
+
+    #[test]
+    fn test_rename_non_element() {
+        let mut doc = Document::new();
+        let text = doc.create_text("hello");
+        assert!(!doc.rename_element(text, "span"));
     }
 }

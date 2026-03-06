@@ -533,23 +533,36 @@ pub unsafe extern "C" fn xmloxide_set_attribute(
     let Ok(value_str) = c_value.to_str() else {
         return 0;
     };
-    if let NodeKind::Element { attributes, .. } = &mut doc.node_mut(node_id).kind {
-        if let Some(attr) = attributes.iter_mut().find(|a| a.name == name_str) {
-            attr.value = value_str.to_string();
-            attr.raw_value = None;
-        } else {
-            attributes.push(crate::tree::Attribute {
-                name: name_str.to_string(),
-                value: value_str.to_string(),
-                prefix: None,
-                namespace: None,
-                raw_value: None,
-            });
-        }
-        1
-    } else {
-        0
+    i32::from(doc.set_attribute(node_id, name_str, value_str))
+}
+
+/// Removes an attribute by name from an element node.
+///
+/// Returns 1 if the attribute was removed, 0 if not found or not an element.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `name` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_remove_attribute(
+    doc: *mut Document,
+    node: u32,
+    name: *const c_char,
+) -> i32 {
+    if doc.is_null() || name.is_null() {
+        return 0;
     }
+    let Some(node_id) = NodeId::from_raw(node) else {
+        return 0;
+    };
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(name) };
+    let Ok(name_str) = c_name.to_str() else {
+        return 0;
+    };
+    i32::from(doc.remove_attribute(node_id, name_str))
 }
 
 /// Inserts a node before a reference sibling. Returns 1 on success, 0 on failure.
@@ -594,6 +607,111 @@ pub unsafe extern "C" fn xmloxide_element_by_id(doc: *const Document, id: *const
         return 0;
     };
     node_id_to_raw(doc.element_by_id(id_str))
+}
+
+/// Inserts a node after a reference sibling. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_insert_after(
+    doc: *mut Document,
+    reference: u32,
+    new_child: u32,
+) -> i32 {
+    let Some((doc, ref_id)) = (unsafe { doc_and_node_mut(doc, reference) }) else {
+        return 0;
+    };
+    let Some(child_id) = NodeId::from_raw(new_child) else {
+        return 0;
+    };
+    doc.insert_after(ref_id, child_id);
+    1
+}
+
+/// Replaces a node in the tree with another. Returns 1 on success, 0 on failure.
+///
+/// The old node is detached and the new node takes its position.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_replace_node(
+    doc: *mut Document,
+    old_node: u32,
+    new_node: u32,
+) -> i32 {
+    let Some((doc, old_id)) = (unsafe { doc_and_node_mut(doc, old_node) }) else {
+        return 0;
+    };
+    let Some(new_id) = NodeId::from_raw(new_node) else {
+        return 0;
+    };
+    doc.replace_node(old_id, new_id);
+    1
+}
+
+/// Creates a new processing instruction node and returns its id (0 on failure).
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `target` must be a valid
+/// null-terminated UTF-8 string. `data` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_create_pi(
+    doc: *mut Document,
+    target: *const c_char,
+    data: *const c_char,
+) -> u32 {
+    if doc.is_null() || target.is_null() {
+        return 0;
+    }
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_target = unsafe { std::ffi::CStr::from_ptr(target) };
+    let Ok(target_str) = c_target.to_str() else {
+        return 0;
+    };
+    let data_str = if data.is_null() {
+        None
+    } else {
+        let c_data = unsafe { std::ffi::CStr::from_ptr(data) };
+        match c_data.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return 0,
+        }
+    };
+    let node = doc.create_processing_instruction(target_str, data_str);
+    node.into_raw()
+}
+
+/// Renames an element node. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+///
+/// `doc` must be a valid mutable document pointer. `new_name` must be a valid
+/// null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_rename_element(
+    doc: *mut Document,
+    node: u32,
+    new_name: *const c_char,
+) -> i32 {
+    if doc.is_null() || new_name.is_null() {
+        return 0;
+    }
+    let Some(node_id) = NodeId::from_raw(node) else {
+        return 0;
+    };
+    // SAFETY: Null checks above.
+    let doc = unsafe { &mut *doc };
+    let c_name = unsafe { std::ffi::CStr::from_ptr(new_name) };
+    let Ok(name_str) = c_name.to_str() else {
+        return 0;
+    };
+    i32::from(doc.rename_element(node_id, name_str))
 }
 
 /// Returns the namespace prefix of an element node, or null if none.

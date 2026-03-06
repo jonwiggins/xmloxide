@@ -2251,3 +2251,154 @@ fn test_sax_parse_cdata() {
     }
     assert_eq!(collector.cdata, vec!["raw <data>"]);
 }
+
+// --- Tree mutation: new FFI functions ---
+
+#[test]
+fn test_remove_attribute() {
+    let xml = CString::new("<root class=\"foo\" id=\"bar\"/>").unwrap();
+    let doc = unsafe { xmloxide_parse_str(xml.as_ptr()) };
+    assert!(!doc.is_null());
+    let root = unsafe { xmloxide_doc_root_element(doc) };
+    let name = CString::new("class").unwrap();
+
+    unsafe {
+        assert_eq!(xmloxide_remove_attribute(doc, root, name.as_ptr()), 1);
+        // Verify removed
+        assert!(xmloxide_node_attribute(doc, root, name.as_ptr()).is_null());
+        // id still present
+        let id_name = CString::new("id").unwrap();
+        let val = c_string_to_owned(xmloxide_node_attribute(doc, root, id_name.as_ptr()));
+        assert_eq!(val.as_deref(), Some("bar"));
+        // Remove non-existent returns 0
+        assert_eq!(xmloxide_remove_attribute(doc, root, name.as_ptr()), 0);
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_insert_after_ffi() {
+    let xml = CString::new("<root><a/><c/></root>").unwrap();
+    let doc = unsafe { xmloxide_parse_str(xml.as_ptr()) };
+    assert!(!doc.is_null());
+    let root = unsafe { xmloxide_doc_root_element(doc) };
+    let a = unsafe { xmloxide_node_first_child(doc, root) };
+
+    let b_name = CString::new("b").unwrap();
+    let b = unsafe { xmloxide_create_element(doc, b_name.as_ptr()) };
+    assert_ne!(b, 0);
+
+    unsafe {
+        assert_eq!(xmloxide_insert_after(doc, a, b), 1);
+        // Order should be a, b, c
+        let first = xmloxide_node_first_child(doc, root);
+        let second = xmloxide_node_next_sibling(doc, first);
+        let third = xmloxide_node_next_sibling(doc, second);
+
+        let first_name = c_string_to_owned(xmloxide_node_name(doc, first));
+        let second_name = c_string_to_owned(xmloxide_node_name(doc, second));
+        let third_name = c_string_to_owned(xmloxide_node_name(doc, third));
+        assert_eq!(first_name.as_deref(), Some("a"));
+        assert_eq!(second_name.as_deref(), Some("b"));
+        assert_eq!(third_name.as_deref(), Some("c"));
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_replace_node_ffi() {
+    let xml = CString::new("<root><a/><b/><c/></root>").unwrap();
+    let doc = unsafe { xmloxide_parse_str(xml.as_ptr()) };
+    assert!(!doc.is_null());
+    let root = unsafe { xmloxide_doc_root_element(doc) };
+
+    // Get b node
+    let a = unsafe { xmloxide_node_first_child(doc, root) };
+    let b = unsafe { xmloxide_node_next_sibling(doc, a) };
+
+    // Create replacement
+    let new_name = CString::new("new_b").unwrap();
+    let new_b = unsafe { xmloxide_create_element(doc, new_name.as_ptr()) };
+
+    unsafe {
+        assert_eq!(xmloxide_replace_node(doc, b, new_b), 1);
+        // Order should be a, new_b, c
+        let first = xmloxide_node_first_child(doc, root);
+        let second = xmloxide_node_next_sibling(doc, first);
+        let third = xmloxide_node_next_sibling(doc, second);
+
+        let second_name = c_string_to_owned(xmloxide_node_name(doc, second));
+        let third_name = c_string_to_owned(xmloxide_node_name(doc, third));
+        assert_eq!(second_name.as_deref(), Some("new_b"));
+        assert_eq!(third_name.as_deref(), Some("c"));
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_create_pi_ffi() {
+    let xml = CString::new("<root/>").unwrap();
+    let doc = unsafe { xmloxide_parse_str(xml.as_ptr()) };
+    assert!(!doc.is_null());
+    let root = unsafe { xmloxide_doc_root_element(doc) };
+
+    let target = CString::new("my-pi").unwrap();
+    let data = CString::new("some data").unwrap();
+
+    unsafe {
+        let pi = xmloxide_create_pi(doc, target.as_ptr(), data.as_ptr());
+        assert_ne!(pi, 0);
+        assert_eq!(xmloxide_append_child(doc, root, pi), 1);
+        assert_eq!(xmloxide_node_type(doc, pi), XMLOXIDE_NODE_PI);
+        let pi_name = c_string_to_owned(xmloxide_node_name(doc, pi));
+        assert_eq!(pi_name.as_deref(), Some("my-pi"));
+        let pi_text = c_string_to_owned(xmloxide_node_text(doc, pi));
+        assert_eq!(pi_text.as_deref(), Some("some data"));
+
+        // Null data is ok
+        let pi2 = xmloxide_create_pi(doc, target.as_ptr(), std::ptr::null());
+        assert_ne!(pi2, 0);
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_rename_element_ffi() {
+    let xml = CString::new("<root><old/></root>").unwrap();
+    let doc = unsafe { xmloxide_parse_str(xml.as_ptr()) };
+    assert!(!doc.is_null());
+    let root = unsafe { xmloxide_doc_root_element(doc) };
+    let child = unsafe { xmloxide_node_first_child(doc, root) };
+
+    let new_name = CString::new("new").unwrap();
+    unsafe {
+        assert_eq!(xmloxide_rename_element(doc, child, new_name.as_ptr()), 1);
+        let name = c_string_to_owned(xmloxide_node_name(doc, child));
+        assert_eq!(name.as_deref(), Some("new"));
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_mutation_null_safety() {
+    let name = CString::new("test").unwrap();
+    unsafe {
+        assert_eq!(
+            xmloxide_remove_attribute(std::ptr::null_mut(), 1, name.as_ptr()),
+            0
+        );
+        assert_eq!(xmloxide_insert_after(std::ptr::null_mut(), 1, 2), 0);
+        assert_eq!(xmloxide_replace_node(std::ptr::null_mut(), 1, 2), 0);
+        assert_eq!(
+            xmloxide_create_pi(std::ptr::null_mut(), name.as_ptr(), std::ptr::null()),
+            0
+        );
+        assert_eq!(
+            xmloxide_rename_element(std::ptr::null_mut(), 1, name.as_ptr()),
+            0
+        );
+    }
+}

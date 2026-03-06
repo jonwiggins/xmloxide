@@ -367,6 +367,39 @@ int32_t xmloxide_insert_before(xmloxide_document *doc, uint32_t reference,
                                uint32_t new_child);
 
 /**
+ * Inserts a node after a reference sibling. Returns 1 on success, 0 on failure.
+ */
+int32_t xmloxide_insert_after(xmloxide_document *doc, uint32_t reference,
+                              uint32_t new_child);
+
+/**
+ * Replaces a node in the tree with another. Returns 1 on success, 0 on failure.
+ * The old node is detached and the new node takes its position.
+ */
+int32_t xmloxide_replace_node(xmloxide_document *doc, uint32_t old_node,
+                              uint32_t new_node);
+
+/**
+ * Removes an attribute by name from an element node.
+ * Returns 1 if removed, 0 if not found or not an element.
+ */
+int32_t xmloxide_remove_attribute(xmloxide_document *doc, uint32_t node,
+                                  const char *name);
+
+/**
+ * Creates a new processing instruction node and returns its id (0 on failure).
+ * data may be NULL.
+ */
+uint32_t xmloxide_create_pi(xmloxide_document *doc, const char *target,
+                            const char *data);
+
+/**
+ * Renames an element node. Returns 1 on success, 0 on failure.
+ */
+int32_t xmloxide_rename_element(xmloxide_document *doc, uint32_t node,
+                                const char *new_name);
+
+/**
  * Returns the element with the given ID attribute, or 0 if not found.
  * The document's id_map must be populated first (typically via DTD validation).
  */
