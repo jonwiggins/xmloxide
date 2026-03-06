@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Pin `tempfile` dev-dependency to `<3.20` to avoid transitive `getrandom 0.4`
-  which requires `edition2024` (Rust 1.85+), breaking the MSRV of 1.81
+- Pin `tempfile` dev-dependency to `<3.20` and `proptest` to `<1.7` to avoid
+  transitive dependencies requiring Rust 1.84+/1.85+, breaking the MSRV of 1.81
 
 ### Improved
 
