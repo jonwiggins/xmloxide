@@ -1,6 +1,6 @@
 [package]
 name = "xmloxide"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.81"
 license = "MIT"
@@ -48,6 +48,9 @@ pretty_assertions = "1"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Pin tempfile <3.20 to avoid getrandom 0.4 which requires edition2024 (Rust 1.85+),
+# breaking our MSRV of 1.81. Pulled in transitively by proptest.
+tempfile = ">=3,<3.20"
 tokio = { version = "1", features = ["io-util", "rt", "macros", "fs"] }
 
 [lints.rust]

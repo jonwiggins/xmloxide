@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-03-06
+
+### Fixed
+
+- Pin `tempfile` dev-dependency to `<3.20` to avoid transitive `getrandom 0.4`
+  which requires `edition2024` (Rust 1.85+), breaking the MSRV of 1.81
+
+### Improved
+
+- Pre-commit hook now includes an MSRV check: runs `cargo check` with the 1.81
+  toolchain (if installed) or scans `Cargo.lock` for edition2024 dependencies
+
 ## [0.3.0] - 2026-03-06
 
 ### Added
@@ -162,6 +174,7 @@ Initial release of xmloxide — a pure Rust reimplementation of libxml2.
 - 119/119 libxml2 compatibility tests (100%)
 - Real-world XML, security/DoS, and entity resolver integration tests
 
+[0.3.1]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.3.1
 [0.3.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.2.0
 [0.1.1]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.1.1

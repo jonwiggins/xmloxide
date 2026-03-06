@@ -1,8 +1,10 @@
 #!/bin/sh
 # Pre-commit hook for xmloxide.
-# Runs formatting, clippy, tests, and doc build before allowing commits.
+# Runs formatting, clippy, tests, doc build, and MSRV check before allowing commits.
 #
 # Install with: ./scripts/install-hooks.sh
+
+set -e
 
 echo "Running cargo fmt --check..."
 if ! cargo fmt --all -- --check; then
@@ -38,6 +40,33 @@ if ! RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --quiet; then
     exit 1
 fi
 echo "Documentation check passed."
+
+# MSRV check: verify the dependency tree resolves on our minimum supported
+# Rust version (1.81). If the MSRV toolchain is installed, run `cargo check`;
+# otherwise, scan Cargo.lock for known-incompatible patterns.
+echo ""
+MSRV="1.81"
+if rustup run "$MSRV" cargo --version >/dev/null 2>&1; then
+    echo "Running MSRV check (Rust $MSRV)..."
+    if ! rustup run "$MSRV" cargo check --features cli,ffi --quiet 2>&1; then
+        echo ""
+        echo "ERROR: Build fails on MSRV (Rust $MSRV). A dependency may require a newer Rust."
+        echo "Check Cargo.lock for edition2024 or rust-version constraints above $MSRV."
+        exit 1
+    fi
+    echo "MSRV check passed."
+else
+    echo "MSRV toolchain ($MSRV) not installed, running lockfile heuristic check..."
+    # Check for edition2024 in resolved dependencies (requires Rust 1.85+)
+    if cargo metadata --format-version=1 --frozen 2>/dev/null | grep -q '"edition":"2024"'; then
+        echo ""
+        echo "ERROR: A resolved dependency uses edition 2024, which requires Rust 1.85+."
+        echo "This breaks our MSRV of $MSRV. Pin the offending dependency to an older version."
+        echo "Run: cargo tree -i <package> to find what pulls it in."
+        exit 1
+    fi
+    echo "Lockfile heuristic check passed (install Rust $MSRV for a full check: rustup toolchain install $MSRV)."
+fi
 
 echo ""
 echo "All pre-commit checks passed."
