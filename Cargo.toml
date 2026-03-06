@@ -21,6 +21,7 @@ include = [
     "Cargo.toml",
     "LICENSE",
     "README.md",
+    "!tests/html5lib-tests/**",
 ]
 
 [features]
