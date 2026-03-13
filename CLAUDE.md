@@ -4,7 +4,7 @@
 
 **xmloxide** is a pure Rust reimplementation of libxml2 — the de facto standard XML/HTML parsing library in the open-source world. libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide is a memory-safe, high-performance replacement that passes the same conformance test suites.
 
-**Version:** 0.3.1
+**Version:** 0.3.2
 **License:** MIT
 **MSRV:** Rust 1.81+
 

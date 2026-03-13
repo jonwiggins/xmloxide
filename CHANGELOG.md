@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-03-13
+
+### Added
+
+- **`xsd:import` and `xsd:include` support** ([#3](https://github.com/jonwiggins/xmloxide/issues/3)) —
+  multi-file XSD schema composition for real-world schemas like UBL 2.4
+  - `SchemaResolver` trait for pluggable schema loading (filesystem, HTTP, embedded, etc.)
+  - `parse_xsd_with_options()` — new entry point that follows `xsd:include` (same-namespace
+    merging, chameleon includes) and `xsd:import` (cross-namespace type resolution)
+  - `XsdParseOptions` struct with optional resolver and base URI
+  - Cycle detection prevents infinite loops in circular import/include chains
+  - Namespace-aware type resolution via `QName` prefix maps — imported types like
+    `tns:AddressType` resolve correctly through `imported_namespaces`
+  - Existing `parse_xsd()` unchanged (backward compatible, silently ignores import/include)
+- 23 new tests (21 unit + 2 integration) covering include merging, chameleon includes,
+  import cross-namespace resolution, cycle detection, transitive includes, namespace
+  mismatch errors, and UBL-like multi-schema validation patterns
+
 ## [0.3.1] - 2026-03-06
 
 ### Fixed
