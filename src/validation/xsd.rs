@@ -43,10 +43,62 @@
 //! assert!(result.is_valid);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::tree::{Document, NodeId, NodeKind};
 use crate::validation::{ValidationError, ValidationResult};
+
+/// The XML Schema namespace URI.
+const XSD_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema";
+
+// ---------------------------------------------------------------------------
+// Schema resolver
+// ---------------------------------------------------------------------------
+
+/// A trait for resolving external schema documents by URI.
+///
+/// Implementors provide schema content for `xsd:import` and `xsd:include`
+/// directives. The resolver receives the `schemaLocation` URI and an optional
+/// base URI for resolving relative paths.
+///
+/// A blanket implementation is provided for closures matching
+/// `Fn(&str, Option<&str>) -> Option<String>`.
+///
+/// See XSD 1.0 section 4.2 for schema composition.
+pub trait SchemaResolver {
+    /// Resolves a schema location to its XML content.
+    ///
+    /// `location` is the `schemaLocation` attribute value, which may be
+    /// an absolute URI or a relative path. `base` is the URI of the
+    /// including/importing schema, if known, for resolving relative paths.
+    ///
+    /// Returns `Some(xml_content)` if the schema was found, or `None` if
+    /// the schema cannot be resolved.
+    fn resolve(&self, location: &str, base: Option<&str>) -> Option<String>;
+}
+
+impl<F> SchemaResolver for F
+where
+    F: Fn(&str, Option<&str>) -> Option<String>,
+{
+    fn resolve(&self, location: &str, base: Option<&str>) -> Option<String> {
+        self(location, base)
+    }
+}
+
+/// Options for parsing XSD schemas with multi-file schema composition.
+///
+/// See XSD 1.0 section 4.2 for `xsd:include` and `xsd:import`.
+pub struct XsdParseOptions<'a> {
+    /// Optional resolver for `xsd:include` and `xsd:import` directives.
+    ///
+    /// If `None`, include/import directives are silently ignored (matching
+    /// the current behavior of [`parse_xsd`]).
+    pub resolver: Option<&'a dyn SchemaResolver>,
+
+    /// Optional base URI for resolving relative `schemaLocation` values.
+    pub base_uri: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -65,6 +117,26 @@ pub struct XsdSchema {
     /// Named type definitions (both simple and complex), keyed by type name.
     types: HashMap<String, XsdType>,
     /// Named attribute groups, keyed by group name.
+    attribute_groups: HashMap<String, Vec<XsdAttribute>>,
+    /// Imported schemas from other namespaces, keyed by namespace URI.
+    imported_namespaces: HashMap<String, ImportedSchema>,
+    /// Prefix-to-namespace-URI map from the root schema element.
+    ///
+    /// Used during validation to resolve `QName` type references like
+    /// `tns:AddressType` to the correct namespace for imported type lookup.
+    prefix_map: HashMap<String, String>,
+}
+
+/// Declarations imported from another namespace via `xsd:import`.
+///
+/// See XSD 1.0 section 4.2.3.
+#[derive(Debug, Clone)]
+struct ImportedSchema {
+    /// Global element declarations from the imported namespace.
+    elements: HashMap<String, XsdElement>,
+    /// Named type definitions from the imported namespace.
+    types: HashMap<String, XsdType>,
+    /// Named attribute groups from the imported namespace.
     attribute_groups: HashMap<String, Vec<XsdAttribute>>,
 }
 
@@ -272,6 +344,10 @@ pub struct XsdAttribute {
 /// element using the XML Schema namespace
 /// (`http://www.w3.org/2001/XMLSchema`).
 ///
+/// This is a convenience wrapper around [`parse_xsd_with_options`] that does
+/// not resolve `xsd:include` or `xsd:import` directives (they are silently
+/// ignored).
+///
 /// # Errors
 ///
 /// Returns a [`ValidationError`] if the input cannot be parsed as XML or
@@ -289,6 +365,101 @@ pub struct XsdAttribute {
 /// "#).unwrap();
 /// ```
 pub fn parse_xsd(schema_xml: &str) -> Result<XsdSchema, ValidationError> {
+    parse_xsd_with_options(
+        schema_xml,
+        &XsdParseOptions {
+            resolver: None,
+            base_uri: None,
+        },
+    )
+}
+
+/// Parses an XSD schema with support for `xsd:include` and `xsd:import`.
+///
+/// When a [`SchemaResolver`] is provided in the options, `xsd:include` and
+/// `xsd:import` elements trigger loading and merging of referenced schemas.
+///
+/// See XSD 1.0 section 4.2 for schema composition rules.
+///
+/// # Errors
+///
+/// Returns a [`ValidationError`] if the input cannot be parsed as XML, does
+/// not contain a valid XSD schema structure, or if an included/imported
+/// schema cannot be resolved or has a namespace mismatch.
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::validation::xsd::{parse_xsd_with_options, SchemaResolver, XsdParseOptions};
+///
+/// // A simple resolver that returns schema content by location
+/// let resolver = |location: &str, _base: Option<&str>| -> Option<String> {
+///     match location {
+///         "types.xsd" => Some(r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+///             <xs:complexType name="NameType"><xs:sequence>
+///                 <xs:element name="first" type="xs:string"/>
+///             </xs:sequence></xs:complexType>
+///         </xs:schema>"#.to_string()),
+///         _ => None,
+///     }
+/// };
+///
+/// let opts = XsdParseOptions {
+///     resolver: Some(&resolver),
+///     base_uri: None,
+/// };
+///
+/// let schema = parse_xsd_with_options(r#"
+///   <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+///     <xs:include schemaLocation="types.xsd"/>
+///     <xs:element name="name" type="NameType"/>
+///   </xs:schema>
+/// "#, &opts).unwrap();
+/// ```
+pub fn parse_xsd_with_options(
+    schema_xml: &str,
+    options: &XsdParseOptions<'_>,
+) -> Result<XsdSchema, ValidationError> {
+    // Parse the root schema document first to extract the prefix map
+    let root_doc = Document::parse_str(schema_xml).map_err(|e| ValidationError {
+        message: format!("failed to parse XSD schema XML: {e}"),
+        line: None,
+        column: None,
+    })?;
+    let root_elem = root_doc.root_element().ok_or_else(|| ValidationError {
+        message: "XSD schema has no root element".to_string(),
+        line: None,
+        column: None,
+    })?;
+    let prefix_map = build_prefix_map(&root_doc, root_elem);
+
+    let mut schema = XsdSchema {
+        target_namespace: None,
+        elements: HashMap::new(),
+        types: HashMap::new(),
+        attribute_groups: HashMap::new(),
+        imported_namespaces: HashMap::new(),
+        prefix_map,
+    };
+
+    register_builtin_types(&mut schema);
+
+    let mut loaded = HashSet::new();
+    // Use a synthetic key for the top-level schema (it has no schemaLocation)
+    loaded.insert("<root>".to_string());
+
+    parse_xsd_internal(schema_xml, options, &mut loaded, &mut schema)?;
+
+    Ok(schema)
+}
+
+/// Internal recursive schema parser with cycle detection.
+fn parse_xsd_internal(
+    schema_xml: &str,
+    options: &XsdParseOptions<'_>,
+    loaded: &mut HashSet<String>,
+    schema: &mut XsdSchema,
+) -> Result<(), ValidationError> {
     let doc = Document::parse_str(schema_xml).map_err(|e| ValidationError {
         message: format!("failed to parse XSD schema XML: {e}"),
         line: None,
@@ -310,21 +481,27 @@ pub fn parse_xsd(schema_xml: &str) -> Result<XsdSchema, ValidationError> {
         });
     }
 
-    let mut schema = XsdSchema {
-        target_namespace: doc.attribute(root, "targetNamespace").map(String::from),
-        elements: HashMap::new(),
-        types: HashMap::new(),
-        attribute_groups: HashMap::new(),
-    };
+    let this_ns = doc.attribute(root, "targetNamespace").map(String::from);
 
-    register_builtin_types(&mut schema);
-    parse_top_level_declarations(&doc, root, &mut schema);
+    // Set target_namespace from the first schema we parse (the root)
+    if schema.target_namespace.is_none() && this_ns.is_some() {
+        schema.target_namespace.clone_from(&this_ns);
+    }
 
-    Ok(schema)
+    parse_top_level_declarations(&doc, root, schema, options, loaded, this_ns.as_ref())?;
+
+    Ok(())
 }
 
 /// Parses top-level declarations from the schema root element.
-fn parse_top_level_declarations(doc: &Document, root: NodeId, schema: &mut XsdSchema) {
+fn parse_top_level_declarations(
+    doc: &Document,
+    root: NodeId,
+    schema: &mut XsdSchema,
+    options: &XsdParseOptions<'_>,
+    loaded: &mut HashSet<String>,
+    this_ns: Option<&String>,
+) -> Result<(), ValidationError> {
     for child in doc.children(root) {
         let Some(name) = doc.node_name(child) else {
             continue;
@@ -355,9 +532,219 @@ fn parse_top_level_declarations(doc: &Document, root: NodeId, schema: &mut XsdSc
                         .insert(group_name.to_string(), attrs);
                 }
             }
+            "include" => {
+                handle_include(doc, child, schema, options, loaded, this_ns)?;
+            }
+            "import" => {
+                handle_import(doc, child, schema, options, loaded)?;
+            }
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Handles an `<xsd:include>` element by resolving and merging the included
+/// schema into the current schema.
+///
+/// See XSD 1.0 section 4.2.1.
+fn handle_include(
+    doc: &Document,
+    node: NodeId,
+    schema: &mut XsdSchema,
+    options: &XsdParseOptions<'_>,
+    loaded: &mut HashSet<String>,
+    this_ns: Option<&String>,
+) -> Result<(), ValidationError> {
+    let Some(location) = doc.attribute(node, "schemaLocation") else {
+        return Ok(());
+    };
+
+    // Cycle detection
+    if loaded.contains(location) {
+        return Ok(());
+    }
+
+    let Some(resolver) = options.resolver else {
+        return Ok(());
+    };
+
+    let content = resolver
+        .resolve(location, options.base_uri.as_deref())
+        .ok_or_else(|| ValidationError {
+            message: format!("cannot resolve included schema: {location}"),
+            line: None,
+            column: None,
+        })?;
+
+    // Check namespace compatibility before merging: parse just the root to
+    // extract its targetNamespace.
+    let included_doc = Document::parse_str(&content).map_err(|e| ValidationError {
+        message: format!("failed to parse included schema '{location}': {e}"),
+        line: None,
+        column: None,
+    })?;
+    let included_root = included_doc.root_element().ok_or_else(|| ValidationError {
+        message: format!("included schema '{location}' has no root element"),
+        line: None,
+        column: None,
+    })?;
+    let included_ns = included_doc
+        .attribute(included_root, "targetNamespace")
+        .map(String::from);
+
+    // Per XSD 1.0 §4.2.1: included schema must have the same targetNamespace
+    // or no targetNamespace (chameleon include).
+    if let Some(ref inc_ns) = included_ns {
+        if this_ns != Some(inc_ns) {
+            return Err(ValidationError {
+                message: format!(
+                    "included schema '{location}' has targetNamespace '{inc_ns}' \
+                     which does not match the including schema's namespace"
+                ),
+                line: None,
+                column: None,
+            });
+        }
+    }
+
+    // Mark as loaded before recursing to prevent cycles
+    loaded.insert(location.to_string());
+
+    // Parse and merge the included schema's declarations
+    parse_xsd_internal(&content, options, loaded, schema)?;
+
+    Ok(())
+}
+
+/// Handles an `<xsd:import>` element by resolving the imported schema and
+/// storing its declarations under the imported namespace.
+///
+/// See XSD 1.0 section 4.2.3.
+fn handle_import(
+    doc: &Document,
+    node: NodeId,
+    schema: &mut XsdSchema,
+    options: &XsdParseOptions<'_>,
+    loaded: &mut HashSet<String>,
+) -> Result<(), ValidationError> {
+    let namespace = doc.attribute(node, "namespace").map(String::from);
+    let location = doc.attribute(node, "schemaLocation");
+
+    let Some(location) = location else {
+        // Import without schemaLocation is valid — just declares the namespace
+        return Ok(());
+    };
+
+    // Cycle detection
+    if loaded.contains(location) {
+        return Ok(());
+    }
+
+    let Some(resolver) = options.resolver else {
+        return Ok(());
+    };
+
+    let content = resolver
+        .resolve(location, options.base_uri.as_deref())
+        .ok_or_else(|| ValidationError {
+            message: format!("cannot resolve imported schema: {location}"),
+            line: None,
+            column: None,
+        })?;
+
+    // Parse the imported schema to extract its declarations
+    let imported_doc = Document::parse_str(&content).map_err(|e| ValidationError {
+        message: format!("failed to parse imported schema '{location}': {e}"),
+        line: None,
+        column: None,
+    })?;
+    let imported_root = imported_doc.root_element().ok_or_else(|| ValidationError {
+        message: format!("imported schema '{location}' has no root element"),
+        line: None,
+        column: None,
+    })?;
+
+    let imported_root_name = imported_doc.node_name(imported_root).unwrap_or("");
+    if imported_root_name != "schema" {
+        return Err(ValidationError {
+            message: format!(
+                "imported schema '{location}' has root <{imported_root_name}>, expected <xs:schema>"
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    let imported_ns = imported_doc
+        .attribute(imported_root, "targetNamespace")
+        .map(String::from);
+
+    // Verify namespace matches if both are specified
+    if let (Some(ref expected), Some(ref actual)) = (&namespace, &imported_ns) {
+        if expected != actual {
+            return Err(ValidationError {
+                message: format!(
+                    "imported schema '{location}' has targetNamespace '{actual}' \
+                     but import declares namespace '{expected}'"
+                ),
+                line: None,
+                column: None,
+            });
+        }
+    }
+
+    let ns_key = namespace.or(imported_ns).unwrap_or_default();
+
+    // Mark as loaded before recursing
+    loaded.insert(location.to_string());
+
+    // Build an ImportedSchema by parsing the imported schema's declarations
+    let mut imported = ImportedSchema {
+        elements: HashMap::new(),
+        types: HashMap::new(),
+        attribute_groups: HashMap::new(),
+    };
+
+    // We need a temporary XsdSchema to parse into, then extract declarations
+    let mut temp_schema = XsdSchema {
+        target_namespace: Some(ns_key.clone()),
+        elements: HashMap::new(),
+        types: HashMap::new(),
+        attribute_groups: HashMap::new(),
+        imported_namespaces: HashMap::new(),
+        prefix_map: build_prefix_map(&imported_doc, imported_root),
+    };
+    register_builtin_types(&mut temp_schema);
+    parse_top_level_declarations(
+        &imported_doc,
+        imported_root,
+        &mut temp_schema,
+        options,
+        loaded,
+        Some(&ns_key),
+    )?;
+
+    // Move non-builtin declarations to the ImportedSchema
+    for (name, typ) in &temp_schema.types {
+        // Skip built-in types — they are already registered on the main schema
+        if matches!(typ, XsdType::Simple(st) if matches!(st.variety, SimpleTypeVariety::Builtin(_)))
+        {
+            continue;
+        }
+        imported.types.insert(name.clone(), typ.clone());
+    }
+    imported.elements = temp_schema.elements;
+    imported.attribute_groups = temp_schema.attribute_groups;
+
+    // Also merge any transitive imports
+    for (k, v) in temp_schema.imported_namespaces {
+        schema.imported_namespaces.entry(k).or_insert(v);
+    }
+
+    schema.imported_namespaces.entry(ns_key).or_insert(imported);
+
+    Ok(())
 }
 
 /// Registers all supported built-in XSD types in the schema.
@@ -699,6 +1086,40 @@ fn parse_attributes(doc: &Document, node: NodeId) -> Vec<XsdAttribute> {
         .collect()
 }
 
+/// Builds a prefix-to-namespace-URI map from `xmlns:*` attributes on a node.
+///
+/// Scans the attributes of the given node for namespace declarations
+/// (`xmlns:prefix="uri"`) and returns a map from prefix to URI.
+fn build_prefix_map(doc: &Document, node: NodeId) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for attr in doc.attributes(node) {
+        if attr.prefix.as_deref() == Some("xmlns") {
+            map.insert(attr.name.clone(), attr.value.clone());
+        }
+    }
+    map
+}
+
+/// Resolves a `QName` type reference into a namespace URI and local name.
+///
+/// Given a type reference like `"xs:string"` or `"tns:AddressType"`, splits
+/// on `:` and looks up the prefix in the provided prefix map to get the
+/// namespace URI.
+///
+/// Returns `(None, local_name)` for unprefixed names and
+/// `(Some(namespace_uri), local_name)` for prefixed names.
+fn resolve_type_qname(
+    qname: &str,
+    prefix_map: &HashMap<String, String>,
+) -> (Option<String>, String) {
+    if let Some((prefix, local)) = qname.split_once(':') {
+        let ns = prefix_map.get(prefix).cloned();
+        (ns, local.to_string())
+    } else {
+        (None, qname.to_string())
+    }
+}
+
 /// Strips an `xs:` or `xsd:` prefix from a type reference string.
 fn strip_xs_prefix(name: &str) -> String {
     if let Some(local) = name.strip_prefix("xs:") {
@@ -784,13 +1205,29 @@ fn validate_element(
     }
 }
 
-/// Resolves the type for an element declaration.
+/// Resolves the type for an element declaration, checking both local types
+/// and imported namespaces for QName-prefixed type references.
 fn resolve_element_type<'a>(decl: &'a XsdElement, schema: &'a XsdSchema) -> Option<&'a XsdType> {
     if let Some(ref inline) = decl.inline_type {
         return Some(inline);
     }
     if let Some(ref type_name) = decl.type_ref {
-        return schema.types.get(type_name);
+        // Try local types first (handles unprefixed names and xs:-stripped names)
+        if let Some(t) = schema.types.get(type_name) {
+            return Some(t);
+        }
+        // Try namespace-aware resolution for prefixed type references
+        let (ns, local) = resolve_type_qname(type_name, &schema.prefix_map);
+        if let Some(ref ns_uri) = ns {
+            if ns_uri == XSD_NAMESPACE {
+                // Built-in XSD type — look up by local name
+                return schema.types.get(&local);
+            }
+            // Check imported namespaces
+            if let Some(imported) = schema.imported_namespaces.get(ns_uri) {
+                return imported.types.get(&local);
+            }
+        }
     }
     None
 }
@@ -2418,5 +2855,602 @@ mod tests {
         let result =
             apply_whitespace_normalization("  hello \t world \n ", &WhiteSpaceValue::Collapse);
         assert_eq!(result, "hello world");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0: Prefix map and QName resolution infrastructure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_prefix_map() {
+        let doc = Document::parse_str(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:tns="http://example.com/types"
+                        targetNamespace="http://example.com/types">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+        let root = doc.root_element().unwrap();
+        let map = build_prefix_map(&doc, root);
+        assert_eq!(
+            map.get("xs"),
+            Some(&"http://www.w3.org/2001/XMLSchema".to_string())
+        );
+        assert_eq!(
+            map.get("tns"),
+            Some(&"http://example.com/types".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_type_qname_builtin() {
+        let mut map = HashMap::new();
+        map.insert(
+            "xs".to_string(),
+            "http://www.w3.org/2001/XMLSchema".to_string(),
+        );
+        let (ns, local) = resolve_type_qname("xs:string", &map);
+        assert_eq!(ns.as_deref(), Some("http://www.w3.org/2001/XMLSchema"));
+        assert_eq!(local, "string");
+    }
+
+    #[test]
+    fn test_resolve_type_qname_local() {
+        let mut map = HashMap::new();
+        map.insert("tns".to_string(), "http://example.com/types".to_string());
+        let (ns, local) = resolve_type_qname("tns:MyType", &map);
+        assert_eq!(ns.as_deref(), Some("http://example.com/types"));
+        assert_eq!(local, "MyType");
+    }
+
+    #[test]
+    fn test_resolve_type_qname_unprefixed() {
+        let map = HashMap::new();
+        let (ns, local) = resolve_type_qname("MyType", &map);
+        assert_eq!(ns, None);
+        assert_eq!(local, "MyType");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: xsd:include tests
+    // -----------------------------------------------------------------------
+
+    fn make_resolver(schemas: Vec<(&str, &str)>) -> impl SchemaResolver {
+        let map: HashMap<String, String> = schemas
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |location: &str, _base: Option<&str>| map.get(location).cloned()
+    }
+
+    #[test]
+    fn test_include_ignored_without_resolver() {
+        // Without a resolver, include is silently skipped (backward compat)
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="types.xsd"/>
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+        assert!(schema.elements.contains_key("root"));
+    }
+
+    #[test]
+    fn test_include_merges_types() {
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="PersonType"><xs:sequence>
+                    <xs:element name="name" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="types.xsd"/>
+                <xs:element name="person" type="PersonType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema.types.contains_key("PersonType"));
+        assert!(schema.elements.contains_key("person"));
+    }
+
+    #[test]
+    fn test_include_merges_elements() {
+        let resolver = make_resolver(vec![(
+            "elements.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="greeting" type="xs:string"/>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="elements.xsd"/>
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema.elements.contains_key("greeting"));
+        assert!(schema.elements.contains_key("root"));
+    }
+
+    #[test]
+    fn test_include_chameleon() {
+        // Included schema has no targetNamespace — adopts includer's namespace
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="AddrType"><xs:sequence>
+                    <xs:element name="street" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/main">
+                <xs:include schemaLocation="types.xsd"/>
+                <xs:element name="addr" type="AddrType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        // The type should be merged into the main schema
+        assert!(schema.types.contains_key("AddrType"));
+    }
+
+    #[test]
+    fn test_include_namespace_mismatch_error() {
+        let resolver = make_resolver(vec![(
+            "other.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://other.com">
+                <xs:element name="x" type="xs:string"/>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let result = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com">
+                <xs:include schemaLocation="other.xsd"/>
+            </xs:schema>"#,
+            &opts,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("namespace"));
+    }
+
+    #[test]
+    fn test_include_cycle_detection() {
+        // A includes B, B includes A — should not loop
+        let resolver = make_resolver(vec![
+            (
+                "a.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:include schemaLocation="b.xsd"/>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:schema>"#,
+            ),
+            (
+                "b.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:include schemaLocation="a.xsd"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        // Parse from a.xsd content — should include b.xsd but not re-include a.xsd
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="a.xsd"/>
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema.elements.contains_key("root"));
+        assert!(schema.elements.contains_key("a"));
+        assert!(schema.elements.contains_key("b"));
+    }
+
+    #[test]
+    fn test_include_transitive() {
+        // A includes B, B includes C — declarations from C available in A
+        let resolver = make_resolver(vec![
+            (
+                "b.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:include schemaLocation="c.xsd"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:schema>"#,
+            ),
+            (
+                "c.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="CType"><xs:sequence>
+                        <xs:element name="val" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="b.xsd"/>
+                <xs:element name="root" type="CType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema.elements.contains_key("root"));
+        assert!(schema.elements.contains_key("b"));
+        assert!(schema.types.contains_key("CType"));
+    }
+
+    #[test]
+    fn test_include_resolver_returns_none() {
+        let resolver = make_resolver(vec![]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let result = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="nonexistent.xsd"/>
+            </xs:schema>"#,
+            &opts,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("nonexistent.xsd"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: xsd:import tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_import_cross_namespace_type() {
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/types">
+                <xs:complexType name="AddressType"><xs:sequence>
+                    <xs:element name="street" type="xs:string"/>
+                    <xs:element name="city" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:tns="http://example.com/types"
+                        targetNamespace="http://example.com/main">
+                <xs:import namespace="http://example.com/types" schemaLocation="types.xsd"/>
+                <xs:element name="address" type="tns:AddressType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        // The imported type should be resolvable
+        assert!(schema
+            .imported_namespaces
+            .contains_key("http://example.com/types"));
+        let imported = &schema.imported_namespaces["http://example.com/types"];
+        assert!(imported.types.contains_key("AddressType"));
+    }
+
+    #[test]
+    fn test_import_namespace_mismatch_error() {
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://wrong.com">
+                <xs:element name="x" type="xs:string"/>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let result = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:import namespace="http://expected.com" schemaLocation="types.xsd"/>
+            </xs:schema>"#,
+            &opts,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("namespace"));
+    }
+
+    #[test]
+    fn test_import_without_schema_location() {
+        // Import with just namespace attribute is valid (declares expected ns)
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:import namespace="http://example.com/types"/>
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        )
+        .unwrap();
+        assert!(schema.elements.contains_key("root"));
+    }
+
+    #[test]
+    fn test_import_cycle_detection() {
+        let resolver = make_resolver(vec![
+            (
+                "a.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="http://example.com/a">
+                    <xs:import namespace="http://example.com/b" schemaLocation="b.xsd"/>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:schema>"#,
+            ),
+            (
+                "b.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="http://example.com/b">
+                    <xs:import namespace="http://example.com/a" schemaLocation="a.xsd"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/main">
+                <xs:import namespace="http://example.com/a" schemaLocation="a.xsd"/>
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema.elements.contains_key("root"));
+        assert!(schema
+            .imported_namespaces
+            .contains_key("http://example.com/a"));
+    }
+
+    #[test]
+    fn test_import_multiple_namespaces() {
+        let resolver = make_resolver(vec![
+            (
+                "types.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="http://example.com/types">
+                    <xs:complexType name="NameType"><xs:sequence>
+                        <xs:element name="first" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+            (
+                "addr.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="http://example.com/addr">
+                    <xs:complexType name="AddrType"><xs:sequence>
+                        <xs:element name="city" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:t="http://example.com/types"
+                        xmlns:a="http://example.com/addr">
+                <xs:import namespace="http://example.com/types" schemaLocation="types.xsd"/>
+                <xs:import namespace="http://example.com/addr" schemaLocation="addr.xsd"/>
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema
+            .imported_namespaces
+            .contains_key("http://example.com/types"));
+        assert!(schema
+            .imported_namespaces
+            .contains_key("http://example.com/addr"));
+        assert!(schema.imported_namespaces["http://example.com/types"]
+            .types
+            .contains_key("NameType"));
+        assert!(schema.imported_namespaces["http://example.com/addr"]
+            .types
+            .contains_key("AddrType"));
+    }
+
+    #[test]
+    fn test_import_and_include_combined() {
+        let resolver = make_resolver(vec![
+            (
+                "local_types.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="LocalType"><xs:sequence>
+                        <xs:element name="value" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+            (
+                "foreign.xsd",
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="http://foreign.com">
+                    <xs:complexType name="ForeignType"><xs:sequence>
+                        <xs:element name="data" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:schema>"#,
+            ),
+        ]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:f="http://foreign.com">
+                <xs:include schemaLocation="local_types.xsd"/>
+                <xs:import namespace="http://foreign.com" schemaLocation="foreign.xsd"/>
+                <xs:element name="root" type="LocalType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+        assert!(schema.types.contains_key("LocalType"));
+        assert!(schema
+            .imported_namespaces
+            .contains_key("http://foreign.com"));
+        assert!(schema.imported_namespaces["http://foreign.com"]
+            .types
+            .contains_key("ForeignType"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Namespace-aware validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_with_imported_types() {
+        // End-to-end: parse multi-schema, validate document
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/types">
+                <xs:complexType name="AddressType"><xs:sequence>
+                    <xs:element name="street" type="xs:string"/>
+                    <xs:element name="city" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:tns="http://example.com/types">
+                <xs:import namespace="http://example.com/types" schemaLocation="types.xsd"/>
+                <xs:element name="address" type="tns:AddressType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(
+            "<address><street>123 Main</street><city>Springfield</city></address>",
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_validate_imported_content_model() {
+        // Validate that child elements typed from imported schemas validate
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/types">
+                <xs:complexType name="NameType"><xs:sequence>
+                    <xs:element name="first" type="xs:string"/>
+                    <xs:element name="last" type="xs:string"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:t="http://example.com/types">
+                <xs:import namespace="http://example.com/types" schemaLocation="types.xsd"/>
+                <xs:element name="person"><xs:complexType><xs:sequence>
+                    <xs:element name="name" type="t:NameType"/>
+                    <xs:element name="age" type="xs:integer"/>
+                </xs:sequence></xs:complexType></xs:element>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+
+        // Valid document
+        let doc = Document::parse_str(
+            "<person><name><first>John</first><last>Doe</last></name><age>30</age></person>",
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        // Invalid document: wrong child element in imported type
+        let doc = Document::parse_str(
+            "<person><name><wrong>X</wrong><last>Doe</last></name><age>30</age></person>",
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(!result.is_valid);
+    }
+
+    #[test]
+    fn test_validate_included_type_validation() {
+        // Validate that included types work in validation too
+        let resolver = make_resolver(vec![(
+            "types.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="ItemType"><xs:sequence>
+                    <xs:element name="name" type="xs:string"/>
+                    <xs:element name="qty" type="xs:integer"/>
+                </xs:sequence></xs:complexType>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:include schemaLocation="types.xsd"/>
+                <xs:element name="item" type="ItemType"/>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<item><name>Widget</name><qty>5</qty></item>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 }

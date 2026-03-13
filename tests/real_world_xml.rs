@@ -566,3 +566,165 @@ fn test_configuration_xml() {
     assert!(output.contains("connectionString"));
     assert!(output.contains("system.web"));
 }
+
+// --- Multi-file XSD with imports (UBL-like pattern, issue #3) ---
+
+#[test]
+fn test_xsd_import_include_ubl_like_pattern() {
+    use std::collections::HashMap;
+    use xmloxide::validation::xsd::{parse_xsd_with_options, validate_xsd, XsdParseOptions};
+
+    // Simulate UBL 2.4 structure:
+    //   maindoc/UBL-Order-2.4.xsd  (targetNamespace = urn:oasis:names:...:Order-2)
+    //     imports common/UBL-CommonBasicComponents-2.4.xsd (ns: urn:...:CommonBasicComponents-2)
+    //       includes common/UBL-UnqualifiedDataTypes-2.4.xsd (same ns, chameleon)
+
+    let unqualified_types_xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:simpleType name="QuantityType">
+            <xs:restriction base="xs:decimal"/>
+        </xs:simpleType>
+        <xs:simpleType name="AmountType">
+            <xs:restriction base="xs:decimal"/>
+        </xs:simpleType>
+    </xs:schema>"#;
+
+    let common_basic_xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                targetNamespace="urn:oasis:names:tc:ubl:CommonBasicComponents-2">
+        <xs:include schemaLocation="UBL-UnqualifiedDataTypes-2.4.xsd"/>
+        <xs:complexType name="NameType">
+            <xs:sequence>
+                <xs:element name="value" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="ItemType">
+            <xs:sequence>
+                <xs:element name="name" type="xs:string"/>
+                <xs:element name="quantity" type="xs:integer"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:schema>"#;
+
+    let main_order_xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                xmlns:cbc="urn:oasis:names:tc:ubl:CommonBasicComponents-2"
+                targetNamespace="urn:oasis:names:tc:ubl:Order-2">
+        <xs:import namespace="urn:oasis:names:tc:ubl:CommonBasicComponents-2"
+                   schemaLocation="UBL-CommonBasicComponents-2.4.xsd"/>
+        <xs:element name="Order">
+            <xs:complexType>
+                <xs:sequence>
+                    <xs:element name="ID" type="xs:string"/>
+                    <xs:element name="Item" type="cbc:ItemType"/>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:element>
+    </xs:schema>"#;
+
+    // Build a resolver that simulates filesystem access
+    let schemas: HashMap<String, String> = [
+        (
+            "UBL-CommonBasicComponents-2.4.xsd".to_string(),
+            common_basic_xsd.to_string(),
+        ),
+        (
+            "UBL-UnqualifiedDataTypes-2.4.xsd".to_string(),
+            unqualified_types_xsd.to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let resolver = move |location: &str, _base: Option<&str>| schemas.get(location).cloned();
+
+    let opts = XsdParseOptions {
+        resolver: Some(&resolver),
+        base_uri: None,
+    };
+
+    // Parse the main schema (follows imports and includes)
+    let schema = parse_xsd_with_options(main_order_xsd, &opts).unwrap();
+
+    // Validate a valid document
+    let xml =
+        "<Order><ID>ORD-001</ID><Item><name>Widget</name><quantity>10</quantity></Item></Order>";
+    let doc = Document::parse_str(xml).unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(
+        result.is_valid,
+        "expected valid, errors: {:?}",
+        result.errors
+    );
+
+    // Validate an invalid document (wrong child elements)
+    let bad_xml = "<Order><ID>ORD-002</ID><Item><wrong>X</wrong></Item></Order>";
+    let bad_doc = Document::parse_str(bad_xml).unwrap();
+    let bad_result = validate_xsd(&bad_doc, &schema);
+    assert!(
+        !bad_result.is_valid,
+        "expected invalid for wrong child elements"
+    );
+}
+
+#[test]
+fn test_xsd_import_with_catalog_resolution() {
+    use xmloxide::catalog::{Catalog, CatalogEntry};
+    use xmloxide::validation::xsd::{parse_xsd_with_options, validate_xsd, XsdParseOptions};
+
+    // Simulate: catalog maps namespace URIs to local schema files
+    let mut catalog = Catalog::new();
+    catalog.add_entry(CatalogEntry::Uri {
+        name: "http://example.com/types".to_string(),
+        uri: "schemas/types.xsd".to_string(),
+    });
+
+    // Schema files keyed by their resolved paths
+    let types_xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                targetNamespace="http://example.com/types">
+        <xs:complexType name="PersonType">
+            <xs:sequence>
+                <xs:element name="name" type="xs:string"/>
+                <xs:element name="email" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:schema>"#;
+
+    // Resolver that uses catalog to map namespace URIs, and has file content
+    let resolver = move |location: &str, _base: Option<&str>| -> Option<String> {
+        if location == "schemas/types.xsd" {
+            return Some(types_xsd.to_string());
+        }
+        // Try catalog resolution (maps namespace URI -> local path)
+        let resolved = catalog.resolve_uri(location)?;
+        if resolved == "schemas/types.xsd" {
+            Some(types_xsd.to_string())
+        } else {
+            None
+        }
+    };
+
+    let main_xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                xmlns:t="http://example.com/types">
+        <xs:import namespace="http://example.com/types" schemaLocation="schemas/types.xsd"/>
+        <xs:element name="directory">
+            <xs:complexType>
+                <xs:sequence>
+                    <xs:element name="person" type="t:PersonType" maxOccurs="unbounded"/>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:element>
+    </xs:schema>"#;
+
+    let opts = XsdParseOptions {
+        resolver: Some(&resolver),
+        base_uri: None,
+    };
+
+    let schema = parse_xsd_with_options(main_xsd, &opts).unwrap();
+
+    let xml = "<directory>\
+        <person><name>Alice</name><email>alice@example.com</email></person>\
+        <person><name>Bob</name><email>bob@example.com</email></person>\
+    </directory>";
+    let doc = Document::parse_str(xml).unwrap();
+    let result = validate_xsd(&doc, &schema);
+    assert!(result.is_valid, "errors: {:?}", result.errors);
+}
