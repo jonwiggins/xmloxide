@@ -444,14 +444,18 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         self.advance_while(is_name_char);
 
-        // Check for QName (prefix:localname) -- but not prefix::axis
-        if self.peek_byte() == Some(b':')
-            && self
-                .peek_byte_at(self.pos + 1)
-                .is_some_and(|b| b != b':' && is_name_start_char(b))
-        {
-            self.advance(); // consume ':'
-            self.advance_while(is_name_char);
+        // Check for QName (prefix:localname) or prefix:* -- but not prefix::axis
+        if self.peek_byte() == Some(b':') {
+            let next = self.peek_byte_at(self.pos + 1);
+            if next.is_some_and(|b| b != b':' && is_name_start_char(b)) {
+                // prefix:localname
+                self.advance(); // consume ':'
+                self.advance_while(is_name_char);
+            } else if next == Some(b'*') {
+                // prefix:* (namespace wildcard)
+                self.advance(); // consume ':'
+                self.advance(); // consume '*'
+            }
         }
 
         let name = self.slice_from(start);

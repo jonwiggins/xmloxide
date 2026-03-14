@@ -615,9 +615,10 @@ fn validate_pattern_refs(
     let mut warnings = Vec::new();
 
     let root = doc.root();
+    let ns = &schema.namespaces;
 
     // Evaluate schema-level variables at the document root
-    let schema_vars = eval_variables(doc, root, &schema.variables, &HashMap::new());
+    let schema_vars = eval_variables(doc, root, &schema.variables, &HashMap::new(), ns);
 
     for pattern in patterns {
         // Per-pattern fired_nodes tracking (firing rule semantics)
@@ -625,22 +626,26 @@ fn validate_pattern_refs(
 
         // Evaluate pattern-level variables
         let mut pattern_vars = schema_vars.clone();
-        let extra = eval_variables(doc, root, &pattern.variables, &pattern_vars);
+        let extra = eval_variables(doc, root, &pattern.variables, &pattern_vars, ns);
         pattern_vars.extend(extra);
 
         for rule in &pattern.rules {
             // Evaluate the context XPath to find matching nodes
-            let context_nodes = match eval_context_xpath(doc, root, &rule.context, &pattern_vars) {
-                Ok(nodes) => nodes,
-                Err(e) => {
-                    errors.push(ValidationError {
-                        message: format!("XPath error in rule context '{}': {}", rule.context, e),
-                        line: None,
-                        column: None,
-                    });
-                    continue;
-                }
-            };
+            let context_nodes =
+                match eval_context_xpath(doc, root, &rule.context, &pattern_vars, ns) {
+                    Ok(nodes) => nodes,
+                    Err(e) => {
+                        errors.push(ValidationError {
+                            message: format!(
+                                "XPath error in rule context '{}': {}",
+                                rule.context, e
+                            ),
+                            line: None,
+                            column: None,
+                        });
+                        continue;
+                    }
+                };
 
             for &node in &context_nodes {
                 // Firing rule: skip nodes already fired in this pattern
@@ -651,16 +656,17 @@ fn validate_pattern_refs(
 
                 // Evaluate rule-level variables at this context node
                 let mut rule_vars = pattern_vars.clone();
-                let extra = eval_variables(doc, node, &rule.variables, &rule_vars);
+                let extra = eval_variables(doc, node, &rule.variables, &rule_vars, ns);
                 rule_vars.extend(extra);
 
                 for check in &rule.checks {
                     match check {
                         SchematronCheck::Assert { test, message } => {
-                            match eval_test(doc, node, test, &rule_vars) {
+                            match eval_test(doc, node, test, &rule_vars, ns) {
                                 Ok(true) => {} // assertion satisfied
                                 Ok(false) => {
-                                    let msg = interpolate_message(doc, node, message, &rule_vars);
+                                    let msg =
+                                        interpolate_message(doc, node, message, &rule_vars, ns);
                                     errors.push(ValidationError {
                                         message: msg,
                                         line: None,
@@ -679,9 +685,10 @@ fn validate_pattern_refs(
                             }
                         }
                         SchematronCheck::Report { test, message } => {
-                            match eval_test(doc, node, test, &rule_vars) {
+                            match eval_test(doc, node, test, &rule_vars, ns) {
                                 Ok(true) => {
-                                    let msg = interpolate_message(doc, node, message, &rule_vars);
+                                    let msg =
+                                        interpolate_message(doc, node, message, &rule_vars, ns);
                                     warnings.push(ValidationError {
                                         message: msg,
                                         line: None,
@@ -713,18 +720,33 @@ fn validate_pattern_refs(
     }
 }
 
+/// Creates an `XPathContext` with variables and namespace bindings.
+fn make_xpath_context<'a>(
+    doc: &'a Document,
+    node: NodeId,
+    variables: &HashMap<String, XPathValue>,
+    ns_bindings: &[NamespaceBinding],
+) -> XPathContext<'a> {
+    let mut ctx = XPathContext::new(doc, node);
+    for (name, value) in variables {
+        ctx.set_variable(name, value.clone());
+    }
+    for ns in ns_bindings {
+        ctx.set_namespace(&ns.prefix, &ns.uri);
+    }
+    ctx
+}
+
 /// Evaluates an `XPath` context expression and returns the matching nodes.
 fn eval_context_xpath(
     doc: &Document,
     root: NodeId,
     xpath_expr: &str,
     variables: &HashMap<String, XPathValue>,
+    ns_bindings: &[NamespaceBinding],
 ) -> Result<Vec<NodeId>, XPathError> {
     let expr = xpath::parser::parse(xpath_expr)?;
-    let mut ctx = XPathContext::new(doc, root);
-    for (name, value) in variables {
-        ctx.set_variable(name, value.clone());
-    }
+    let ctx = make_xpath_context(doc, root, variables, ns_bindings);
     let result = ctx.evaluate(&expr)?;
     match result {
         XPathValue::NodeSet(nodes) => Ok(nodes),
@@ -738,12 +760,10 @@ fn eval_test(
     node: NodeId,
     test_expr: &str,
     variables: &HashMap<String, XPathValue>,
+    ns_bindings: &[NamespaceBinding],
 ) -> Result<bool, XPathError> {
     let expr = xpath::parser::parse(test_expr)?;
-    let mut ctx = XPathContext::new(doc, node);
-    for (name, value) in variables {
-        ctx.set_variable(name, value.clone());
-    }
+    let ctx = make_xpath_context(doc, node, variables, ns_bindings);
     let result = ctx.evaluate(&expr)?;
     Ok(result.to_boolean())
 }
@@ -754,6 +774,7 @@ fn eval_variables(
     context_node: NodeId,
     bindings: &[LetBinding],
     existing: &HashMap<String, XPathValue>,
+    ns_bindings: &[NamespaceBinding],
 ) -> HashMap<String, XPathValue> {
     let mut result = HashMap::new();
     // Accumulate so later bindings can reference earlier ones
@@ -762,10 +783,7 @@ fn eval_variables(
     for binding in bindings {
         // Try to evaluate as XPath; fall back to string literal
         let value = if let Ok(expr) = xpath::parser::parse(&binding.value) {
-            let mut ctx = XPathContext::new(doc, context_node);
-            for (name, val) in &combined {
-                ctx.set_variable(name, val.clone());
-            }
+            let ctx = make_xpath_context(doc, context_node, &combined, ns_bindings);
             ctx.evaluate(&expr)
                 .unwrap_or_else(|_| XPathValue::String(binding.value.clone()))
         } else {
@@ -785,6 +803,7 @@ fn interpolate_message(
     node: NodeId,
     parts: &[MessagePart],
     variables: &HashMap<String, XPathValue>,
+    ns_bindings: &[NamespaceBinding],
 ) -> String {
     let mut result = String::new();
     for part in parts {
@@ -792,10 +811,7 @@ fn interpolate_message(
             MessagePart::Text(text) => result.push_str(text),
             MessagePart::ValueOf { select } => {
                 if let Ok(expr) = xpath::parser::parse(select) {
-                    let mut ctx = XPathContext::new(doc, node);
-                    for (name, val) in variables {
-                        ctx.set_variable(name, val.clone());
-                    }
+                    let ctx = make_xpath_context(doc, node, variables, ns_bindings);
                     if let Ok(val) = ctx.evaluate(&expr) {
                         result.push_str(&xpath_value_to_string(doc, &val));
                     }
@@ -1569,6 +1585,70 @@ mod tests {
             r#"<order expected="99"><item price="10"/><item price="20"/></order>"#,
         )
         .unwrap();
+        let result = validate_schematron(&doc_fail, &schema);
+        assert!(!result.is_valid);
+    }
+
+    // ===================================================================
+    // Namespace-prefixed XPath tests
+    // ===================================================================
+
+    #[test]
+    fn test_namespace_prefixed_xpath() {
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <ns prefix="inv" uri="urn:example:invoice"/>
+              <pattern>
+                <rule context="/inv:invoice">
+                  <assert test="inv:customer">Invoice must have a customer</assert>
+                </rule>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+
+        // Document with namespace
+        let doc_pass = Document::parse_str(
+            r#"<invoice xmlns="urn:example:invoice"><customer>Acme</customer></invoice>"#,
+        )
+        .unwrap();
+        let result = validate_schematron(&doc_pass, &schema);
+        assert!(
+            result.is_valid,
+            "namespace-prefixed XPath should match: {:?}",
+            result.errors
+        );
+
+        // Document with namespace but missing customer
+        let doc_fail = Document::parse_str(r#"<invoice xmlns="urn:example:invoice"/>"#).unwrap();
+        let result = validate_schematron(&doc_fail, &schema);
+        assert!(!result.is_valid);
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn test_namespace_prefix_wildcard() {
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <ns prefix="inv" uri="urn:example:invoice"/>
+              <pattern>
+                <rule context="/inv:*">
+                  <assert test="@id">Root element must have an id</assert>
+                </rule>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(r#"<invoice xmlns="urn:example:invoice" id="1"/>"#).unwrap();
+        let result = validate_schematron(&doc, &schema);
+        assert!(result.is_valid);
+
+        let doc_fail = Document::parse_str(r#"<invoice xmlns="urn:example:invoice"/>"#).unwrap();
         let result = validate_schematron(&doc_fail, &schema);
         assert!(!result.is_valid);
     }

@@ -59,6 +59,13 @@ pub struct XPathContext<'a> {
     context_size: usize,
     /// Variable bindings available during evaluation.
     variables: HashMap<String, XPathValue>,
+    /// Namespace prefix → URI bindings for resolving prefixed name tests.
+    ///
+    /// When set (e.g., via Schematron `<sch:ns>` bindings), prefixed names
+    /// like `inv:invoice` in `XPath` expressions are matched by resolving
+    /// the prefix to a URI and comparing against the element's namespace URI
+    /// and local name.
+    namespaces: HashMap<String, String>,
     /// Attribute string values for nodes returned by attribute axis steps.
     ///
     /// When a location path ends with an attribute axis (e.g., `item/@amount`),
@@ -88,8 +95,22 @@ impl<'a> XPathContext<'a> {
             context_position: 1,
             context_size: 1,
             variables: HashMap::new(),
+            namespaces: HashMap::new(),
             attr_string_values: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Registers a namespace prefix → URI binding for name resolution.
+    ///
+    /// When evaluating `XPath` expressions containing prefixed name tests
+    /// (e.g., `//inv:invoice`), the prefix is resolved to a URI using these
+    /// bindings, and the element's namespace URI and local name are compared
+    /// instead of the raw `QName` string.
+    ///
+    /// This is used by Schematron validation to pass `<sch:ns>` bindings
+    /// to the `XPath` evaluator.
+    pub fn set_namespace(&mut self, prefix: &str, uri: &str) {
+        self.namespaces.insert(prefix.to_owned(), uri.to_owned());
     }
 
     /// Binds a variable name to a value in this context.
@@ -413,56 +434,62 @@ impl<'a> XPathContext<'a> {
         // check to avoid per-node function call overhead through
         // node_matches_test. This is the hottest path for queries like
         // //entry/title or /root/child.
+        //
+        // Only use the fast path when no namespace bindings are registered,
+        // because namespace-aware matching needs the full matches_element_name
+        // logic.
         if let NodeTest::Name(name) = test {
-            match axis {
-                Axis::Child => {
-                    for child in self.doc.children(node) {
-                        if let NodeKind::Element {
-                            name: elem_name, ..
-                        } = &self.doc.node(child).kind
-                        {
-                            if elem_name == name {
-                                result.push(child);
+            if self.namespaces.is_empty() {
+                match axis {
+                    Axis::Child => {
+                        for child in self.doc.children(node) {
+                            if let NodeKind::Element {
+                                name: elem_name, ..
+                            } = &self.doc.node(child).kind
+                            {
+                                if elem_name == name {
+                                    result.push(child);
+                                }
                             }
                         }
+                        return;
                     }
-                    return;
-                }
-                Axis::Descendant => {
-                    for desc in self.doc.descendants(node) {
-                        if let NodeKind::Element {
-                            name: elem_name, ..
-                        } = &self.doc.node(desc).kind
-                        {
-                            if elem_name == name {
-                                result.push(desc);
+                    Axis::Descendant => {
+                        for desc in self.doc.descendants(node) {
+                            if let NodeKind::Element {
+                                name: elem_name, ..
+                            } = &self.doc.node(desc).kind
+                            {
+                                if elem_name == name {
+                                    result.push(desc);
+                                }
                             }
                         }
+                        return;
                     }
-                    return;
-                }
-                Axis::DescendantOrSelf => {
-                    if let NodeKind::Element {
-                        name: elem_name, ..
-                    } = &self.doc.node(node).kind
-                    {
-                        if elem_name == name {
-                            result.push(node);
-                        }
-                    }
-                    for desc in self.doc.descendants(node) {
+                    Axis::DescendantOrSelf => {
                         if let NodeKind::Element {
                             name: elem_name, ..
-                        } = &self.doc.node(desc).kind
+                        } = &self.doc.node(node).kind
                         {
                             if elem_name == name {
-                                result.push(desc);
+                                result.push(node);
                             }
                         }
+                        for desc in self.doc.descendants(node) {
+                            if let NodeKind::Element {
+                                name: elem_name, ..
+                            } = &self.doc.node(desc).kind
+                            {
+                                if elem_name == name {
+                                    result.push(desc);
+                                }
+                            }
+                        }
+                        return;
                     }
-                    return;
+                    _ => {} // fall through to generic path
                 }
-                _ => {} // fall through to generic path
             }
         }
 
@@ -709,15 +736,46 @@ impl<'a> XPathContext<'a> {
     // Node test filtering
     // -----------------------------------------------------------------------
 
+    /// Tests whether a name test matches an element, accounting for namespace
+    /// prefix bindings when available.
+    ///
+    /// When the name contains a colon and namespace bindings are registered,
+    /// splits the name into prefix + local, resolves the prefix to a URI,
+    /// and compares against the element's namespace URI and local name.
+    /// Otherwise, falls back to direct string comparison.
+    #[inline]
+    fn matches_element_name(&self, name: &str, elem: &NodeKind) -> bool {
+        if let NodeKind::Element {
+            name: elem_name,
+            namespace,
+            ..
+        } = elem
+        {
+            // If the XPath name has a prefix and we have namespace bindings,
+            // do namespace-aware matching.
+            if let Some(colon_pos) = name.find(':') {
+                if !self.namespaces.is_empty() {
+                    let prefix = &name[..colon_pos];
+                    let local = &name[colon_pos + 1..];
+                    if let Some(uri) = self.namespaces.get(prefix) {
+                        return namespace.as_deref() == Some(uri.as_str()) && elem_name == local;
+                    }
+                }
+            }
+            // Default: direct string comparison (matches existing behavior)
+            elem_name == name
+        } else {
+            false
+        }
+    }
+
     /// Checks whether a single node matches a node test for a given axis.
     #[inline]
     fn node_matches_test(&self, id: NodeId, test: &NodeTest, axis: Axis) -> bool {
         let node = self.doc.node(id);
         match test {
             NodeTest::Name(name) => match &node.kind {
-                NodeKind::Element {
-                    name: elem_name, ..
-                } => elem_name == name,
+                kind @ NodeKind::Element { .. } => self.matches_element_name(name, kind),
                 NodeKind::ProcessingInstruction { target, .. }
                     if axis == Axis::Child
                         || axis == Axis::Descendant
@@ -734,8 +792,18 @@ impl<'a> XPathContext<'a> {
             }
             NodeTest::PrefixWildcard(prefix) => match &node.kind {
                 NodeKind::Element {
-                    prefix: Some(p), ..
-                } => p == prefix,
+                    namespace,
+                    prefix: elem_prefix,
+                    ..
+                } => {
+                    // If we have namespace bindings, resolve the prefix to a URI
+                    // and match against the element's namespace.
+                    if let Some(uri) = self.namespaces.get(prefix.as_str()) {
+                        namespace.as_deref() == Some(uri.as_str())
+                    } else {
+                        elem_prefix.as_deref() == Some(prefix.as_str())
+                    }
+                }
                 _ => false,
             },
             NodeTest::Node => true,
@@ -908,6 +976,7 @@ impl<'a> XPathContext<'a> {
                 } else {
                     self.variables.clone()
                 },
+                namespaces: self.namespaces.clone(),
                 attr_string_values: RefCell::new(HashMap::new()),
             };
             let val = ctx.eval_expr(predicate)?;
