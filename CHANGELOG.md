@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Namespace-aware type resolution via `QName` prefix maps — imported types like
     `tns:AddressType` resolve correctly through `imported_namespaces`
   - Existing `parse_xsd()` unchanged (backward compatible, silently ignores import/include)
-- 23 new tests (21 unit + 2 integration) covering include merging, chameleon includes,
+- **`xsd:element ref` support** — element references (`ref="cbc:ID"`) resolve to global
+  element declarations in local or imported schemas, enabling real-world UBL 2.4 validation
+- 26 new tests (24 unit + 2 integration) covering include merging, chameleon includes,
   import cross-namespace resolution, cycle detection, transitive includes, namespace
-  mismatch errors, and UBL-like multi-schema validation patterns
+  mismatch errors, element refs, and UBL-like multi-schema validation patterns
+- UBL 2.4 `BusinessCard` schema integration test: parses 15-file schema graph and
+  validates the official OASIS example document with zero errors
 
 ## [0.3.1] - 2026-03-06
 

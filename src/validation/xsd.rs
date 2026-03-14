@@ -154,6 +154,11 @@ pub struct XsdElement {
     type_ref: Option<String>,
     /// An inline anonymous type definition.
     inline_type: Option<XsdType>,
+    /// Reference to a global element declaration (`ref` attribute `QName`).
+    ///
+    /// When present, the element's type is resolved from the referenced
+    /// global element declaration rather than from `type_ref` or `inline_type`.
+    element_ref: Option<String>,
     /// Minimum number of occurrences (default 1 for local elements).
     min_occurs: u32,
     /// Maximum number of occurrences (default 1 for local elements).
@@ -792,9 +797,12 @@ fn register_builtin_types(schema: &mut XsdSchema) {
 }
 
 /// Parses an `<xs:element>` declaration.
+///
+/// Handles both named declarations (`name="foo" type="xs:string"`) and
+/// element references (`ref="cbc:ID"`). For references, the `ref` `QName`
+/// is stored in `element_ref` and the local name is used as the element
+/// name for matching.
 fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
-    let name = doc.attribute(node, "name")?.to_string();
-    let type_ref = doc.attribute(node, "type").map(strip_xs_prefix);
     let min_occurs = doc
         .attribute(node, "minOccurs")
         .and_then(|v| v.parse::<u32>().ok())
@@ -808,11 +816,32 @@ fn parse_element_decl(doc: &Document, node: NodeId) -> Option<XsdElement> {
                 MaxOccurs::Bounded(v.parse::<u32>().unwrap_or(1))
             }
         });
+
+    // Handle ref="prefix:name" — reference to a global element declaration
+    if let Some(ref_qname) = doc.attribute(node, "ref") {
+        let local_name = if let Some((_prefix, local)) = ref_qname.split_once(':') {
+            local.to_string()
+        } else {
+            ref_qname.to_string()
+        };
+        return Some(XsdElement {
+            name: local_name,
+            type_ref: None,
+            inline_type: None,
+            element_ref: Some(ref_qname.to_string()),
+            min_occurs,
+            max_occurs,
+        });
+    }
+
+    let name = doc.attribute(node, "name")?.to_string();
+    let type_ref = doc.attribute(node, "type").map(strip_xs_prefix);
     let inline_type = find_inline_type(doc, node);
     Some(XsdElement {
         name,
         type_ref,
         inline_type,
+        element_ref: None,
         min_occurs,
         max_occurs,
     })
@@ -1207,26 +1236,60 @@ fn validate_element(
 
 /// Resolves the type for an element declaration, checking both local types
 /// and imported namespaces for QName-prefixed type references.
+///
+/// For element references (`ref="cbc:ID"`), resolves the referenced global
+/// element declaration and returns its type.
 fn resolve_element_type<'a>(decl: &'a XsdElement, schema: &'a XsdSchema) -> Option<&'a XsdType> {
+    // Handle element ref — look up the referenced global element's type
+    if let Some(ref ref_qname) = decl.element_ref {
+        if let Some(ref_decl) = resolve_element_ref(ref_qname, schema) {
+            return resolve_element_type(ref_decl, schema);
+        }
+        return None;
+    }
     if let Some(ref inline) = decl.inline_type {
         return Some(inline);
     }
     if let Some(ref type_name) = decl.type_ref {
-        // Try local types first (handles unprefixed names and xs:-stripped names)
-        if let Some(t) = schema.types.get(type_name) {
-            return Some(t);
+        return resolve_type_name(type_name, schema);
+    }
+    None
+}
+
+/// Resolves a type by name, checking local types first, then imported namespaces.
+fn resolve_type_name<'a>(type_name: &str, schema: &'a XsdSchema) -> Option<&'a XsdType> {
+    // Try local types first (handles unprefixed names and xs:-stripped names)
+    if let Some(t) = schema.types.get(type_name) {
+        return Some(t);
+    }
+    // Try namespace-aware resolution for prefixed type references
+    let (ns, local) = resolve_type_qname(type_name, &schema.prefix_map);
+    if let Some(ref ns_uri) = ns {
+        if ns_uri == XSD_NAMESPACE {
+            // Built-in XSD type — look up by local name
+            return schema.types.get(&local);
         }
-        // Try namespace-aware resolution for prefixed type references
-        let (ns, local) = resolve_type_qname(type_name, &schema.prefix_map);
-        if let Some(ref ns_uri) = ns {
-            if ns_uri == XSD_NAMESPACE {
-                // Built-in XSD type — look up by local name
-                return schema.types.get(&local);
-            }
-            // Check imported namespaces
-            if let Some(imported) = schema.imported_namespaces.get(ns_uri) {
-                return imported.types.get(&local);
-            }
+        // Check imported namespaces
+        if let Some(imported) = schema.imported_namespaces.get(ns_uri) {
+            return imported.types.get(&local);
+        }
+    }
+    None
+}
+
+/// Resolves an element reference `QName` to its global element declaration.
+///
+/// Checks local elements first, then imported namespaces for prefixed refs.
+fn resolve_element_ref<'a>(ref_qname: &str, schema: &'a XsdSchema) -> Option<&'a XsdElement> {
+    // Unprefixed ref — look up in local elements
+    if !ref_qname.contains(':') {
+        return schema.elements.get(ref_qname);
+    }
+    // Prefixed ref — resolve namespace and look up in imported elements
+    let (ns, local) = resolve_type_qname(ref_qname, &schema.prefix_map);
+    if let Some(ref ns_uri) = ns {
+        if let Some(imported) = schema.imported_namespaces.get(ns_uri) {
+            return imported.elements.get(&local);
         }
     }
     None
@@ -3452,5 +3515,100 @@ mod tests {
         let doc = Document::parse_str("<item><name>Widget</name><qty>5</qty></item>").unwrap();
         let result = validate_xsd(&doc, &schema);
         assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    // -----------------------------------------------------------------------
+    // Element ref support tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_element_ref_local() {
+        // ref to a global element in the same schema
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="name" type="xs:string"/>
+                <xs:element name="person">
+                    <xs:complexType><xs:sequence>
+                        <xs:element ref="name"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<person><name>Alice</name></person>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_element_ref_imported() {
+        // ref to a global element in an imported namespace (UBL pattern)
+        let resolver = make_resolver(vec![(
+            "components.xsd",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/components">
+                <xs:element name="ID" type="xs:string"/>
+                <xs:element name="Name" type="xs:string"/>
+            </xs:schema>"#,
+        )]);
+        let opts = XsdParseOptions {
+            resolver: Some(&resolver),
+            base_uri: None,
+        };
+        let schema = parse_xsd_with_options(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xmlns:cbc="http://example.com/components">
+                <xs:import namespace="http://example.com/components"
+                           schemaLocation="components.xsd"/>
+                <xs:element name="Order">
+                    <xs:complexType><xs:sequence>
+                        <xs:element ref="cbc:ID"/>
+                        <xs:element ref="cbc:Name" minOccurs="0"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+            &opts,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<Order><ID>ORD-1</ID><Name>Test</Name></Order>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        // Valid without optional Name
+        let doc2 = Document::parse_str("<Order><ID>ORD-2</ID></Order>").unwrap();
+        let result2 = validate_xsd(&doc2, &schema);
+        assert!(result2.is_valid, "errors: {:?}", result2.errors);
+
+        // Invalid: wrong element
+        let doc3 = Document::parse_str("<Order><Wrong>X</Wrong></Order>").unwrap();
+        let result3 = validate_xsd(&doc3, &schema);
+        assert!(!result3.is_valid);
+    }
+
+    #[test]
+    fn test_element_ref_with_occurs() {
+        // ref with minOccurs/maxOccurs overrides
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="item" type="xs:string"/>
+                <xs:element name="list">
+                    <xs:complexType><xs:sequence>
+                        <xs:element ref="item" minOccurs="1" maxOccurs="unbounded"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<list><item>a</item><item>b</item></list>").unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        // Invalid: empty list (minOccurs=1)
+        let doc2 = Document::parse_str("<list/>").unwrap();
+        let result2 = validate_xsd(&doc2, &schema);
+        assert!(!result2.is_valid);
     }
 }

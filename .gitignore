@@ -18,6 +18,9 @@ tests/libxml2-compat/libxml2/
 # html5lib test suite (downloaded by scripts/download-html5lib-tests.sh)
 tests/html5lib-tests/
 
+# UBL 2.4 XSD schemas (downloaded for integration testing)
+tests/ubl-2.4/
+
 # Fuzz corpus, artifacts, and lock file
 fuzz/corpus/
 fuzz/artifacts/
