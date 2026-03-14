@@ -4,7 +4,7 @@
 
 **xmloxide** is a pure Rust reimplementation of libxml2 — the de facto standard XML/HTML parsing library in the open-source world. libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide is a memory-safe, high-performance replacement that passes the same conformance test suites.
 
-**Version:** 0.3.3
+**Version:** 0.3.4
 **License:** MIT
 **MSRV:** Rust 1.81+
 
@@ -13,7 +13,7 @@
 - Full conformance with W3C XML 1.0 (Fifth Edition) and Namespaces in XML 1.0
 - **1727/1727** W3C XML Conformance Test Suite tests passing (100%)
 - **119/119** libxml2 regression tests passing (100%)
-- Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0, XmlReader, push parser, DTD/RelaxNG/XSD validation, C14N, XInclude, XML Catalogs
+- Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0, XmlReader, push parser, DTD/RelaxNG/XSD/Schematron validation, C14N, XInclude, XML Catalogs
 - **WHATWG HTML5 parser** — full HTML Living Standard tokenizer (§13.2.5) and tree builder (§13.2.6) with 7032/7032 tokenizer tests + 1778/1778 tree construction tests passing (100% html5lib-tests)
 - Zero `unsafe` in public API surface (`unsafe_code = "deny"` in Cargo.toml)
 - No system dependencies — pure Rust (uses `encoding_rs` for character encoding)
@@ -85,7 +85,8 @@ src/
 │   ├── mod.rs          # ValidationResult, ValidationError
 │   ├── dtd.rs          # DTD parsing and validation (populates id_map)
 │   ├── relaxng.rs      # RelaxNG schema parsing and validation
-│   └── xsd.rs          # XML Schema (XSD) parsing and validation
+│   ├── xsd.rs          # XML Schema (XSD) parsing and validation
+│   └── schematron.rs   # ISO Schematron (ISO/IEC 19757-3) rule-based validation
 ├── serial/
 │   ├── mod.rs          # Serialization options and entry points
 │   ├── xml.rs          # XML serializer
@@ -279,6 +280,7 @@ cargo +nightly fuzz run fuzz_sax
 cargo +nightly fuzz run fuzz_reader
 cargo +nightly fuzz run fuzz_push
 cargo +nightly fuzz run fuzz_validation
+cargo +nightly fuzz run fuzz_schematron
 ```
 
 ---
@@ -356,7 +358,7 @@ Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, t
 
 | Suite | Location | Tests | Notes |
 |-------|----------|-------|-------|
-| Unit tests | `src/**/*.rs` (inline) | 848 | All modules |
+| Unit tests | `src/**/*.rs` (inline) | 991 | All modules |
 | W3C Conformance | `tests/conformance.rs` | 1727/1727 | Requires `download-conformance-suite.sh` |
 | libxml2 Compat | `tests/libxml2_compat.rs` | 119/119 | Requires `download-libxml2-tests.sh` |
 | html5lib Tokenizer | `tests/html5lib_tokenizer.rs` | 7032/7032 | Requires `download-html5lib-tests.sh` |
@@ -366,4 +368,5 @@ Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, t
 | Security/DoS | `tests/security.rs` | 15 | Billion laughs, deep nesting, etc. |
 | Entity resolver | `tests/entity_resolver.rs` | 14 | Entity expansion edge cases |
 | FFI | `tests/ffi_tests.rs` | 112 | C API surface tests (including SAX) |
-| Fuzz targets | `fuzz/` | 10 targets | XML, HTML, HTML5, XPath, roundtrip, SAX, reader, push, validation |
+| Schematron | `tests/schematron.rs` | 11 | PO schema, phases, firing rules, namespaces |
+| Fuzz targets | `fuzz/` | 11 targets | XML, HTML, HTML5, XPath, roundtrip, SAX, reader, push, validation, schematron |
