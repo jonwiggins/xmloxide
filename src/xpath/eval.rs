@@ -22,6 +22,7 @@
 //! All 27 core `XPath` 1.0 functions are implemented (node-set, string,
 //! boolean, and number function groups).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::ast::{Axis, BinaryOp, Expr, NodeTest, Step};
@@ -58,6 +59,13 @@ pub struct XPathContext<'a> {
     context_size: usize,
     /// Variable bindings available during evaluation.
     variables: HashMap<String, XPathValue>,
+    /// Attribute string values for nodes returned by attribute axis steps.
+    ///
+    /// When a location path ends with an attribute axis (e.g., `item/@amount`),
+    /// the element `NodeId` is returned in the node-set, but its string value
+    /// for `XPath` purposes should be the attribute value, not the element's
+    /// text content. This map provides that override.
+    attr_string_values: RefCell<HashMap<NodeId, String>>,
 }
 
 /// An `XPath` 1.0 value.
@@ -80,6 +88,7 @@ impl<'a> XPathContext<'a> {
             context_position: 1,
             context_size: 1,
             variables: HashMap::new(),
+            attr_string_values: RefCell::new(HashMap::new()),
         }
     }
 
@@ -208,27 +217,15 @@ impl<'a> XPathContext<'a> {
     // -----------------------------------------------------------------------
 
     fn eval_relative_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
-        // Special case: a single attribute axis step (e.g., `@id`) returns the
-        // attribute value as a string rather than a node-set, because attributes
-        // are not tree nodes in our arena.
-        if steps.len() == 1 && steps[0].axis == Axis::Attribute && steps[0].predicates.is_empty() {
-            return Ok(self.eval_attribute_access(self.context_node, &steps[0].node_test));
-        }
-
         let mut nodes = vec![self.context_node];
         let mut i = 0;
         while i < steps.len() {
             let step = &steps[i];
-            // If the last step is an attribute axis, resolve to attribute values
+            // If the last step is an attribute axis, collect attribute values
+            // into the attr_string_values map so that string_value() returns
+            // the attribute value rather than the element's text content.
             if i == steps.len() - 1 && step.axis == Axis::Attribute && step.predicates.is_empty() {
-                // For multiple context nodes, return the first attribute value found
-                for &node in &nodes {
-                    let val = self.eval_attribute_access(node, &step.node_test);
-                    if !matches!(&val, XPathValue::String(s) if s.is_empty()) {
-                        return Ok(val);
-                    }
-                }
-                return Ok(XPathValue::String(String::new()));
+                return Ok(self.collect_attribute_nodeset(&nodes, &step.node_test));
             }
             // Optimization: fuse descendant-or-self::node()/child::X into
             // descendant::X — avoids materializing the huge intermediate
@@ -242,6 +239,54 @@ impl<'a> XPathContext<'a> {
             }
         }
         Ok(XPathValue::NodeSet(nodes))
+    }
+
+    /// Collects attribute values from a set of element nodes, returning them
+    /// as a `NodeSet` (using element `NodeId`s) with `attr_string_values`
+    /// overrides so that `string_value()` returns the attribute value.
+    ///
+    /// This handles the fact that attributes are not tree nodes in our arena.
+    /// For a single matching attribute, returns the value as a `String` for
+    /// backwards compatibility with expressions like `@id` in string context.
+    fn collect_attribute_nodeset(&self, nodes: &[NodeId], test: &NodeTest) -> XPathValue {
+        let mut result_nodes = Vec::new();
+        let mut attr_map = self.attr_string_values.borrow_mut();
+
+        for &node in nodes {
+            let attrs = self.doc.attributes(node);
+            match test {
+                NodeTest::Name(name) => {
+                    if let Some(attr) = attrs.iter().find(|a| a.name == *name) {
+                        attr_map.insert(node, attr.value.clone());
+                        result_nodes.push(node);
+                    }
+                }
+                NodeTest::Wildcard | NodeTest::Node => {
+                    // For wildcard, return one entry per attribute
+                    // Since we map NodeId → String, we can only store one value
+                    // per element. Use the first attribute's value.
+                    if let Some(attr) = attrs.first() {
+                        attr_map.insert(node, attr.value.clone());
+                        result_nodes.push(node);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // For a single result, return as String for backwards compatibility
+        // with expressions like `@id` used in string context.
+        if result_nodes.len() == 1 {
+            if let Some(val) = attr_map.get(&result_nodes[0]) {
+                return XPathValue::String(val.clone());
+            }
+        }
+        // Empty result
+        if result_nodes.is_empty() {
+            return XPathValue::String(String::new());
+        }
+
+        XPathValue::NodeSet(result_nodes)
     }
 
     /// Tries to fuse `descendant-or-self::node()` + `child::X` at position `i`
@@ -270,30 +315,6 @@ impl<'a> XPathContext<'a> {
         }
     }
 
-    /// Evaluates an attribute access (e.g., `@id`) on a single element node.
-    ///
-    /// Returns the attribute value as a `String`, or an empty string if the
-    /// attribute does not exist. This handles the fact that attributes are not
-    /// tree nodes in our arena.
-    fn eval_attribute_access(&self, node: NodeId, test: &NodeTest) -> XPathValue {
-        let attrs = self.doc.attributes(node);
-        match test {
-            NodeTest::Name(name) => {
-                let val = attrs
-                    .iter()
-                    .find(|a| a.name == *name)
-                    .map_or_else(String::new, |a| a.value.clone());
-                XPathValue::String(val)
-            }
-            NodeTest::Wildcard | NodeTest::Node => {
-                // Return the value of the first attribute
-                let val = attrs.first().map_or_else(String::new, |a| a.value.clone());
-                XPathValue::String(val)
-            }
-            _ => XPathValue::String(String::new()),
-        }
-    }
-
     fn eval_root_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
         let root = self.doc.root();
         if steps.is_empty() {
@@ -302,13 +323,18 @@ impl<'a> XPathContext<'a> {
         let mut nodes = vec![root];
         let mut i = 0;
         while i < steps.len() {
+            let step = &steps[i];
+            // Handle final attribute axis step
+            if i == steps.len() - 1 && step.axis == Axis::Attribute && step.predicates.is_empty() {
+                return Ok(self.collect_attribute_nodeset(&nodes, &step.node_test));
+            }
             // Optimization: fuse descendant-or-self::node()/child::X into
             // descendant::X.
             if let Some(fused) = Self::try_fuse_descendant_child(steps, i) {
                 nodes = self.apply_step(&nodes, &fused)?;
                 i += 2;
             } else {
-                nodes = self.apply_step(&nodes, &steps[i])?;
+                nodes = self.apply_step(&nodes, step)?;
                 i += 1;
             }
         }
@@ -882,6 +908,7 @@ impl<'a> XPathContext<'a> {
                 } else {
                     self.variables.clone()
                 },
+                attr_string_values: RefCell::new(HashMap::new()),
             };
             let val = ctx.eval_expr(predicate)?;
             let keep = match &val {
@@ -1495,6 +1522,11 @@ impl<'a> XPathContext<'a> {
     /// - PI: the PI data
     /// - Attribute: would be the attribute value (handled separately)
     fn string_value(&self, node: NodeId) -> String {
+        // Check if this node has an attribute string value override
+        // (set when a location path ended with an attribute axis step).
+        if let Some(val) = self.attr_string_values.borrow().get(&node) {
+            return val.clone();
+        }
         let kind = &self.doc.node(node).kind;
         match kind {
             NodeKind::Document | NodeKind::Element { .. } => self.doc.text_content(node),
