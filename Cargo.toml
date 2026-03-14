@@ -1,6 +1,6 @@
 [package]
 name = "xmloxide"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.81"
 license = "MIT"
