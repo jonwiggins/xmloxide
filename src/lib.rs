@@ -15,7 +15,7 @@
 //! - [`sax`] — SAX2 event-driven streaming parser
 //! - [`reader`] — `XmlReader` pull-based parsing API
 //! - [`xpath`] — `XPath` 1.0 expression evaluation
-//! - [`validation`] — DTD, `RelaxNG`, and XML Schema (XSD) validation
+//! - [`validation`] — DTD, `RelaxNG`, XML Schema (XSD), and ISO Schematron validation
 //! - [`serial`] — XML/HTML serialization and Canonical XML (C14N)
 //! - [`encoding`] — Character encoding detection and conversion
 //! - [`xinclude`] — `XInclude` 1.0 document inclusion
