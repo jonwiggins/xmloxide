@@ -797,13 +797,29 @@ fn interpolate_message(
                         ctx.set_variable(name, val.clone());
                     }
                     if let Ok(val) = ctx.evaluate(&expr) {
-                        result.push_str(&val.to_xpath_string());
+                        result.push_str(&xpath_value_to_string(doc, &val));
                     }
                 }
             }
         }
     }
     result
+}
+
+/// Converts an `XPath` value to a string, computing string-value for
+/// node-sets using the document (unlike `to_xpath_string()` which returns
+/// empty for node-sets without document access).
+fn xpath_value_to_string(doc: &Document, val: &XPathValue) -> String {
+    match val {
+        XPathValue::NodeSet(nodes) => {
+            if let Some(&first) = nodes.first() {
+                doc.text_content(first)
+            } else {
+                String::new()
+            }
+        }
+        _ => val.to_xpath_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,6 +1538,39 @@ mod tests {
             "error should mention XPath: {}",
             result.errors[0].message
         );
+    }
+
+    #[test]
+    fn test_validate_sum_attribute_path() {
+        // Tests that sum(child/@attr) works correctly now that
+        // attribute paths return proper NodeSets.
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <pattern>
+                <rule context="/order">
+                  <let name="total" value="sum(item/@price)"/>
+                  <assert test="$total = @expected">Total <value-of select="$total"/> does not match expected <value-of select="@expected"/></assert>
+                </rule>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+
+        let doc_pass = Document::parse_str(
+            r#"<order expected="30"><item price="10"/><item price="20"/></order>"#,
+        )
+        .unwrap();
+        let result = validate_schematron(&doc_pass, &schema);
+        assert!(result.is_valid, "sum should equal 30: {:?}", result.errors);
+
+        let doc_fail = Document::parse_str(
+            r#"<order expected="99"><item price="10"/><item price="20"/></order>"#,
+        )
+        .unwrap();
+        let result = validate_schematron(&doc_fail, &schema);
+        assert!(!result.is_valid);
     }
 
     // ===================================================================

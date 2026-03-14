@@ -81,6 +81,10 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     schema: Option<String>,
 
+    /// Validate against an ISO Schematron schema file.
+    #[arg(long, value_name = "FILE")]
+    schematron: Option<String>,
+
     // -- XPath -------------------------------------------------------------
     /// Evaluate an XPath expression and print the result.
     #[allow(clippy::doc_markdown)]
@@ -214,6 +218,13 @@ fn process_file(cli: &Cli, filename: &str) -> u8 {
 
     if let Some(ref xsd_file) = cli.schema {
         let code = validate_xsd_file(filename, &doc, xsd_file);
+        if code > exit_code {
+            exit_code = code;
+        }
+    }
+
+    if let Some(ref sch_file) = cli.schematron {
+        let code = validate_schematron_file(filename, &doc, sch_file);
         if code > exit_code {
             exit_code = code;
         }
@@ -372,6 +383,28 @@ fn validate_xsd_file(filename: &str, doc: &Document, xsd_file: &str) -> u8 {
         }
         Err(e) => {
             eprintln!("{xsd_file}: failed to parse XML Schema: {e}");
+            EXIT_VALIDATION_ERROR
+        }
+    }
+}
+
+/// Validates a document against an ISO Schematron schema file (--schematron).
+fn validate_schematron_file(filename: &str, doc: &Document, sch_file: &str) -> u8 {
+    let schema_content = match fs::read_to_string(sch_file) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("{sch_file}: failed to read Schematron schema: {e}");
+            return EXIT_VALIDATION_ERROR;
+        }
+    };
+
+    match xmloxide::validation::schematron::parse_schematron(&schema_content) {
+        Ok(schema) => {
+            let result = xmloxide::validation::schematron::validate_schematron(doc, &schema);
+            print_validation_result(filename, &result)
+        }
+        Err(e) => {
+            eprintln!("{sch_file}: failed to parse Schematron schema: {e}");
             EXIT_VALIDATION_ERROR
         }
     }
