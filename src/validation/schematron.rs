@@ -102,6 +102,13 @@ pub struct LetBinding {
 pub struct SchematronPattern {
     /// Optional pattern identifier (used by phases to activate subsets).
     pub id: Option<String>,
+    /// Whether this is an abstract pattern (template for `is-a` instantiation).
+    pub is_abstract: bool,
+    /// Reference to an abstract pattern id (instantiates the abstract pattern
+    /// with parameter substitutions).
+    pub is_a: Option<String>,
+    /// Parameter bindings for `is-a` instantiation (`<sch:param>`).
+    pub params: Vec<(String, String)>,
     /// Pattern-level `<sch:let>` variable bindings.
     pub variables: Vec<LetBinding>,
     /// Rules within this pattern.
@@ -275,6 +282,9 @@ pub fn parse_schematron(schema_xml: &str) -> Result<SchematronSchema, Validation
         }
     }
 
+    // Resolve abstract pattern instantiations (is-a references)
+    let patterns = resolve_abstract_patterns(patterns);
+
     Ok(SchematronSchema {
         namespaces,
         variables,
@@ -282,6 +292,79 @@ pub fn parse_schematron(schema_xml: &str) -> Result<SchematronSchema, Validation
         phases,
         default_phase,
     })
+}
+
+/// Resolves `is-a` references by copying rules from abstract patterns
+/// and substituting `$param` placeholders in context and test expressions.
+fn resolve_abstract_patterns(patterns: Vec<SchematronPattern>) -> Vec<SchematronPattern> {
+    // Collect abstract patterns by id (cloned so we can move patterns below)
+    let abstract_map: HashMap<String, SchematronPattern> = patterns
+        .iter()
+        .filter(|p| p.is_abstract)
+        .filter_map(|p| p.id.as_ref().map(|id| (id.clone(), p.clone())))
+        .collect();
+
+    patterns
+        .into_iter()
+        .filter(|p| !p.is_abstract) // Exclude abstract patterns from validation
+        .map(|mut p| {
+            if let Some(ref abstract_id) = p.is_a {
+                if let Some(abstract_pat) = abstract_map.get(abstract_id) {
+                    // Copy rules from abstract pattern, substituting params
+                    p.rules = abstract_pat
+                        .rules
+                        .iter()
+                        .map(|rule| substitute_rule_params(rule, &p.params))
+                        .collect();
+                    // Also inherit variables from abstract pattern
+                    let mut combined_vars = abstract_pat.variables.clone();
+                    combined_vars.extend(p.variables.clone());
+                    p.variables = combined_vars;
+                }
+            }
+            p
+        })
+        .collect()
+}
+
+/// Substitutes `$param_name` placeholders in a rule's context and test
+/// expressions with the corresponding parameter values.
+fn substitute_rule_params(rule: &SchematronRule, params: &[(String, String)]) -> SchematronRule {
+    SchematronRule {
+        context: substitute_params(&rule.context, params),
+        variables: rule
+            .variables
+            .iter()
+            .map(|v| LetBinding {
+                name: v.name.clone(),
+                value: substitute_params(&v.value, params),
+            })
+            .collect(),
+        checks: rule
+            .checks
+            .iter()
+            .map(|check| match check {
+                SchematronCheck::Assert { test, message } => SchematronCheck::Assert {
+                    test: substitute_params(test, params),
+                    message: message.clone(),
+                },
+                SchematronCheck::Report { test, message } => SchematronCheck::Report {
+                    test: substitute_params(test, params),
+                    message: message.clone(),
+                },
+            })
+            .collect(),
+    }
+}
+
+/// Replaces `$name` placeholders in `text` with parameter values.
+fn substitute_params(text: &str, params: &[(String, String)]) -> String {
+    let mut result = text.to_string();
+    for (name, value) in params {
+        let placeholder = format!("${name}");
+        result = result.replace(&placeholder, value);
+    }
+    result
 }
 
 /// Namespace detection mode for parsing Schematron elements.
@@ -343,8 +426,11 @@ fn parse_pattern(
     node: NodeId,
 ) -> Result<SchematronPattern, ValidationError> {
     let id = doc.attribute(node, "id").map(String::from);
+    let is_abstract = doc.attribute(node, "abstract") == Some("true");
+    let is_a = doc.attribute(node, "is-a").map(String::from);
     let mut variables = Vec::new();
     let mut rules = Vec::new();
+    let mut params = Vec::new();
 
     for child in doc.children(node) {
         if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
@@ -367,12 +453,22 @@ fn parse_pattern(
             "rule" => {
                 rules.push(parse_rule(doc, ns_mode, child)?);
             }
+            "param" => {
+                if let (Some(pname), Some(pvalue)) =
+                    (doc.attribute(child, "name"), doc.attribute(child, "value"))
+                {
+                    params.push((pname.to_owned(), pvalue.to_owned()));
+                }
+            }
             _ => {}
         }
     }
 
     Ok(SchematronPattern {
         id,
+        is_abstract,
+        is_a,
+        params,
         variables,
         rules,
     })
@@ -1712,5 +1808,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(schema.patterns.len(), 1);
+    }
+
+    // ===================================================================
+    // Abstract pattern tests
+    // ===================================================================
+
+    #[test]
+    fn test_abstract_pattern_basic() {
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <pattern id="req_attr" abstract="true">
+                <rule context="$element">
+                  <assert test="@$attr">Element must have $attr attribute</assert>
+                </rule>
+              </pattern>
+              <pattern id="check_id" is-a="req_attr">
+                <param name="element" value="//item"/>
+                <param name="attr" value="id"/>
+              </pattern>
+              <pattern id="check_name" is-a="req_attr">
+                <param name="element" value="//item"/>
+                <param name="attr" value="name"/>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+
+        // Abstract pattern should be excluded, two concrete patterns remain
+        assert_eq!(schema.patterns.len(), 2);
+
+        // First pattern should have context "//item" and test "@id"
+        assert_eq!(schema.patterns[0].rules[0].context, "//item");
+        match &schema.patterns[0].rules[0].checks[0] {
+            SchematronCheck::Assert { test, .. } => assert_eq!(test, "@id"),
+            SchematronCheck::Report { .. } => panic!("expected assert"),
+        }
+
+        // Validate
+        let doc_pass = Document::parse_str(r#"<root><item id="1" name="x"/></root>"#).unwrap();
+        assert!(validate_schematron(&doc_pass, &schema).is_valid);
+
+        let doc_fail = Document::parse_str(r#"<root><item id="1"/></root>"#).unwrap();
+        let result = validate_schematron(&doc_fail, &schema);
+        assert!(!result.is_valid);
+        // Missing name attribute
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn test_abstract_pattern_multiple_rules() {
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <pattern id="has_content" abstract="true">
+                <rule context="$ctx">
+                  <assert test="string-length(normalize-space(.)) > 0">$ctx must not be empty</assert>
+                </rule>
+              </pattern>
+              <pattern is-a="has_content">
+                <param name="ctx" value="/doc/title"/>
+              </pattern>
+              <pattern is-a="has_content">
+                <param name="ctx" value="/doc/body"/>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+
+        let doc_pass =
+            Document::parse_str("<doc><title>Hi</title><body>Content</body></doc>").unwrap();
+        assert!(validate_schematron(&doc_pass, &schema).is_valid);
+
+        let doc_fail = Document::parse_str("<doc><title>Hi</title><body>  </body></doc>").unwrap();
+        assert!(!validate_schematron(&doc_fail, &schema).is_valid);
     }
 }
