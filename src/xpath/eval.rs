@@ -1104,6 +1104,22 @@ impl<'a> XPathContext<'a> {
 
             // XPath 2.0 / XSD functions commonly used in Schematron
             "matches" => self.fn_matches(args),
+            "replace" => self.fn_replace(args),
+            "tokenize" => self.fn_tokenize(args),
+
+            // XPath 2.0 string functions
+            "upper-case" => self.fn_upper_case(args),
+            "lower-case" => self.fn_lower_case(args),
+            "ends-with" => self.fn_ends_with(args),
+            "string-join" => self.fn_string_join(args),
+
+            // XPath 2.0 sequence/numeric functions
+            "empty" => self.fn_empty(args),
+            "exists" => self.fn_exists(args),
+            "abs" => self.fn_abs(args),
+            "min" => self.fn_min(args),
+            "max" => self.fn_max(args),
+            "reverse" => self.fn_reverse(args),
 
             _ => Err(XPathError::UndefinedFunction {
                 name: name.to_owned(),
@@ -1568,6 +1584,213 @@ impl<'a> XPathContext<'a> {
             Err(e) => Err(XPathError::InternalError {
                 message: format!("regex error in matches(): {e}"),
             }),
+        }
+    }
+
+    /// `replace(string, pattern, replacement)` or with flags.
+    ///
+    /// Replaces all matches of `pattern` in `string` with `replacement`.
+    /// See `XPath` 2.0 F&O section 7.6.3.
+    fn fn_replace(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        if args.len() < 3 || args.len() > 4 {
+            return Err(XPathError::InvalidArgCount {
+                function: "replace".to_owned(),
+                expected: 3,
+                found: args.len(),
+            });
+        }
+        let input = self.value_to_string(&self.eval_expr(&args[0])?);
+        let pattern = self.value_to_string(&self.eval_expr(&args[1])?);
+        let replacement = self.value_to_string(&self.eval_expr(&args[2])?);
+        let flags = if args.len() == 4 {
+            self.value_to_string(&self.eval_expr(&args[3])?)
+        } else {
+            String::new()
+        };
+        match super::regex::xpath_replace(&input, &pattern, &replacement, &flags) {
+            Ok(result) => Ok(XPathValue::String(result)),
+            Err(e) => Err(XPathError::InternalError {
+                message: format!("regex error in replace(): {e}"),
+            }),
+        }
+    }
+
+    /// `tokenize(string, pattern)` or with flags.
+    ///
+    /// Splits `string` on occurrences of `pattern`.
+    /// See `XPath` 2.0 F&O section 7.6.4.
+    fn fn_tokenize(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        if args.is_empty() || args.len() > 3 {
+            return Err(XPathError::InvalidArgCount {
+                function: "tokenize".to_owned(),
+                expected: 2,
+                found: args.len(),
+            });
+        }
+        let input = self.value_to_string(&self.eval_expr(&args[0])?);
+        let pattern = if args.len() >= 2 {
+            self.value_to_string(&self.eval_expr(&args[1])?)
+        } else {
+            r"\s+".to_string()
+        };
+        let flags = if args.len() == 3 {
+            self.value_to_string(&self.eval_expr(&args[2])?)
+        } else {
+            String::new()
+        };
+        match super::regex::xpath_tokenize(&input, &pattern, &flags) {
+            Ok(tokens) => {
+                // Return as a NodeSet-like structure. Since tokenize returns
+                // strings not nodes, return as a String (joining with space)
+                // for XPath 1.0 compatibility. In a full XPath 2.0 impl this
+                // would return a sequence of strings.
+                Ok(XPathValue::String(tokens.join(" ")))
+            }
+            Err(e) => Err(XPathError::InternalError {
+                message: format!("regex error in tokenize(): {e}"),
+            }),
+        }
+    }
+
+    // -- XPath 2.0 string functions -------------------------------------------
+
+    /// `upper-case(string)` — converts to uppercase.
+    fn fn_upper_case(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("upper-case", args, 1)?;
+        let s = self.value_to_string(&self.eval_expr(&args[0])?);
+        Ok(XPathValue::String(s.to_uppercase()))
+    }
+
+    /// `lower-case(string)` — converts to lowercase.
+    fn fn_lower_case(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("lower-case", args, 1)?;
+        let s = self.value_to_string(&self.eval_expr(&args[0])?);
+        Ok(XPathValue::String(s.to_lowercase()))
+    }
+
+    /// `ends-with(string, suffix)` — tests if string ends with suffix.
+    fn fn_ends_with(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("ends-with", args, 2)?;
+        let s = self.value_to_string(&self.eval_expr(&args[0])?);
+        let suffix = self.value_to_string(&self.eval_expr(&args[1])?);
+        Ok(XPathValue::Boolean(s.ends_with(&suffix)))
+    }
+
+    /// `string-join(sequence, separator)` — joins strings with a separator.
+    ///
+    /// In our `XPath` 1.0-based model, operates on a node-set by joining
+    /// each node's string value.
+    fn fn_string_join(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(XPathError::InvalidArgCount {
+                function: "string-join".to_owned(),
+                expected: 2,
+                found: args.len(),
+            });
+        }
+        let val = self.eval_expr(&args[0])?;
+        let sep = if args.len() == 2 {
+            self.value_to_string(&self.eval_expr(&args[1])?)
+        } else {
+            String::new()
+        };
+        match &val {
+            XPathValue::NodeSet(nodes) => {
+                let strings: Vec<String> = nodes.iter().map(|&n| self.string_value(n)).collect();
+                Ok(XPathValue::String(strings.join(&sep)))
+            }
+            XPathValue::String(s) => Ok(XPathValue::String(s.clone())),
+            other => Ok(XPathValue::String(other.to_xpath_string())),
+        }
+    }
+
+    // -- XPath 2.0 sequence/boolean functions ---------------------------------
+
+    /// `empty(sequence)` — returns true if the node-set is empty.
+    fn fn_empty(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("empty", args, 1)?;
+        let val = self.eval_expr(&args[0])?;
+        match &val {
+            XPathValue::NodeSet(ns) => Ok(XPathValue::Boolean(ns.is_empty())),
+            XPathValue::String(s) => Ok(XPathValue::Boolean(s.is_empty())),
+            _ => Ok(XPathValue::Boolean(false)),
+        }
+    }
+
+    /// `exists(sequence)` — returns true if the node-set is non-empty.
+    fn fn_exists(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("exists", args, 1)?;
+        let val = self.eval_expr(&args[0])?;
+        match &val {
+            XPathValue::NodeSet(ns) => Ok(XPathValue::Boolean(!ns.is_empty())),
+            XPathValue::String(s) => Ok(XPathValue::Boolean(!s.is_empty())),
+            _ => Ok(XPathValue::Boolean(true)),
+        }
+    }
+
+    /// `abs(number)` — absolute value.
+    fn fn_abs(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("abs", args, 1)?;
+        let n = self.value_to_number(&self.eval_expr(&args[0])?);
+        Ok(XPathValue::Number(n.abs()))
+    }
+
+    /// `min(node-set)` — minimum numeric value of node string values.
+    fn fn_min(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("min", args, 1)?;
+        let val = self.eval_expr(&args[0])?;
+        match &val {
+            XPathValue::NodeSet(nodes) if nodes.is_empty() => Ok(XPathValue::Number(f64::NAN)),
+            XPathValue::NodeSet(nodes) => {
+                let mut min = f64::INFINITY;
+                for &n in nodes {
+                    let v = parse_xpath_number(&self.string_value(n));
+                    if v.is_nan() {
+                        return Ok(XPathValue::Number(f64::NAN));
+                    }
+                    if v < min {
+                        min = v;
+                    }
+                }
+                Ok(XPathValue::Number(min))
+            }
+            other => Ok(XPathValue::Number(self.value_to_number(other))),
+        }
+    }
+
+    /// `max(node-set)` — maximum numeric value of node string values.
+    fn fn_max(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("max", args, 1)?;
+        let val = self.eval_expr(&args[0])?;
+        match &val {
+            XPathValue::NodeSet(nodes) if nodes.is_empty() => Ok(XPathValue::Number(f64::NAN)),
+            XPathValue::NodeSet(nodes) => {
+                let mut max = f64::NEG_INFINITY;
+                for &n in nodes {
+                    let v = parse_xpath_number(&self.string_value(n));
+                    if v.is_nan() {
+                        return Ok(XPathValue::Number(f64::NAN));
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                Ok(XPathValue::Number(max))
+            }
+            other => Ok(XPathValue::Number(self.value_to_number(other))),
+        }
+    }
+
+    /// `reverse(node-set)` — returns the node-set in reverse document order.
+    fn fn_reverse(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        check_arg_count("reverse", args, 1)?;
+        let val = self.eval_expr(&args[0])?;
+        match val {
+            XPathValue::NodeSet(mut nodes) => {
+                nodes.reverse();
+                Ok(XPathValue::NodeSet(nodes))
+            }
+            other => Ok(other),
         }
     }
 

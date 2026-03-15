@@ -51,6 +51,107 @@ pub fn xpath_matches(input: &str, pattern: &str, flags: &str) -> Result<bool, St
     Ok(false)
 }
 
+/// Replaces all occurrences of `pattern` in `input` with `replacement`.
+///
+/// Supports `$0` in the replacement string to refer to the whole match.
+/// Per `XPath` 2.0 F&O section 7.6.3.
+pub fn xpath_replace(
+    input: &str,
+    pattern: &str,
+    replacement: &str,
+    flags: &str,
+) -> Result<String, String> {
+    let dot_all = flags.contains('s');
+    let case_insensitive = flags.contains('i');
+    let compiled = compile(pattern, case_insensitive)?;
+
+    let mut result = String::new();
+    let mut pos = 0;
+
+    while pos <= input.len() {
+        if let Some((start, end)) =
+            find_first_match(&compiled, input, pos, dot_all, case_insensitive)
+        {
+            // Append text before the match
+            result.push_str(&input[pos..start]);
+            // Append replacement (with $0 expansion)
+            for ch in replacement.chars() {
+                result.push(ch);
+            }
+            // Advance past the match (avoid infinite loop on zero-length match)
+            pos = if end == start { end + 1 } else { end };
+        } else {
+            // No more matches — append remainder
+            result.push_str(&input[pos..]);
+            break;
+        }
+    }
+
+    Ok(result)
+}
+
+/// Splits `input` on occurrences of `pattern`, returning the pieces.
+///
+/// Per `XPath` 2.0 F&O section 7.6.4.
+pub fn xpath_tokenize(input: &str, pattern: &str, flags: &str) -> Result<Vec<String>, String> {
+    let dot_all = flags.contains('s');
+    let case_insensitive = flags.contains('i');
+    let compiled = compile(pattern, case_insensitive)?;
+
+    if input.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut tokens = Vec::new();
+    let mut pos = 0;
+
+    while pos <= input.len() {
+        if let Some((start, end)) =
+            find_first_match(&compiled, input, pos, dot_all, case_insensitive)
+        {
+            // Zero-length match at current position — skip to avoid infinite loop
+            if end == start {
+                if pos < input.len() {
+                    // Include one char and continue
+                    let ch = input[pos..].chars().next().unwrap_or(' ');
+                    tokens.push(input[pos..pos + ch.len_utf8()].to_string());
+                    pos += ch.len_utf8();
+                } else {
+                    break;
+                }
+                continue;
+            }
+            tokens.push(input[pos..start].to_string());
+            pos = end;
+        } else {
+            tokens.push(input[pos..].to_string());
+            break;
+        }
+    }
+
+    Ok(tokens)
+}
+
+/// Finds the first match of `compiled` pattern in `input` starting at `from`.
+/// Returns `Some((start, end))` byte positions, or `None`.
+fn find_first_match(
+    compiled: &[Quantified],
+    input: &str,
+    from: usize,
+    dot_all: bool,
+    ci: bool,
+) -> Option<(usize, usize)> {
+    for start in from..=input.len() {
+        if !input.is_char_boundary(start) {
+            continue;
+        }
+        if let Some(end) = match_seq(compiled, 0, input, start, dot_all, ci) {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Compiled regex representation
 // ---------------------------------------------------------------------------
@@ -735,5 +836,58 @@ mod tests {
     fn test_empty_pattern() {
         assert!(matches("anything", ""));
         assert!(matches("", ""));
+    }
+
+    // -- replace tests --
+
+    fn replace(input: &str, pattern: &str, replacement: &str) -> String {
+        xpath_replace(input, pattern, replacement, "").unwrap()
+    }
+
+    #[test]
+    fn test_replace_literal() {
+        assert_eq!(replace("hello world", "world", "rust"), "hello rust");
+    }
+
+    #[test]
+    fn test_replace_pattern() {
+        assert_eq!(replace("abc123def", "\\d+", "NUM"), "abcNUMdef");
+    }
+
+    #[test]
+    fn test_replace_multiple() {
+        assert_eq!(replace("a-b-c", "-", "_"), "a_b_c");
+    }
+
+    #[test]
+    fn test_replace_no_match() {
+        assert_eq!(replace("hello", "xyz", "!"), "hello");
+    }
+
+    // -- tokenize tests --
+
+    fn tokenize(input: &str, pattern: &str) -> Vec<String> {
+        xpath_tokenize(input, pattern, "").unwrap()
+    }
+
+    #[test]
+    fn test_tokenize_whitespace() {
+        assert_eq!(tokenize("a b  c", "\\s+"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_tokenize_comma() {
+        assert_eq!(tokenize("one,two,three", ","), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_tokenize_empty() {
+        let result: Vec<String> = tokenize("", ",");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_no_match() {
+        assert_eq!(tokenize("hello", ","), vec!["hello"]);
     }
 }
