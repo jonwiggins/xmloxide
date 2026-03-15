@@ -1102,6 +1102,9 @@ impl<'a> XPathContext<'a> {
             // id() - stub
             "id" => self.fn_id(args),
 
+            // XPath 2.0 / XSD functions commonly used in Schematron
+            "matches" => self.fn_matches(args),
+
             _ => Err(XPathError::UndefinedFunction {
                 name: name.to_owned(),
             }),
@@ -1537,6 +1540,35 @@ impl<'a> XPathContext<'a> {
 
         sort_document_order(&mut result);
         Ok(XPathValue::NodeSet(result))
+    }
+
+    // -- XPath 2.0 functions (commonly used in Schematron) ------------------
+
+    /// `matches(string, pattern)` or `matches(string, pattern, flags)`.
+    ///
+    /// Returns true if the string matches the regular expression pattern.
+    /// See `XPath` 2.0 Functions and Operators section 7.6.2.
+    fn fn_matches(&self, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(XPathError::InvalidArgCount {
+                function: "matches".to_owned(),
+                expected: 2,
+                found: args.len(),
+            });
+        }
+        let input = self.value_to_string(&self.eval_expr(&args[0])?);
+        let pattern = self.value_to_string(&self.eval_expr(&args[1])?);
+        let flags = if args.len() == 3 {
+            self.value_to_string(&self.eval_expr(&args[2])?)
+        } else {
+            String::new()
+        };
+        match super::regex::xpath_matches(&input, &pattern, &flags) {
+            Ok(result) => Ok(XPathValue::Boolean(result)),
+            Err(e) => Err(XPathError::InternalError {
+                message: format!("regex error in matches(): {e}"),
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------

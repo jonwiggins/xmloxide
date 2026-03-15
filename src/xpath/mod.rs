@@ -34,6 +34,7 @@ pub mod ast;
 pub mod eval;
 pub mod lexer;
 pub mod parser;
+pub(crate) mod regex;
 pub mod types;
 
 pub use eval::XPathContext;

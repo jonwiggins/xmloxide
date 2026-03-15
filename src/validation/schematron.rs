@@ -1658,6 +1658,31 @@ mod tests {
     // ===================================================================
 
     #[test]
+    fn test_matches_function() {
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <pattern>
+                <rule context="/order">
+                  <assert test="matches(@country, '[A-Z]{2}')">Country must be a 2-letter ISO code</assert>
+                  <assert test="matches(@id, '[A-Z]+-\d+')">ID must match format LETTERS-DIGITS</assert>
+                </rule>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+
+        let doc_pass = Document::parse_str(r#"<order country="US" id="INV-42"/>"#).unwrap();
+        assert!(validate_schematron(&doc_pass, &schema).is_valid);
+
+        let doc_fail = Document::parse_str(r#"<order country="usa" id="123"/>"#).unwrap();
+        let result = validate_schematron(&doc_fail, &schema);
+        assert!(!result.is_valid);
+        assert_eq!(result.errors.len(), 2);
+    }
+
+    #[test]
     fn test_classic_namespace() {
         let schema = parse_schematron(
             r#"<schema xmlns="http://www.ascc.net/xml/schematron">
