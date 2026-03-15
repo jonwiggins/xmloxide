@@ -125,6 +125,24 @@ pub struct XsdSchema {
     /// Used during validation to resolve `QName` type references like
     /// `tns:AddressType` to the correct namespace for imported type lookup.
     prefix_map: HashMap<String, String>,
+    /// The `elementFormDefault` attribute from the schema root.
+    ///
+    /// When `Qualified`, local element declarations must be namespace-qualified
+    /// in instance documents. Default is `Unqualified`.
+    ///
+    /// See XSD 1.0 section 3.3.2.
+    element_form_default: FormDefault,
+}
+
+/// Whether local elements/attributes must be namespace-qualified in instances.
+///
+/// See XSD 1.0 section 3.3.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormDefault {
+    /// Local elements do not need to be namespace-qualified (default).
+    Unqualified,
+    /// Local elements must be namespace-qualified in instance documents.
+    Qualified,
 }
 
 /// Declarations imported from another namespace via `xsd:import`.
@@ -437,6 +455,10 @@ pub fn parse_xsd_with_options(
         column: None,
     })?;
     let prefix_map = build_prefix_map(&root_doc, root_elem);
+    let element_form_default = match root_doc.attribute(root_elem, "elementFormDefault") {
+        Some("qualified") => FormDefault::Qualified,
+        _ => FormDefault::Unqualified,
+    };
 
     let mut schema = XsdSchema {
         target_namespace: None,
@@ -445,6 +467,7 @@ pub fn parse_xsd_with_options(
         attribute_groups: HashMap::new(),
         imported_namespaces: HashMap::new(),
         prefix_map,
+        element_form_default,
     };
 
     register_builtin_types(&mut schema);
@@ -712,6 +735,10 @@ fn handle_import(
     };
 
     // We need a temporary XsdSchema to parse into, then extract declarations
+    let imported_form_default = match imported_doc.attribute(imported_root, "elementFormDefault") {
+        Some("qualified") => FormDefault::Qualified,
+        _ => FormDefault::Unqualified,
+    };
     let mut temp_schema = XsdSchema {
         target_namespace: Some(ns_key.clone()),
         elements: HashMap::new(),
@@ -719,6 +746,7 @@ fn handle_import(
         attribute_groups: HashMap::new(),
         imported_namespaces: HashMap::new(),
         prefix_map: build_prefix_map(&imported_doc, imported_root),
+        element_form_default: imported_form_default,
     };
     register_builtin_types(&mut temp_schema);
     parse_top_level_declarations(
@@ -1410,6 +1438,32 @@ fn validate_sequence(
 }
 
 /// Validates a single element particle in a sequence, returning number consumed.
+/// Checks if an instance element matches a schema element declaration,
+/// accounting for `elementFormDefault` and element-level `form` attributes.
+///
+/// When qualified form is in effect, the element must have the schema's
+/// target namespace. When unqualified, the element is matched by local
+/// name only (no namespace required).
+fn element_matches_decl(
+    doc: &Document,
+    node: NodeId,
+    decl: &XsdElement,
+    schema: &XsdSchema,
+) -> bool {
+    let child_name = doc.node_name(node).unwrap_or("");
+    if child_name != decl.name {
+        return false;
+    }
+    // Check namespace qualification
+    if schema.element_form_default == FormDefault::Qualified {
+        if let Some(ref target_ns) = schema.target_namespace {
+            let child_ns = doc.node_namespace(node).unwrap_or("");
+            return child_ns == target_ns;
+        }
+    }
+    true
+}
+
 fn validate_sequence_element(
     doc: &Document,
     children: &[NodeId],
@@ -1421,8 +1475,7 @@ fn validate_sequence_element(
     let mut count: u32 = 0;
     let mut consumed = 0;
     for &child in children {
-        let child_name = doc.node_name(child).unwrap_or("");
-        if child_name != decl.name {
+        if !element_matches_decl(doc, child, decl, schema) {
             break;
         }
         if let MaxOccurs::Bounded(max) = decl.max_occurs {
@@ -1499,7 +1552,7 @@ fn validate_choice(
     let first_name = doc.node_name(first).unwrap_or("");
     let matched = particles.iter().any(|p| {
         if let XsdParticle::Element(decl) = p {
-            if decl.name == first_name {
+            if element_matches_decl(doc, first, decl, schema) {
                 validate_element(doc, first, decl, schema, errors);
                 return true;
             }
@@ -1536,9 +1589,9 @@ fn validate_all(
     let mut seen: HashMap<&str, u32> = HashMap::new();
     for &child in children {
         let child_name = doc.node_name(child).unwrap_or("");
-        let matching = particles
-            .iter()
-            .find(|p| matches!(p, XsdParticle::Element(d) if d.name == child_name));
+        let matching = particles.iter().find(
+            |p| matches!(p, XsdParticle::Element(d) if element_matches_decl(doc, child, d, schema)),
+        );
         if let Some(XsdParticle::Element(decl)) = matching {
             let count = seen.entry(child_name).or_insert(0);
             *count += 1;
@@ -3610,5 +3663,73 @@ mod tests {
         let doc2 = Document::parse_str("<list/>").unwrap();
         let result2 = validate_xsd(&doc2, &schema);
         assert!(!result2.is_valid);
+    }
+
+    #[test]
+    fn test_element_form_default_qualified() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="urn:example"
+                        xmlns:tns="urn:example"
+                        elementFormDefault="qualified">
+                <xs:element name="order">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="item" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+        .unwrap();
+        assert_eq!(schema.element_form_default, FormDefault::Qualified);
+
+        // Valid: child element is namespace-qualified
+        let doc = Document::parse_str(r#"<order xmlns="urn:example"><item>Widget</item></order>"#)
+            .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(
+            result.is_valid,
+            "qualified children should pass: {:?}",
+            result.errors
+        );
+
+        // Invalid: child element is NOT namespace-qualified
+        let doc_fail = Document::parse_str(
+            r#"<tns:order xmlns:tns="urn:example"><item>Widget</item></tns:order>"#,
+        )
+        .unwrap();
+        let result = validate_xsd(&doc_fail, &schema);
+        assert!(
+            !result.is_valid,
+            "unqualified child should fail when elementFormDefault=qualified"
+        );
+    }
+
+    #[test]
+    fn test_element_form_default_unqualified() {
+        let schema = parse_xsd(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="urn:example"
+                        xmlns:tns="urn:example">
+                <xs:element name="order">
+                    <xs:complexType><xs:sequence>
+                        <xs:element name="item" type="xs:string"/>
+                    </xs:sequence></xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+        .unwrap();
+        assert_eq!(schema.element_form_default, FormDefault::Unqualified);
+
+        // Valid: child element without namespace (unqualified is default)
+        let doc = Document::parse_str(
+            r#"<tns:order xmlns:tns="urn:example"><item>Widget</item></tns:order>"#,
+        )
+        .unwrap();
+        let result = validate_xsd(&doc, &schema);
+        assert!(
+            result.is_valid,
+            "unqualified children should pass: {:?}",
+            result.errors
+        );
     }
 }
