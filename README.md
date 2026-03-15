@@ -20,8 +20,10 @@ libxml2 became officially unmaintained in December 2025 with known security issu
 - **WHATWG HTML5 parser** — full [HTML Living Standard](https://html.spec.whatwg.org/) tokenizer and tree builder (8810/8810 html5lib-tests passing)
 - **HTML5 streaming** — SAX-like callback API for HTML5 (`html5::sax`) that wraps the tokenizer without building a DOM tree
 - **CSS selectors** — query elements with familiar CSS syntax (`css::select`) including combinators, pseudo-classes, and fast `#id` lookup
-- **XPath 1.0** — full expression parser and evaluator with all core functions
-- **Validation** — DTD, RelaxNG, and XML Schema (XSD) validation
+- **XPath 1.0+** — full expression parser and evaluator with all XPath 1.0 core functions plus key XPath 2.0 functions (`matches()`, `replace()`, `tokenize()`, `upper-case()`, `lower-case()`, `abs()`, `min()`, `max()`, and more)
+- **Validation** — DTD, RelaxNG, XML Schema (XSD), and ISO Schematron (ISO/IEC 19757-3) validation
+- **Serde integration** — optional `serde` feature for XML (de)serialization to/from Rust types
+- **Async parsing** — optional `async` feature for parsing from `tokio::io::AsyncRead` sources
 - **Canonical XML** — C14N 1.0 and Exclusive C14N serialization
 - **XInclude** — document inclusion processing
 - **XML Catalogs** — OASIS XML Catalogs for URI resolution
@@ -169,6 +171,7 @@ xmllint --format document.xml
 # Validate against a schema
 xmllint --schema schema.xsd document.xml
 xmllint --relaxng schema.rng document.xml
+xmllint --schematron schema.sch document.xml
 xmllint --dtdvalid schema.dtd document.xml
 
 # XPath query
@@ -195,10 +198,13 @@ xmllint --html page.html
 | `sax` | SAX2 streaming event-driven parser |
 | `reader` | XmlReader pull-based parsing API |
 | `serial` | XML, HTML, and HTML5 serializers, plus Canonical XML (C14N) |
-| `xpath` | XPath 1.0 expression parser and evaluator |
+| `xpath` | XPath 1.0+ expression parser and evaluator |
 | `validation::dtd` | DTD parsing and validation |
 | `validation::relaxng` | RelaxNG schema validation |
 | `validation::xsd` | XML Schema (XSD) validation |
+| `validation::schematron` | ISO Schematron rule-based validation |
+| `serde_xml` | Serde XML (de)serialization (optional `serde` feature) |
+| `async_xml` | Async parsing via `tokio::io::AsyncRead` (optional `async` feature) |
 | `xinclude` | XInclude 1.0 document inclusion |
 | `catalog` | OASIS XML Catalogs for URI resolution |
 | `encoding` | Character encoding detection and transcoding |
@@ -244,8 +250,8 @@ cargo bench --features bench-libxml2 --bench comparison_bench
 
 ## Testing
 
-- **936 unit tests** across all modules
-- **128 FFI tests** covering the full C API surface (including SAX streaming)
+- **1078 unit tests** across all modules
+- **138 FFI tests** covering the full C API surface (including SAX, Schematron, and CSS)
 - **libxml2 compatibility suite** — 119/119 tests passing (100%) covering XML parsing, namespaces, error detection, and HTML parsing
 - **W3C XML Conformance Test Suite** — 1727/1727 applicable tests passing (100%)
 - **html5lib-tests** — 7032/7032 tokenizer tests + 1778/1778 tree construction tests (100%)
@@ -284,7 +290,7 @@ xmloxide_free_string(text);
 xmloxide_free_doc(doc);
 ```
 
-The full API — including tree navigation and mutation, XPath evaluation, serialization (plain and pretty-printed), HTML parsing, DTD/RelaxNG/XSD validation, C14N, and XML Catalogs — is declared in [`include/xmloxide.h`](include/xmloxide.h).
+The full API — including tree navigation and mutation, XPath evaluation, serialization (plain and pretty-printed), HTML/HTML5 parsing, DTD/RelaxNG/XSD/Schematron validation, C14N, SAX streaming, XmlReader, push parser, and XML Catalogs — is declared in [`include/xmloxide.h`](include/xmloxide.h).
 
 ## Migrating from libxml2
 
@@ -319,6 +325,7 @@ The full API — including tree navigation and mutation, XPath evaluation, seria
 | `xmlValidateDtd` | `validation::dtd::validate` | `xmloxide_validate_dtd` |
 | `xmlRelaxNGValidateDoc` | `validation::relaxng::validate` | `xmloxide_validate_relaxng` |
 | `xmlSchemaValidateDoc` | `validation::xsd::validate_xsd` | `xmloxide_validate_xsd` |
+| (Schematron validation) | `validation::schematron::validate_schematron` | `xmloxide_validate_schematron` |
 | `xmlXIncludeProcess` | `xinclude::process_xincludes` | `xmloxide_process_xincludes` |
 | `xmlLoadCatalog` | `Catalog::parse` | `xmloxide_parse_catalog` |
 | `xmlSAX2...` callbacks | `sax::SaxHandler` trait | `xmloxide_sax_parse` |
@@ -347,6 +354,7 @@ cargo +nightly fuzz run fuzz_sax
 cargo +nightly fuzz run fuzz_reader
 cargo +nightly fuzz run fuzz_push
 cargo +nightly fuzz run fuzz_validation
+cargo +nightly fuzz run fuzz_schematron
 ```
 
 ## Building
@@ -364,7 +372,6 @@ Minimum supported Rust version: **1.81**
 
 - **No XML 1.1** — xmloxide implements XML 1.0 (Fifth Edition) only. XML 1.1 is rarely used and not planned.
 - **No XSLT** — XSLT is a separate specification (libxslt) and is out of scope.
-- **No Schematron** — Schematron validation is not implemented. DTD, RelaxNG, and XSD are supported.
 - **HTML parsers** — both an HTML 4.01 parser (matching libxml2's behavior) and a full WHATWG HTML5 parser are provided. The HTML5 parser passes 100% of html5lib-tests.
 - **Push parser buffers internally** — the push/incremental parser API (`PushParser`) currently buffers all pushed data and performs the full parse on `finish()`, rather than truly streaming like libxml2's `xmlParseChunk`. SAX streaming (`parse_sax` for XML, `html5::sax::parse_html5_sax` for HTML5) is available as an alternative for memory-constrained large-document processing.
 - **XPath `namespace::` axis** — the `namespace::` axis returns the element node when in-scope namespaces match (rather than materializing separate namespace nodes), following the same pattern as the attribute axis.

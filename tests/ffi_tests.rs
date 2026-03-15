@@ -10,6 +10,7 @@ use std::os::raw::c_char;
 
 use xmloxide::ffi::c14n::*;
 use xmloxide::ffi::catalog::*;
+use xmloxide::ffi::css::*;
 use xmloxide::ffi::document::*;
 use xmloxide::ffi::html5::*;
 use xmloxide::ffi::push::*;
@@ -2400,5 +2401,250 @@ fn test_mutation_null_safety() {
             xmloxide_rename_element(std::ptr::null_mut(), 1, name.as_ptr()),
             0
         );
+    }
+}
+
+// ---------- Schematron validation tests ----------
+
+#[test]
+fn test_schematron_valid_document() {
+    let schema_xml = CString::new(
+        r#"<schema xmlns="http://purl.oclc.org/dml/schematron">
+            <pattern>
+                <rule context="/root">
+                    <assert test="child">root must have a child element</assert>
+                </rule>
+            </pattern>
+        </schema>"#,
+    )
+    .unwrap();
+    let xml = CString::new("<root><child/></root>").unwrap();
+
+    unsafe {
+        let schema = xmloxide_parse_schematron(schema_xml.as_ptr());
+        assert!(!schema.is_null(), "schema parse failed: {:?}", last_error());
+
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+
+        let result = xmloxide_validate_schematron(doc, schema);
+        assert!(!result.is_null());
+        assert_eq!(xmloxide_validation_is_valid(result), 1);
+        assert_eq!(xmloxide_validation_error_count(result), 0);
+
+        xmloxide_free_validation_result(result);
+        xmloxide_free_doc(doc);
+        xmloxide_free_schematron(schema);
+    }
+}
+
+#[test]
+fn test_schematron_invalid_document() {
+    let schema_xml = CString::new(
+        r#"<schema xmlns="http://purl.oclc.org/dml/schematron">
+            <pattern>
+                <rule context="/root">
+                    <assert test="child">root must have a child element</assert>
+                </rule>
+            </pattern>
+        </schema>"#,
+    )
+    .unwrap();
+    let xml = CString::new("<root/>").unwrap();
+
+    unsafe {
+        let schema = xmloxide_parse_schematron(schema_xml.as_ptr());
+        assert!(!schema.is_null());
+
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+
+        let result = xmloxide_validate_schematron(doc, schema);
+        assert!(!result.is_null());
+        assert_eq!(xmloxide_validation_is_valid(result), 0);
+        assert!(xmloxide_validation_error_count(result) > 0);
+
+        let msg = c_string_to_owned(xmloxide_validation_error_message(result, 0));
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("root must have a child element"));
+
+        xmloxide_free_validation_result(result);
+        xmloxide_free_doc(doc);
+        xmloxide_free_schematron(schema);
+    }
+}
+
+#[test]
+fn test_schematron_with_phase() {
+    let schema_xml = CString::new(
+        r#"<schema xmlns="http://purl.oclc.org/dml/schematron">
+            <phase id="basic">
+                <active pattern="check-root"/>
+            </phase>
+            <pattern id="check-root">
+                <rule context="/root">
+                    <assert test="@id">root must have an id attribute</assert>
+                </rule>
+            </pattern>
+            <pattern id="check-child">
+                <rule context="/root">
+                    <assert test="child">root must have a child element</assert>
+                </rule>
+            </pattern>
+        </schema>"#,
+    )
+    .unwrap();
+    let xml = CString::new(r#"<root id="1"/>"#).unwrap();
+    let phase = CString::new("basic").unwrap();
+
+    unsafe {
+        let schema = xmloxide_parse_schematron(schema_xml.as_ptr());
+        assert!(!schema.is_null());
+
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+
+        // With "basic" phase, only check-root pattern is active — should pass
+        let result = xmloxide_validate_schematron_with_phase(doc, schema, phase.as_ptr());
+        assert!(!result.is_null());
+        assert_eq!(xmloxide_validation_is_valid(result), 1);
+        xmloxide_free_validation_result(result);
+
+        // With null phase, all patterns are active — should fail (no child element)
+        let result = xmloxide_validate_schematron_with_phase(doc, schema, std::ptr::null());
+        assert!(!result.is_null());
+        assert_eq!(xmloxide_validation_is_valid(result), 0);
+        xmloxide_free_validation_result(result);
+
+        xmloxide_free_doc(doc);
+        xmloxide_free_schematron(schema);
+    }
+}
+
+#[test]
+fn test_schematron_null_safety() {
+    unsafe {
+        assert!(xmloxide_parse_schematron(std::ptr::null()).is_null());
+        assert!(xmloxide_validate_schematron(std::ptr::null(), std::ptr::null()).is_null());
+        assert!(xmloxide_validate_schematron_with_phase(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null()
+        )
+        .is_null());
+        xmloxide_free_schematron(std::ptr::null_mut()); // should not crash
+    }
+}
+
+#[test]
+fn test_schematron_parse_error() {
+    let bad = CString::new("not a schematron schema").unwrap();
+    unsafe {
+        let schema = xmloxide_parse_schematron(bad.as_ptr());
+        assert!(schema.is_null());
+        assert!(last_error().is_some());
+    }
+}
+
+// ---------- CSS selector tests ----------
+
+#[test]
+fn test_css_select_by_tag() {
+    let xml = CString::new(r"<div><p>Hello</p><p>World</p><span>Other</span></div>").unwrap();
+    let selector = CString::new("p").unwrap();
+
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+        let root = xmloxide_doc_root_element(doc);
+
+        let mut count: usize = 0;
+        let ids = xmloxide_css_select(doc, root, selector.as_ptr(), &mut count);
+        assert!(!ids.is_null());
+        assert_eq!(count, 2);
+
+        // Verify both are <p> elements
+        for i in 0..count {
+            let name = c_string_to_owned(xmloxide_node_name(doc, *ids.add(i)));
+            assert_eq!(name.as_deref(), Some("p"));
+        }
+
+        xmloxide_free_nodeid_array(ids, count);
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_css_select_first() {
+    let xml = CString::new(r#"<div><p class="a">First</p><p class="b">Second</p></div>"#).unwrap();
+    let selector = CString::new(".b").unwrap();
+
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+        let root = xmloxide_doc_root_element(doc);
+
+        let node = xmloxide_css_select_first(doc, root, selector.as_ptr());
+        assert_ne!(node, 0);
+        let text = c_string_to_owned(xmloxide_node_text_content(doc, node));
+        assert_eq!(text.as_deref(), Some("Second"));
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_css_select_no_match() {
+    let xml = CString::new("<root><child/></root>").unwrap();
+    let selector = CString::new("nonexistent").unwrap();
+
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+        let root = xmloxide_doc_root_element(doc);
+
+        let mut count: usize = 0;
+        let ids = xmloxide_css_select(doc, root, selector.as_ptr(), &mut count);
+        assert_eq!(count, 0);
+        // Empty result returns dangling pointer, just free it
+        xmloxide_free_nodeid_array(ids, count);
+
+        let first = xmloxide_css_select_first(doc, root, selector.as_ptr());
+        assert_eq!(first, 0);
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_css_select_invalid_selector() {
+    let xml = CString::new("<root/>").unwrap();
+    let selector = CString::new(">>>").unwrap();
+
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+        let root = xmloxide_doc_root_element(doc);
+
+        let mut count: usize = 0;
+        let ids = xmloxide_css_select(doc, root, selector.as_ptr(), &mut count);
+        assert!(ids.is_null());
+        assert!(last_error().is_some());
+
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
+fn test_css_select_null_safety() {
+    let selector = CString::new("p").unwrap();
+    unsafe {
+        let mut count: usize = 0;
+        assert!(xmloxide_css_select(std::ptr::null(), 1, selector.as_ptr(), &mut count).is_null());
+        assert_eq!(
+            xmloxide_css_select_first(std::ptr::null(), 1, selector.as_ptr()),
+            0
+        );
+        xmloxide_free_nodeid_array(std::ptr::null_mut(), 0); // should not crash
     }
 }

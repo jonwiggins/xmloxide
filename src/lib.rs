@@ -14,13 +14,15 @@
 //! - [`css`] — CSS selector engine for querying document trees
 //! - [`sax`] — SAX2 event-driven streaming parser
 //! - [`reader`] — `XmlReader` pull-based parsing API
-//! - [`xpath`] — `XPath` 1.0 expression evaluation
+//! - [`xpath`] — `XPath` 1.0+ expression evaluation (includes key `XPath` 2.0 functions)
 //! - [`validation`] — DTD, `RelaxNG`, XML Schema (XSD), and ISO Schematron validation
 //! - [`serial`] — XML/HTML serialization and Canonical XML (C14N)
 //! - [`encoding`] — Character encoding detection and conversion
 //! - [`xinclude`] — `XInclude` 1.0 document inclusion
 //! - [`catalog`] — OASIS XML Catalogs for URI resolution
 //! - [`error`] — Error types and diagnostics
+//! - [`serde_xml`] — Serde XML (de)serialization (requires `serde` feature)
+//! - [`async_xml`] — Async parsing via `tokio::io::AsyncRead` (requires `async` feature)
 //!
 //! ## Quick Start
 //!

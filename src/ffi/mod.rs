@@ -24,6 +24,7 @@
 
 pub mod c14n;
 pub mod catalog;
+pub mod css;
 pub mod document;
 pub mod html5;
 pub mod push;

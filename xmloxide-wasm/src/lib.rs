@@ -7,6 +7,11 @@
 use wasm_bindgen::prelude::*;
 use xmloxide::tree::{Document as RustDocument, NodeId as RustNodeId, NodeKind};
 
+/// Convert a raw `u32` to a `RustNodeId`, returning `JsError` if the value is zero.
+fn node_id_from_u32(raw: u32) -> Result<RustNodeId, JsError> {
+    RustNodeId::from_raw(raw).ok_or_else(|| JsError::new("invalid node id: 0 is not a valid node"))
+}
+
 /// A parsed XML/HTML document.
 #[wasm_bindgen]
 pub struct WasmDocument {
@@ -206,6 +211,84 @@ impl WasmDocument {
             .map_err(|e| JsError::new(&e.to_string()))?;
         let result = xmloxide::validation::schematron::validate_schematron(&self.inner, &schema);
         Ok(WasmValidationResult::from_result(&result))
+    }
+
+    // -- Mutation --
+
+    /// Create a new element node (detached). Returns the raw node id.
+    #[wasm_bindgen(js_name = createElement)]
+    pub fn create_element(&mut self, name: &str) -> Result<u32, JsError> {
+        Ok(self.inner.create_element(name).into_raw())
+    }
+
+    /// Create a new text node (detached). Returns the raw node id.
+    #[wasm_bindgen(js_name = createText)]
+    pub fn create_text(&mut self, content: &str) -> Result<u32, JsError> {
+        Ok(self.inner.create_text(content).into_raw())
+    }
+
+    /// Create a new comment node (detached). Returns the raw node id.
+    #[wasm_bindgen(js_name = createComment)]
+    pub fn create_comment(&mut self, content: &str) -> Result<u32, JsError> {
+        Ok(self.inner.create_comment(content).into_raw())
+    }
+
+    /// Append a child node to a parent node.
+    #[wasm_bindgen(js_name = appendChild)]
+    pub fn append_child(&mut self, parent: u32, child: u32) -> Result<(), JsError> {
+        let parent_id = node_id_from_u32(parent)?;
+        let child_id = node_id_from_u32(child)?;
+        self.inner.append_child(parent_id, child_id);
+        Ok(())
+    }
+
+    /// Remove a node from the tree.
+    #[wasm_bindgen(js_name = removeNode)]
+    pub fn remove_node(&mut self, node: u32) -> Result<(), JsError> {
+        let id = node_id_from_u32(node)?;
+        self.inner.remove_node(id);
+        Ok(())
+    }
+
+    /// Set an attribute on an element node.
+    #[wasm_bindgen(js_name = setAttribute)]
+    pub fn set_attribute(&mut self, node: u32, name: &str, value: &str) -> Result<(), JsError> {
+        let id = node_id_from_u32(node)?;
+        self.inner.set_attribute(id, name, value);
+        Ok(())
+    }
+
+    /// Remove an attribute from an element node.
+    #[wasm_bindgen(js_name = removeAttribute)]
+    pub fn remove_attribute(&mut self, node: u32, name: &str) -> Result<(), JsError> {
+        let id = node_id_from_u32(node)?;
+        self.inner.remove_attribute(id, name);
+        Ok(())
+    }
+
+    /// Set the text content of a node, replacing any existing children.
+    #[wasm_bindgen(js_name = setTextContent)]
+    pub fn set_text_content(&mut self, node: u32, content: &str) -> Result<(), JsError> {
+        let id = node_id_from_u32(node)?;
+        self.inner.set_text_content(id, content);
+        Ok(())
+    }
+
+    /// Insert a new child before a reference node. Both nodes must share the same parent.
+    #[wasm_bindgen(js_name = insertBefore)]
+    pub fn insert_before(&mut self, reference: u32, new_child: u32) -> Result<(), JsError> {
+        let ref_id = node_id_from_u32(reference)?;
+        let child_id = node_id_from_u32(new_child)?;
+        self.inner.insert_before(ref_id, child_id);
+        Ok(())
+    }
+
+    /// Clone a node. If `deep` is true, all descendants are cloned recursively.
+    /// Returns the raw node id of the clone.
+    #[wasm_bindgen(js_name = cloneNode)]
+    pub fn clone_node(&mut self, node: u32, deep: bool) -> Result<u32, JsError> {
+        let id = node_id_from_u32(node)?;
+        Ok(self.inner.clone_node(id, deep).into_raw())
     }
 }
 

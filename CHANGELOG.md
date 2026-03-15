@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-03-15
+
+### Added
+
+- **Schematron C FFI** — `xmloxide_parse_schematron`, `xmloxide_free_schematron`,
+  `xmloxide_validate_schematron`, and `xmloxide_validate_schematron_with_phase` for
+  C/C++ consumers; Schematron was previously only available in Rust, Python, and WASM
+- **CSS selector C FFI** — `xmloxide_css_select`, `xmloxide_css_select_first`, and
+  `xmloxide_free_nodeid_array` for querying elements with CSS selectors from C/C++
+- **CSS selectors in Python** — `css_select()` and `css_select_first()` methods on
+  `Document` in pyxmloxide
+- **WASM tree mutation APIs** — `createElement`, `createText`, `createComment`,
+  `appendChild`, `removeNode`, `setAttribute`, `removeAttribute`, `setTextContent`,
+  `insertBefore`, `cloneNode` on `WasmDocument`
+- **Validation benchmarks** — criterion benchmarks for DTD, RelaxNG, XSD, and
+  Schematron validation
+- **Expanded XPath benchmarks** — count, string function, position predicate,
+  ancestor axis, and union expression benchmarks
+- **CSS selector benchmarks** — class selector and complex combinator benchmarks
+- 58 CSS evaluator inline tests covering tag, class, ID, attribute, pseudo-class,
+  combinator, and universal selector matching
+- 10 new FFI tests (5 Schematron + 5 CSS) bringing FFI test total to 138
+
+### Fixed
+
+- **README incorrectly listed Schematron as unsupported** — the Limitations section
+  claimed "No Schematron" despite Schematron being added in 0.4.0
+- **README listed XPath as "1.0 only"** — updated to "XPath 1.0+" reflecting the
+  17+ XPath 2.0 functions added in prior releases
+- **Outdated test counts in README** — updated from 936 to 1078 unit tests
+
+### Improved
+
+- Unit tests expanded from 1010 to 1078
+- FFI tests expanded from 128 to 138
+- README now documents serde, async, and Schematron features
+- MIGRATION.md expanded with HTML5 parsing, HTML5 streaming, Schematron validation,
+  and CSS selector migration examples
+- CLAUDE.md module map updated with css/, serde_xml/, async_xml, and full ffi/ listing
+- `xmllint --schematron` added to CLI documentation in README
+- Schematron added to migration table in README
+- `xmloxide.h` header updated with Schematron and CSS selector declarations
+
 ## [0.4.0] - 2026-03-14
 
 ### Added

@@ -212,6 +212,22 @@ impl Document {
         self.inner.set_text_content(node.id, content)
     }
 
+    // --- CSS selectors ---
+
+    /// Select all descendant elements matching a CSS selector string.
+    fn css_select(&self, scope: &NodeId, selector: &str) -> PyResult<Vec<NodeId>> {
+        xmloxide::css::select(&self.inner, scope.id, selector)
+            .map(|nodes| nodes.into_iter().map(|id| NodeId { id }).collect())
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Return the first element matching a CSS selector, or None.
+    fn css_select_first(&self, scope: &NodeId, selector: &str) -> PyResult<Option<NodeId>> {
+        xmloxide::css::select(&self.inner, scope.id, selector)
+            .map(|nodes| nodes.into_iter().next().map(|id| NodeId { id }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     fn __repr__(&self) -> String {
         let count = self.inner.node_count();
         format!("<Document nodes={count}>")

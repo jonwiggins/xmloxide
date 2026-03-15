@@ -344,3 +344,644 @@ fn last_element_child(doc: &Document, parent: NodeId) -> Option<NodeId> {
         .filter(|&c| matches!(doc.node(c).kind, NodeKind::Element { .. }))
         .last()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::css::parser::parse_selector;
+    use crate::tree::Document;
+
+    /// Helper: parse a selector string and evaluate it against the document.
+    fn eval(doc: &Document, scope: NodeId, css: &str) -> Vec<NodeId> {
+        let group = parse_selector(css).unwrap();
+        select(doc, scope, &group)
+    }
+
+    /// Shared test document covering common structures.
+    fn test_doc() -> Document {
+        Document::parse_str(
+            r#"<root>
+                <div id="main" class="container wide">
+                    <h1>Title</h1>
+                    <p class="intro">Hello</p>
+                    <p class="body">World</p>
+                    <ul>
+                        <li class="active">One</li>
+                        <li>Two</li>
+                        <li class="last">Three</li>
+                    </ul>
+                    <a href="https://example.com" data-type="external">Link</a>
+                    <img src="photo.png"/>
+                    <span lang="en-US">English</span>
+                    <span lang="en">Plain English</span>
+                    <span lang="fr">French</span>
+                    <div class="empty-div"/>
+                </div>
+                <div id="sidebar" class="sidebar">
+                    <p class="intro">Side</p>
+                </div>
+            </root>"#,
+        )
+        .unwrap()
+    }
+
+    // ---------------------------------------------------------------
+    // 1. Basic element matching by tag name
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_tag_name_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "p");
+        assert_eq!(result.len(), 3); // 2 in main + 1 in sidebar
+        for &node in &result {
+            assert_eq!(doc.node_name(node), Some("p"));
+        }
+    }
+
+    #[test]
+    fn test_tag_name_case_insensitive() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // CSS tag matching should be case-insensitive
+        let result = eval(&doc, root, "P");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_tag_name_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "table");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_tag_name_h1() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "h1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "Title");
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Class matching
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_class_single() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, ".intro");
+        assert_eq!(result.len(), 2); // main p.intro + sidebar p.intro
+    }
+
+    #[test]
+    fn test_class_multiple_on_element() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // The main div has class="container wide" — match on either individually
+        let result_container = eval(&doc, root, ".container");
+        assert_eq!(result_container.len(), 1);
+        let result_wide = eval(&doc, root, ".wide");
+        assert_eq!(result_wide.len(), 1);
+        assert_eq!(result_container[0], result_wide[0]);
+    }
+
+    #[test]
+    fn test_class_compound_both_required() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Require both classes on the same element
+        let result = eval(&doc, root, ".container.wide");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("div"));
+    }
+
+    #[test]
+    fn test_class_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, ".nonexistent");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_class_with_tag() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "p.intro");
+        assert_eq!(result.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. ID matching
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_id_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "#main");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("div"));
+    }
+
+    #[test]
+    fn test_id_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "#nonexistent");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_id_with_tag() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "div#sidebar");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.attribute(result[0], "class"), Some("sidebar"));
+    }
+
+    #[test]
+    fn test_id_multiple_ids_in_doc() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let main = eval(&doc, root, "#main");
+        let sidebar = eval(&doc, root, "#sidebar");
+        assert_eq!(main.len(), 1);
+        assert_eq!(sidebar.len(), 1);
+        assert_ne!(main[0], sidebar[0]);
+    }
+
+    // ---------------------------------------------------------------
+    // 4. Attribute matching
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_attr_existence() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[href]");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("a"));
+    }
+
+    #[test]
+    fn test_attr_existence_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[title]");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_attr_exact_value() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[data-type=\"external\"]");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("a"));
+    }
+
+    #[test]
+    fn test_attr_exact_value_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[data-type=\"internal\"]");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_attr_prefix() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[href^=\"https\"]");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("a"));
+    }
+
+    #[test]
+    fn test_attr_prefix_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[href^=\"ftp\"]");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_attr_suffix() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[src$=\".png\"]");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("img"));
+    }
+
+    #[test]
+    fn test_attr_suffix_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[src$=\".jpg\"]");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_attr_substring() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[href*=\"example\"]");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("a"));
+    }
+
+    #[test]
+    fn test_attr_substring_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[href*=\"missing\"]");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_attr_word() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // class="container wide" — match the word "container"
+        let result = eval(&doc, root, "[class~=\"container\"]");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.attribute(result[0], "id"), Some("main"));
+    }
+
+    #[test]
+    fn test_attr_dash_prefix_exact() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // lang="en" exactly matches [lang|="en"]
+        let result = eval(&doc, root, "[lang|=\"en\"]");
+        // Should match both lang="en-US" and lang="en", but NOT lang="fr"
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_attr_dash_prefix_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "[lang|=\"de\"]");
+        assert!(result.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // 5. Pseudo-class matching
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_pseudo_first_child() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "li:first-child");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "One");
+    }
+
+    #[test]
+    fn test_pseudo_last_child() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "li:last-child");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "Three");
+    }
+
+    #[test]
+    fn test_pseudo_first_child_div() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // The first div child of root is #main
+        let result = eval(&doc, root, "div:first-child");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.attribute(result[0], "id"), Some("main"));
+    }
+
+    #[test]
+    fn test_pseudo_empty() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, ":empty");
+        // img and empty-div should be empty
+        let names: Vec<_> = result.iter().map(|&n| doc.node_name(n).unwrap()).collect();
+        assert!(names.contains(&"img"));
+        assert!(names.contains(&"div")); // empty-div
+    }
+
+    #[test]
+    fn test_pseudo_empty_excludes_non_empty() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, ":empty");
+        // h1 has text content, should not match :empty
+        assert!(!result.iter().any(|&n| doc.node_name(n) == Some("h1")));
+    }
+
+    #[test]
+    fn test_pseudo_not_class() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "li:not(.active)");
+        assert_eq!(result.len(), 2);
+        // Should be "Two" and "Three"
+        let texts: Vec<_> = result.iter().map(|&n| doc.text_content(n)).collect();
+        assert!(texts.contains(&"Two".to_string()));
+        assert!(texts.contains(&"Three".to_string()));
+    }
+
+    #[test]
+    fn test_pseudo_not_tag() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // All children of #main that are not <p>
+        let result = eval(&doc, root, "#main > :not(p)");
+        assert!(!result.iter().any(|&n| doc.node_name(n) == Some("p")));
+        assert!(result.len() >= 4); // h1, ul, a, img, span, span, span, div
+    }
+
+    #[test]
+    fn test_pseudo_only_child() {
+        let doc = Document::parse_str(
+            r"<root><wrapper><only>Only child</only></wrapper><multi><a/><b/></multi></root>",
+        )
+        .unwrap();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, ":only-child");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.node_name(result[0]), Some("only"));
+    }
+
+    #[test]
+    fn test_pseudo_nth_child_specific() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Second li
+        let result = eval(&doc, root, "li:nth-child(2)");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "Two");
+    }
+
+    #[test]
+    fn test_pseudo_nth_child_odd() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "li:nth-child(odd)");
+        assert_eq!(result.len(), 2); // 1st and 3rd
+        assert_eq!(doc.text_content(result[0]), "One");
+        assert_eq!(doc.text_content(result[1]), "Three");
+    }
+
+    #[test]
+    fn test_pseudo_nth_child_even() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "li:nth-child(even)");
+        assert_eq!(result.len(), 1); // 2nd only
+        assert_eq!(doc.text_content(result[0]), "Two");
+    }
+
+    #[test]
+    fn test_pseudo_nth_last_child() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // :nth-last-child(1) is last child
+        let result = eval(&doc, root, "li:nth-last-child(1)");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "Three");
+    }
+
+    // ---------------------------------------------------------------
+    // 6. Combinator matching
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_combinator_descendant() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // All p descendants of div (any depth)
+        let result = eval(&doc, root, "div p");
+        assert_eq!(result.len(), 3); // 2 in #main + 1 in #sidebar
+    }
+
+    #[test]
+    fn test_combinator_descendant_deep() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // li is nested inside root > div > ul > li
+        let result = eval(&doc, root, "div li");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_combinator_child() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Only direct children of #main that are <p>
+        let result = eval(&doc, root, "#main > p");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_combinator_child_excludes_deeper() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // li is NOT a direct child of div — it's a child of ul
+        let result = eval(&doc, root, "div > li");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_combinator_adjacent_sibling() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // p immediately after h1
+        let result = eval(&doc, root, "h1 + p");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "Hello");
+    }
+
+    #[test]
+    fn test_combinator_adjacent_sibling_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // h1 is not immediately preceded by a <p>
+        let result = eval(&doc, root, "p + h1");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_combinator_general_sibling() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // All p elements that come after an h1 in the same parent
+        let result = eval(&doc, root, "h1 ~ p");
+        assert_eq!(result.len(), 2); // both p's in #main
+    }
+
+    #[test]
+    fn test_combinator_general_sibling_no_match() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // h1 has no preceding sibling <a>
+        let result = eval(&doc, root, "a ~ h1");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_combinator_chain() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Chain: div with class container > ul, then descendant li with class active
+        let result = eval(&doc, root, "div.container > ul li.active");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "One");
+    }
+
+    #[test]
+    fn test_combinator_three_levels() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // root > div > ul > li
+        let result = eval(&doc, root, "div > ul > li");
+        assert_eq!(result.len(), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // 7. Universal selector matching
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_universal_all_elements() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "*");
+        // Should match every element descendant of root
+        assert!(result.len() >= 14); // div, h1, p, p, ul, li, li, li, a, img, span, span, span, div, div, p
+    }
+
+    #[test]
+    fn test_universal_direct_children() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Direct children of #main
+        let result = eval(&doc, root, "#main > *");
+        // h1, p, p, ul, a, img, span, span, span, empty-div
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn test_universal_with_class() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Universal + class is equivalent to just .intro
+        let result_star = eval(&doc, root, "*.intro");
+        let result_class = eval(&doc, root, ".intro");
+        assert_eq!(result_star.len(), result_class.len());
+        assert_eq!(result_star, result_class);
+    }
+
+    #[test]
+    fn test_universal_with_pseudo() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "*:first-child");
+        // First element child of each parent
+        assert!(result.len() >= 2);
+        // All returned nodes should be first element children of their parents
+        for &node in &result {
+            let parent = doc.parent(node).unwrap();
+            let first = doc
+                .children(parent)
+                .find(|&c| matches!(doc.node(c).kind, NodeKind::Element { .. }))
+                .unwrap();
+            assert_eq!(first, node);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Selector group (comma-separated)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_selector_group() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "h1, img");
+        assert_eq!(result.len(), 2);
+        let names: Vec<_> = result.iter().map(|&n| doc.node_name(n).unwrap()).collect();
+        assert!(names.contains(&"h1"));
+        assert!(names.contains(&"img"));
+    }
+
+    // ---------------------------------------------------------------
+    // Edge cases
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_empty_selector_group() {
+        let group = SelectorGroup {
+            selectors: vec![Selector {
+                compounds: Vec::new(),
+            }],
+        };
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = select(&doc, root, &group);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scope_limits_results() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Get the sidebar div, then scope the search to it
+        let sidebar_nodes = eval(&doc, root, "#sidebar");
+        assert_eq!(sidebar_nodes.len(), 1);
+        let sidebar = sidebar_nodes[0];
+        // Only 1 <p> inside sidebar
+        let result = eval(&doc, sidebar, "p");
+        assert_eq!(result.len(), 1);
+        assert_eq!(doc.text_content(result[0]), "Side");
+    }
+
+    #[test]
+    fn test_no_elements_in_scope() {
+        let doc = Document::parse_str("<root/>").unwrap();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "div");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_fast_id_path_descendant_check() {
+        // The fast #id path should verify the node is a descendant of scope
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        // Get #sidebar, then search for #main from within it — should not find it
+        let sidebar_nodes = eval(&doc, root, "#sidebar");
+        let sidebar = sidebar_nodes[0];
+        let result = eval(&doc, sidebar, "#main");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_document_order_preserved() {
+        let doc = test_doc();
+        let root = doc.root_element().unwrap();
+        let result = eval(&doc, root, "li");
+        assert_eq!(result.len(), 3);
+        assert_eq!(doc.text_content(result[0]), "One");
+        assert_eq!(doc.text_content(result[1]), "Two");
+        assert_eq!(doc.text_content(result[2]), "Three");
+    }
+}

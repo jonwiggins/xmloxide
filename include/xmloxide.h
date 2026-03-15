@@ -46,6 +46,9 @@ typedef struct xmloxide_relaxng_schema xmloxide_relaxng_schema;
 /** Opaque XSD schema handle. */
 typedef struct xmloxide_xsd_schema xmloxide_xsd_schema;
 
+/** Opaque Schematron schema handle. */
+typedef struct xmloxide_schematron_schema xmloxide_schematron_schema;
+
 /** Opaque validation result handle. */
 typedef struct xmloxide_validation_result xmloxide_validation_result;
 
@@ -502,6 +505,36 @@ xmloxide_validation_result *xmloxide_validate_xsd(const xmloxide_document *doc,
                                                   const xmloxide_xsd_schema *schema);
 
 /**
+ * Parses an ISO Schematron schema from a null-terminated UTF-8 XML string.
+ * Returns a schema pointer on success, or NULL on failure.
+ * The returned schema must be freed with xmloxide_free_schematron().
+ */
+xmloxide_schematron_schema *xmloxide_parse_schematron(const char *input);
+
+/** Frees a Schematron schema. Passing NULL is safe and does nothing. */
+void xmloxide_free_schematron(xmloxide_schematron_schema *schema);
+
+/**
+ * Validates a document against an ISO Schematron schema.
+ * Returns a validation result that must be freed with
+ * xmloxide_free_validation_result().
+ */
+xmloxide_validation_result *xmloxide_validate_schematron(
+    const xmloxide_document *doc,
+    const xmloxide_schematron_schema *schema);
+
+/**
+ * Validates a document against a Schematron schema using a specific phase.
+ * phase is the name of the phase to activate (NULL for all patterns).
+ * Returns a validation result that must be freed with
+ * xmloxide_free_validation_result().
+ */
+xmloxide_validation_result *xmloxide_validate_schematron_with_phase(
+    const xmloxide_document *doc,
+    const xmloxide_schematron_schema *schema,
+    const char *phase);
+
+/**
  * Returns whether the validation result indicates a valid document.
  * Returns 1 for valid, 0 for invalid or NULL.
  */
@@ -898,6 +931,36 @@ typedef struct {
  */
 int32_t xmloxide_sax_parse(const char *xml,
                             const xmloxide_sax_handler *handler);
+
+/* ---------- CSS selectors ---------- */
+
+/**
+ * Evaluates a CSS selector against a subtree and returns matching node IDs.
+ *
+ * scope is the node to search within (typically the root element).
+ * selector is a null-terminated CSS selector string (e.g., "div.class > p").
+ *
+ * On success, sets *out_count to the number of matching nodes and returns
+ * a heap-allocated array of node IDs. The caller must free the array with
+ * xmloxide_free_nodeid_array(ptr, count).
+ *
+ * Returns NULL on failure (invalid selector or null arguments).
+ */
+uint32_t *xmloxide_css_select(const xmloxide_document *doc, uint32_t scope,
+                               const char *selector, size_t *out_count);
+
+/**
+ * Frees a node ID array returned by xmloxide_css_select().
+ * Passing NULL is safe and does nothing.
+ */
+void xmloxide_free_nodeid_array(uint32_t *ptr, size_t count);
+
+/**
+ * Returns the first node matching a CSS selector, or 0 if none found.
+ * This is a convenience wrapper around xmloxide_css_select().
+ */
+uint32_t xmloxide_css_select_first(const xmloxide_document *doc, uint32_t scope,
+                                    const char *selector);
 
 /* ---------- String lifecycle ---------- */
 

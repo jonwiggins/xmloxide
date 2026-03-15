@@ -2,12 +2,14 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::fmt::Write;
+use xmloxide::css;
 use xmloxide::html::parse_html;
 use xmloxide::html5::{parse_html5, parse_html5_with_options, Html5ParseOptions};
 use xmloxide::parser::{ParseOptions, PushParser};
 use xmloxide::reader::XmlReader;
 use xmloxide::sax::{parse_sax, SaxHandler};
 use xmloxide::serial::serialize;
+use xmloxide::validation::{dtd, relaxng, schematron, xsd};
 use xmloxide::xpath::evaluate;
 use xmloxide::Document;
 
@@ -398,6 +400,184 @@ fn bench_parse_html5_fragment(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Additional XPath benchmarks
+// ---------------------------------------------------------------------------
+
+fn bench_xpath_count(c: &mut Criterion) {
+    let xml = make_xpath_xml();
+    let doc = Document::parse_str(&xml).expect("failed to parse XPath XML");
+    let root = doc.root_element().expect("no root element");
+    c.bench_function("xpath_count", |b| {
+        b.iter(|| evaluate(black_box(&doc), root, "count(//book)"));
+    });
+}
+
+fn bench_xpath_string_function(c: &mut Criterion) {
+    let xml = make_xpath_xml();
+    let doc = Document::parse_str(&xml).expect("failed to parse XPath XML");
+    let root = doc.root_element().expect("no root element");
+    c.bench_function("xpath_string_function", |b| {
+        b.iter(|| evaluate(black_box(&doc), root, "string(//book[1]/title)"));
+    });
+}
+
+fn bench_xpath_position_predicate(c: &mut Criterion) {
+    let xml = make_xpath_xml();
+    let doc = Document::parse_str(&xml).expect("failed to parse XPath XML");
+    let root = doc.root_element().expect("no root element");
+    c.bench_function("xpath_position_predicate", |b| {
+        b.iter(|| {
+            evaluate(
+                black_box(&doc),
+                root,
+                "//book[position() > 10 and position() < 20]",
+            )
+        });
+    });
+}
+
+fn bench_xpath_ancestor(c: &mut Criterion) {
+    let xml = make_xpath_xml();
+    let doc = Document::parse_str(&xml).expect("failed to parse XPath XML");
+    let root = doc.root_element().expect("no root element");
+    // Get a deep node to evaluate ancestor axis from
+    let result = evaluate(&doc, root, "//book[1]/title").expect("xpath failed");
+    let title_node = result.as_node_set().expect("expected nodeset")[0];
+    c.bench_function("xpath_ancestor", |b| {
+        b.iter(|| evaluate(black_box(&doc), title_node, "ancestor::*"));
+    });
+}
+
+fn bench_xpath_union(c: &mut Criterion) {
+    let xml = make_xpath_xml();
+    let doc = Document::parse_str(&xml).expect("failed to parse XPath XML");
+    let root = doc.root_element().expect("no root element");
+    c.bench_function("xpath_union", |b| {
+        b.iter(|| evaluate(black_box(&doc), root, "//title | //author | //year"));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Validation benchmarks
+// ---------------------------------------------------------------------------
+
+/// DTD for validating the medium XML (catalog of books).
+fn make_book_dtd() -> String {
+    String::from(
+        "<!ELEMENT catalog (book*)>\n\
+         <!ELEMENT book (title, author, price)>\n\
+         <!ATTLIST book id ID #REQUIRED>\n\
+         <!ELEMENT title (#PCDATA)>\n\
+         <!ELEMENT author (#PCDATA)>\n\
+         <!ELEMENT price (#PCDATA)>\n",
+    )
+}
+
+fn bench_validate_dtd(c: &mut Criterion) {
+    let xml = make_medium_xml();
+    let dtd_str = make_book_dtd();
+    let dtd_schema = dtd::parse_dtd(&dtd_str).expect("DTD parse failed");
+    c.bench_function("validate_dtd", |b| {
+        b.iter(|| {
+            let mut doc = Document::parse_str(black_box(&xml)).expect("parse failed");
+            dtd::validate(black_box(&mut doc), &dtd_schema)
+        });
+    });
+}
+
+fn bench_validate_relaxng(c: &mut Criterion) {
+    let schema_xml = r#"<?xml version="1.0"?>
+<element name="catalog" xmlns="http://relaxng.org/ns/structure/1.0">
+  <zeroOrMore>
+    <element name="book">
+      <attribute name="id"/>
+      <element name="title"><text/></element>
+      <element name="author"><text/></element>
+      <element name="price"><text/></element>
+    </element>
+  </zeroOrMore>
+</element>"#;
+    let schema = relaxng::parse_relaxng(schema_xml).expect("RelaxNG parse failed");
+    let xml = make_medium_xml();
+    let doc = Document::parse_str(&xml).expect("parse failed");
+    c.bench_function("validate_relaxng", |b| {
+        b.iter(|| relaxng::validate(black_box(&doc), &schema));
+    });
+}
+
+fn bench_validate_xsd(c: &mut Criterion) {
+    let schema_xml = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="catalog">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="book" maxOccurs="unbounded" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="title" type="xs:string"/>
+              <xs:element name="author" type="xs:string"/>
+              <xs:element name="price" type="xs:string"/>
+            </xs:sequence>
+            <xs:attribute name="id" type="xs:string" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    let schema = xsd::parse_xsd(schema_xml).expect("XSD parse failed");
+    let xml = make_medium_xml();
+    let doc = Document::parse_str(&xml).expect("parse failed");
+    c.bench_function("validate_xsd", |b| {
+        b.iter(|| xsd::validate_xsd(black_box(&doc), &schema));
+    });
+}
+
+fn bench_validate_schematron(c: &mut Criterion) {
+    let schema_xml = r#"<schema xmlns="http://purl.oclc.org/dml/schematron">
+  <pattern>
+    <rule context="book">
+      <assert test="title">book must have a title</assert>
+      <assert test="author">book must have an author</assert>
+      <assert test="@id">book must have an id attribute</assert>
+    </rule>
+  </pattern>
+</schema>"#;
+    let schema = schematron::parse_schematron(schema_xml).expect("Schematron parse failed");
+    let xml = make_medium_xml();
+    let doc = Document::parse_str(&xml).expect("parse failed");
+    c.bench_function("validate_schematron", |b| {
+        b.iter(|| schematron::validate_schematron(black_box(&doc), &schema));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// CSS selector benchmark
+// ---------------------------------------------------------------------------
+
+fn bench_css_select(c: &mut Criterion) {
+    let html = make_html_doc();
+    let doc = parse_html5(&html).expect("html5 parse failed");
+    let root = doc.root_element().expect("no root");
+    c.bench_function("css_select_class", |b| {
+        b.iter(|| css::select(black_box(&doc), root, "div.section"));
+    });
+}
+
+fn bench_css_select_complex(c: &mut Criterion) {
+    let html = make_html_doc();
+    let doc = parse_html5(&html).expect("html5 parse failed");
+    let root = doc.root_element().expect("no root");
+    c.bench_function("css_select_complex", |b| {
+        b.iter(|| css::select(black_box(&doc), root, "div.section > p > b"));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Criterion groups and main
+// ---------------------------------------------------------------------------
+
 criterion_group!(html_parsing, bench_parse_html);
 
 criterion_group!(html5_parsing, bench_parse_html5, bench_parse_html5_fragment);
@@ -406,11 +586,30 @@ criterion_group!(sax, bench_sax_parse);
 
 criterion_group!(reader, bench_reader_parse);
 
-criterion_group!(xpath, bench_xpath_simple, bench_xpath_complex);
+criterion_group!(
+    xpath,
+    bench_xpath_simple,
+    bench_xpath_complex,
+    bench_xpath_count,
+    bench_xpath_string_function,
+    bench_xpath_position_predicate,
+    bench_xpath_ancestor,
+    bench_xpath_union,
+);
 
 criterion_group!(roundtrip, bench_roundtrip);
 
 criterion_group!(push, bench_push_parser);
+
+criterion_group!(
+    validation,
+    bench_validate_dtd,
+    bench_validate_relaxng,
+    bench_validate_xsd,
+    bench_validate_schematron,
+);
+
+criterion_group!(css_selectors, bench_css_select, bench_css_select_complex,);
 
 criterion_main!(
     parsing,
@@ -421,5 +620,7 @@ criterion_main!(
     reader,
     xpath,
     roundtrip,
-    push
+    push,
+    validation,
+    css_selectors,
 );

@@ -4,7 +4,7 @@
 
 **xmloxide** is a pure Rust reimplementation of libxml2 — the de facto standard XML/HTML parsing library in the open-source world. libxml2 became officially unmaintained in December 2025 with known security issues. xmloxide is a memory-safe, high-performance replacement that passes the same conformance test suites.
 
-**Version:** 0.4.0
+**Version:** 0.4.1
 **License:** MIT
 **MSRV:** Rust 1.81+
 
@@ -13,11 +13,15 @@
 - Full conformance with W3C XML 1.0 (Fifth Edition) and Namespaces in XML 1.0
 - **1727/1727** W3C XML Conformance Test Suite tests passing (100%)
 - **119/119** libxml2 regression tests passing (100%)
-- Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0, XmlReader, push parser, DTD/RelaxNG/XSD/Schematron validation, C14N, XInclude, XML Catalogs
+- Feature parity with libxml2's core: XML/HTML parsing, DOM, SAX2, XPath 1.0+, XmlReader, push parser, DTD/RelaxNG/XSD/Schematron validation, C14N, XInclude, XML Catalogs
 - **WHATWG HTML5 parser** — full HTML Living Standard tokenizer (§13.2.5) and tree builder (§13.2.6) with 7032/7032 tokenizer tests + 1778/1778 tree construction tests passing (100% html5lib-tests)
+- **CSS selector engine** — query elements with familiar CSS syntax including combinators and pseudo-classes
+- **Serde integration** — optional XML (de)serialization to/from Rust types via serde
+- **Async parsing** — optional async parsing from `tokio::io::AsyncRead` sources
 - Zero `unsafe` in public API surface (`unsafe_code = "deny"` in Cargo.toml)
 - No system dependencies — pure Rust (uses `encoding_rs` for character encoding)
 - C/C++ FFI layer with header file (`include/xmloxide.h`)
+- WASM bindings (`xmloxide-wasm`) and Python bindings (`pyxmloxide`)
 - `xmllint` CLI tool
 - Performance competitive with libxml2 (serialization 1.5-2.3x faster)
 
@@ -67,7 +71,13 @@ src/
 │   ├── mod.rs          # WHATWG HTML5 parser public API and module docs
 │   ├── tokenizer.rs    # HTML5 tokenizer (all 80 states per §13.2.5)
 │   ├── tree_builder.rs # HTML5 tree construction (all insertion modes per §13.2.6)
+│   ├── sax.rs          # HTML5 SAX-like streaming API (no DOM tree)
 │   └── entities.rs     # HTML5 named character references (§13.5, 2231 entries)
+├── css/
+│   ├── mod.rs          # CSS selector public API (select, select_with)
+│   ├── parser.rs       # CSS selector parser
+│   ├── types.rs        # Selector AST types
+│   └── eval.rs         # Selector evaluator against document trees
 ├── sax/
 │   └── mod.rs          # SAX2 handler trait and streaming parser
 ├── reader/
@@ -80,7 +90,8 @@ src/
 │   ├── lexer.rs        # XPath expression tokenizer
 │   ├── parser.rs       # XPath expression parser → AST
 │   ├── eval.rs         # Expression evaluator against a node tree
-│   └── types.rs        # XPath value types (NodeSet, String, Number, Boolean)
+│   ├── types.rs        # XPath value types (NodeSet, String, Number, Boolean)
+│   └── regex.rs        # XPath regex support (matches, replace, tokenize)
 ├── validation/
 │   ├── mod.rs          # ValidationResult, ValidationError
 │   ├── dtd.rs          # DTD parsing and validation (populates id_map)
@@ -96,12 +107,27 @@ src/
 │   └── mod.rs          # XInclude 1.0 document inclusion
 ├── catalog/
 │   └── mod.rs          # OASIS XML Catalogs for URI resolution
+├── serde_xml/
+│   ├── mod.rs          # Serde XML module root (feature-gated behind "serde")
+│   ├── de.rs           # XML deserializer
+│   ├── ser.rs          # XML serializer
+│   └── error.rs        # Serde error types
+├── async_xml.rs        # Async parsing via tokio::io::AsyncRead (feature-gated "async")
 ├── ffi/
 │   ├── mod.rs          # FFI module root (feature-gated behind "ffi")
 │   ├── document.rs     # Document parsing FFI
 │   ├── tree.rs         # Tree navigation FFI
 │   ├── serial.rs       # Serialization FFI
 │   ├── xpath.rs        # XPath evaluation FFI
+│   ├── validation.rs   # DTD/RelaxNG/XSD/Schematron validation FFI
+│   ├── css.rs          # CSS selector FFI
+│   ├── sax.rs          # SAX2 streaming FFI
+│   ├── reader.rs       # XmlReader FFI
+│   ├── push.rs         # Push parser FFI
+│   ├── c14n.rs         # Canonical XML FFI
+│   ├── catalog.rs      # XML Catalogs FFI
+│   ├── html5.rs        # HTML5 parsing FFI
+│   ├── xinclude.rs     # XInclude FFI
 │   └── strings.rs      # String memory management FFI
 ├── error/
 │   └── mod.rs          # Error types, ParseError, ParseDiagnostic
@@ -213,7 +239,8 @@ These are the specs we implement against:
 
 - [XML 1.0 (Fifth Edition)](https://www.w3.org/TR/xml/) — the core spec
 - [Namespaces in XML 1.0](https://www.w3.org/TR/xml-names/) — namespace processing
-- [XPath 1.0](https://www.w3.org/TR/xpath-10/) — XPath query language
+- [XPath 1.0](https://www.w3.org/TR/xpath-10/) — XPath query language (with selected XPath 2.0 functions)
+- [ISO Schematron](https://www.iso.org/standard/40833.html) — ISO/IEC 19757-3 rule-based validation
 - [XML Inclusions (XInclude) 1.0](https://www.w3.org/TR/xinclude/) — document merging
 - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) — canonical serialization
 - [RelaxNG](https://relaxng.org/spec-20011203.html) — schema language
@@ -358,7 +385,7 @@ Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, t
 
 | Suite | Location | Tests | Notes |
 |-------|----------|-------|-------|
-| Unit tests | `src/**/*.rs` (inline) | 991 | All modules |
+| Unit tests | `src/**/*.rs` (inline) | 1020+ | All modules |
 | W3C Conformance | `tests/conformance.rs` | 1727/1727 | Requires `download-conformance-suite.sh` |
 | libxml2 Compat | `tests/libxml2_compat.rs` | 119/119 | Requires `download-libxml2-tests.sh` |
 | html5lib Tokenizer | `tests/html5lib_tokenizer.rs` | 7032/7032 | Requires `download-html5lib-tests.sh` |
@@ -367,6 +394,8 @@ Pre-commit hooks available via `./scripts/install-hooks.sh` (runs fmt, clippy, t
 | Real-world XML | `tests/real_world_xml.rs` | 22 | Atom, SVG, XHTML, Maven, SOAP, validation |
 | Security/DoS | `tests/security.rs` | 15 | Billion laughs, deep nesting, etc. |
 | Entity resolver | `tests/entity_resolver.rs` | 14 | Entity expansion edge cases |
-| FFI | `tests/ffi_tests.rs` | 112 | C API surface tests (including SAX) |
+| FFI | `tests/ffi_tests.rs` | 138+ | C API surface tests (SAX, Schematron, CSS) |
 | Schematron | `tests/schematron.rs` | 11 | PO schema, phases, firing rules, namespaces |
+| Property tests | `tests/property_tests.rs` | — | Proptest roundtrip invariants |
+| UBL Validation | `tests/ubl_validation.rs` | 2 | Real-world UBL 2.4 XSD (requires download) |
 | Fuzz targets | `fuzz/` | 11 targets | XML, HTML, HTML5, XPath, roundtrip, SAX, reader, push, validation, schematron |
