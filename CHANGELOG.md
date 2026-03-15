@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-14
+
+### Added
+
+- **ISO Schematron validation** (`validation::schematron` module) — rule-based XML
+  validation per ISO/IEC 19757-3, complementing DTD, RelaxNG, and XSD
+  - `parse_schematron()` / `validate_schematron()` / `validate_schematron_with_phase()` API
+  - Assert/report checks with `XPath`-driven test expressions
+  - Firing rule semantics (first matching rule wins per pattern)
+  - Three-level `<sch:let>` variables (schema, pattern, rule scope)
+  - Message interpolation via `<sch:value-of select="..."/>`
+  - Phase-based selective validation (`<sch:phase>` / `<sch:active>`)
+  - Dual namespace support: ISO (`http://purl.oclc.org/dml/schematron`) and
+    classic 1.5 (`http://www.ascc.net/xml/schematron`), plus `sch:` prefix
+  - 31 unit tests + 11 integration tests with realistic purchase order schema
+- **`xmllint --schematron`** — CLI validation against Schematron schemas, following
+  the existing `--relaxng` and `--schema` patterns
+- **XPath `matches()` function** — regex matching for Schematron pattern validation,
+  with a hand-rolled engine (no `regex` crate dependency) supporting character classes,
+  quantifiers, shorthand (`\d`, `\s`, `\w`), alternation, grouping, counted
+  quantifiers `{n,m}`, and flags (`i`, `s`)
+- **XPath namespace-aware name matching** — `XPathContext::set_namespace()` registers
+  prefix→URI bindings so that prefixed name tests like `//inv:invoice` resolve via
+  namespace URI comparison instead of string matching; Schematron `<sch:ns>` bindings
+  are automatically threaded through
+- **XSD `elementFormDefault` support** — when set to `"qualified"`, child elements
+  in instance documents must carry the schema's target namespace; fixes namespace
+  validation for UBL 2.4 and similar schemas
+- **WASM validation APIs** — `validateRelaxng()`, `validateXsd()`,
+  `validateSchematron()` on `WasmDocument`, returning `WasmValidationResult`
+  with `isValid`, `errors`, and `warnings`
+- **Python validation APIs** — `validate_relaxng()`, `validate_xsd()`,
+  `validate_schematron()` on `Document`, returning `ValidationResult` with
+  `is_valid`, `errors`, `warnings`, and `__bool__()` support
+- `fuzz_schematron` fuzz target for schema parsing and validation (11 total)
+
+### Fixed
+
+- **XPath attribute path returning String instead of NodeSet** — multi-step paths
+  ending with an attribute axis (e.g., `item/@amount`) now correctly return a
+  `NodeSet`, fixing `sum()`, `count()`, and comparison operations on attribute
+  collections
+- **XPath `prefix:*` tokenization** — the lexer now correctly tokenizes namespace
+  wildcard expressions like `inv:*` as a single token instead of failing with a
+  parse error
+- **Schematron message interpolation for NodeSets** — `<sch:value-of>` expressions
+  that return element NodeSets now correctly compute string values using the document
+  context instead of returning empty strings
+
+### Improved
+
+- Unit tests expanded from 988 to 1010
+- Fuzz targets expanded from 10 to 11
+
 ## [0.3.3] - 2026-03-13
 
 ### Added
@@ -196,6 +250,8 @@ Initial release of xmloxide — a pure Rust reimplementation of libxml2.
 - 119/119 libxml2 compatibility tests (100%)
 - Real-world XML, security/DoS, and entity resolver integration tests
 
+[0.4.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.4.0
+[0.3.3]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.3.3
 [0.3.1]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.3.1
 [0.3.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jonwiggins/xmloxide/releases/tag/v0.2.0
