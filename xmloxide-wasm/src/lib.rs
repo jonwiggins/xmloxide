@@ -172,6 +172,80 @@ impl WasmDocument {
     pub fn node_count(&self) -> usize {
         self.inner.node_count()
     }
+
+    // -- Validation --
+
+    /// Validate against a RelaxNG schema (XML string).
+    /// Returns a `WasmValidationResult`.
+    #[wasm_bindgen(js_name = validateRelaxng)]
+    pub fn validate_relaxng(&self, schema_xml: &str) -> Result<WasmValidationResult, JsError> {
+        let schema = xmloxide::validation::relaxng::parse_relaxng(schema_xml)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let result = xmloxide::validation::relaxng::validate(&self.inner, &schema);
+        Ok(WasmValidationResult::from_result(&result))
+    }
+
+    /// Validate against an XML Schema (XSD string).
+    /// Returns a `WasmValidationResult`.
+    #[wasm_bindgen(js_name = validateXsd)]
+    pub fn validate_xsd(&self, schema_xml: &str) -> Result<WasmValidationResult, JsError> {
+        let schema = xmloxide::validation::xsd::parse_xsd(schema_xml)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let result = xmloxide::validation::xsd::validate_xsd(&self.inner, &schema);
+        Ok(WasmValidationResult::from_result(&result))
+    }
+
+    /// Validate against an ISO Schematron schema (XML string).
+    /// Returns a `WasmValidationResult`.
+    #[wasm_bindgen(js_name = validateSchematron)]
+    pub fn validate_schematron(
+        &self,
+        schema_xml: &str,
+    ) -> Result<WasmValidationResult, JsError> {
+        let schema = xmloxide::validation::schematron::parse_schematron(schema_xml)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let result = xmloxide::validation::schematron::validate_schematron(&self.inner, &schema);
+        Ok(WasmValidationResult::from_result(&result))
+    }
+}
+
+/// Result of validating a document against a schema.
+#[wasm_bindgen]
+pub struct WasmValidationResult {
+    valid: bool,
+    error_messages: Vec<String>,
+    warning_messages: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl WasmValidationResult {
+    /// Whether the document is valid.
+    #[wasm_bindgen(getter, js_name = isValid)]
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Validation error messages.
+    #[wasm_bindgen(getter)]
+    pub fn errors(&self) -> Vec<String> {
+        self.error_messages.clone()
+    }
+
+    /// Validation warning messages.
+    #[wasm_bindgen(getter)]
+    pub fn warnings(&self) -> Vec<String> {
+        self.warning_messages.clone()
+    }
+}
+
+impl WasmValidationResult {
+    fn from_result(result: &xmloxide::validation::ValidationResult) -> Self {
+        Self {
+            valid: result.is_valid,
+            error_messages: result.errors.iter().map(|e| e.message.clone()).collect(),
+            warning_messages: result.warnings.iter().map(|w| w.message.clone()).collect(),
+        }
+    }
 }
 
 #[wasm_bindgen]

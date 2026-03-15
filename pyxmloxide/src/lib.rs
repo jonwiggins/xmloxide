@@ -216,6 +216,90 @@ impl Document {
         let count = self.inner.node_count();
         format!("<Document nodes={count}>")
     }
+
+    // --- Validation ---
+
+    /// Validate against a RelaxNG schema (XML string).
+    /// Returns a dict with 'valid', 'errors', and 'warnings' keys.
+    fn validate_relaxng(&self, schema_xml: &str) -> PyResult<ValidationResult> {
+        let schema = xmloxide::validation::relaxng::parse_relaxng(schema_xml)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = xmloxide::validation::relaxng::validate(&self.inner, &schema);
+        Ok(ValidationResult::from_result(&result))
+    }
+
+    /// Validate against an XML Schema (XSD string).
+    /// Returns a dict with 'valid', 'errors', and 'warnings' keys.
+    fn validate_xsd(&self, schema_xml: &str) -> PyResult<ValidationResult> {
+        let schema = xmloxide::validation::xsd::parse_xsd(schema_xml)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = xmloxide::validation::xsd::validate_xsd(&self.inner, &schema);
+        Ok(ValidationResult::from_result(&result))
+    }
+
+    /// Validate against an ISO Schematron schema (XML string).
+    /// Returns a dict with 'valid', 'errors', and 'warnings' keys.
+    fn validate_schematron(&self, schema_xml: &str) -> PyResult<ValidationResult> {
+        let schema = xmloxide::validation::schematron::parse_schematron(schema_xml)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = xmloxide::validation::schematron::validate_schematron(&self.inner, &schema);
+        Ok(ValidationResult::from_result(&result))
+    }
+}
+
+/// Result of validating a document against a schema.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+struct ValidationResult {
+    valid: bool,
+    error_messages: Vec<String>,
+    warning_messages: Vec<String>,
+}
+
+#[pymethods]
+impl ValidationResult {
+    /// Whether the document is valid.
+    #[getter]
+    fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Validation error messages.
+    #[getter]
+    fn errors(&self) -> Vec<String> {
+        self.error_messages.clone()
+    }
+
+    /// Validation warning messages.
+    #[getter]
+    fn warnings(&self) -> Vec<String> {
+        self.warning_messages.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        if self.valid {
+            "ValidationResult(valid=True)".to_string()
+        } else {
+            format!(
+                "ValidationResult(valid=False, errors={})",
+                self.error_messages.len()
+            )
+        }
+    }
+
+    fn __bool__(&self) -> bool {
+        self.valid
+    }
+}
+
+impl ValidationResult {
+    fn from_result(result: &xmloxide::validation::ValidationResult) -> Self {
+        Self {
+            valid: result.is_valid,
+            error_messages: result.errors.iter().map(|e| e.message.clone()).collect(),
+            warning_messages: result.warnings.iter().map(|w| w.message.clone()).collect(),
+        }
+    }
 }
 
 #[pymethods]
@@ -238,5 +322,6 @@ impl NodeId {
 fn pyxmloxide(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Document>()?;
     m.add_class::<NodeId>()?;
+    m.add_class::<ValidationResult>()?;
     Ok(())
 }
