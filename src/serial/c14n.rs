@@ -135,12 +135,28 @@ struct C14nContext<'a> {
 
 impl<'a> C14nContext<'a> {
     fn new(doc: &'a Document, options: &'a C14nOptions) -> Self {
+        // Seed the rendered namespace stack with the implicit `xml` prefix
+        // binding. The XML Namespaces spec reserves `xml` as always bound to
+        // `http://www.w3.org/XML/1998/namespace`. Canonical XML 1.0 §2.3
+        // ("Processing Model") requires that this binding is never emitted:
+        //     "omit namespace node with local name xml, which defines the
+        //      xml prefix, if its string value is
+        //      http://www.w3.org/XML/1998/namespace"
+        // Exclusive C14N §3 defines itself as a variant of Canonical XML and
+        // does not restate this rule — it inherits it. Pre-populating the
+        // binding here makes the dedup check in `compute_ns_declarations`
+        // filter it out automatically when an element uses `xml:lang`,
+        // `xml:space`, or `xml:base`.
+        let mut initial_bindings = NsBinding::new();
+        initial_bindings.insert(
+            "xml".to_string(),
+            "http://www.w3.org/XML/1998/namespace".to_string(),
+        );
         Self {
             doc,
             options,
             output: String::new(),
-            // Start with the implicit xml namespace binding.
-            rendered_ns_stack: vec![NsBinding::new()],
+            rendered_ns_stack: vec![initial_bindings],
         }
     }
 
@@ -1017,5 +1033,72 @@ mod tests {
 
         let result = canonicalize(&doc, &C14nOptions::default());
         assert_eq!(result, "<?before?>\n<root></root>\n<?after?>");
+    }
+
+    #[test]
+    fn test_c14n_inclusive_xml_prefix_not_emitted() {
+        // XML Namespaces reserves the `xml` prefix as implicitly bound to
+        // `http://www.w3.org/XML/1998/namespace`. Canonical XML §2.3 requires
+        // that this binding is never emitted as an `xmlns:xml` declaration.
+        let result = c14n("<root xml:lang=\"en\">hello</root>");
+        assert_eq!(result, "<root xml:lang=\"en\">hello</root>");
+        assert!(
+            !result.contains("xmlns:xml"),
+            "implicit xml namespace should not be emitted, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_c14n_exclusive_xml_prefix_not_emitted_on_root() {
+        // Exclusive C14N §3 is defined as a variant of Canonical XML and
+        // inherits the §2.3 rule that suppresses the implicit `xml` prefix
+        // binding from canonical output.
+        let doc = Document::parse_str("<root xml:lang=\"en\">hello</root>").unwrap();
+        let result = canonicalize(
+            &doc,
+            &C14nOptions {
+                with_comments: false,
+                exclusive: true,
+                inclusive_prefixes: vec![],
+            },
+        );
+        assert_eq!(result, "<root xml:lang=\"en\">hello</root>");
+        assert!(!result.contains("xmlns:xml"));
+    }
+
+    #[test]
+    fn test_c14n_exclusive_xml_prefix_not_emitted_on_subtree() {
+        // When canonicalizing a subtree whose ancestor carries `xml:lang`,
+        // the subtree must not spuriously declare `xmlns:xml` just because
+        // an `xml:` attribute appears in scope.
+        let doc = Document::parse_str(
+            "<root xmlns=\"http://example.com\" xml:lang=\"en\">\
+             <child xml:space=\"preserve\">hi</child></root>",
+        )
+        .unwrap();
+        let root = doc.root_element().unwrap();
+        let child = doc
+            .children(root)
+            .find(|&n| doc.node_name(n) == Some("child"))
+            .unwrap();
+
+        let result = canonicalize_subtree(
+            &doc,
+            child,
+            &C14nOptions {
+                with_comments: false,
+                exclusive: true,
+                inclusive_prefixes: vec![],
+            },
+        );
+
+        assert!(
+            !result.contains("xmlns:xml"),
+            "implicit xml namespace should not be emitted in exclusive C14N, got: {result}"
+        );
+        // The default namespace from the root IS visibly utilized by the
+        // child element's unprefixed name, so it should appear.
+        assert!(result.contains("xmlns=\"http://example.com\""));
+        assert!(result.contains("xml:space=\"preserve\""));
     }
 }
