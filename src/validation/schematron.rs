@@ -552,10 +552,8 @@ fn parse_message_parts(doc: &Document, ns_mode: &NsMode, node: NodeId) -> Vec<Me
     let mut parts = Vec::new();
     for child in doc.children(node) {
         match &doc.node(child).kind {
-            NodeKind::Text { content } => {
-                if !content.is_empty() {
-                    parts.push(MessagePart::Text(content.clone()));
-                }
+            NodeKind::Text { content } if !content.is_empty() => {
+                parts.push(MessagePart::Text(content.clone()));
             }
             NodeKind::Element { .. } => {
                 let name = doc.node_name(child).unwrap_or("");

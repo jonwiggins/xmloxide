@@ -105,15 +105,11 @@ fn parse_test_file(content: &str) -> Vec<TreeTest> {
                     }
                     data.push_str(line);
                 }
-                "errors" => {
-                    if !line.is_empty() {
-                        errors += 1;
-                    }
+                "errors" if !line.is_empty() => {
+                    errors += 1;
                 }
-                "new-errors" => {
-                    if !line.is_empty() {
-                        new_errors += 1;
-                    }
+                "new-errors" if !line.is_empty() => {
+                    new_errors += 1;
                 }
                 "fragment" => {
                     fragment_context = Some(line.to_string());

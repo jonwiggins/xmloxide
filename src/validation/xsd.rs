@@ -1739,59 +1739,55 @@ fn validate_builtin_value(
         "unsignedInt" | "unsignedLong" | "unsignedShort" | "unsignedByte" => {
             validate_unsigned_integer(value, type_name, context, errors);
         }
-        "decimal" => {
-            if parse_decimal(value).is_none() {
-                errors.push(ValidationError {
-                    message: format!("value \"{value}\" in <{context}> is not a valid decimal"),
-                    line: None,
-                    column: None,
-                });
-            }
+        "decimal" if parse_decimal(value).is_none() => {
+            errors.push(ValidationError {
+                message: format!("value \"{value}\" in <{context}> is not a valid decimal"),
+                line: None,
+                column: None,
+            });
         }
-        "float" | "double" => {
-            if !matches!(value, "INF" | "-INF" | "NaN") && value.parse::<f64>().is_err() {
-                errors.push(ValidationError {
-                    message: format!("value \"{value}\" in <{context}> is not a valid {type_name}"),
-                    line: None,
-                    column: None,
-                });
-            }
+        "float" | "double"
+            if !matches!(value, "INF" | "-INF" | "NaN") && value.parse::<f64>().is_err() =>
+        {
+            errors.push(ValidationError {
+                message: format!("value \"{value}\" in <{context}> is not a valid {type_name}"),
+                line: None,
+                column: None,
+            });
         }
-        "boolean" => {
-            if !matches!(value, "true" | "false" | "1" | "0") {
-                errors.push(ValidationError {
-                    message: format!("value \"{value}\" in <{context}> is not a valid boolean (expected true, false, 1, or 0)"),
-                    line: None, column: None,
-                });
-            }
+        "boolean" if !matches!(value, "true" | "false" | "1" | "0") => {
+            errors.push(ValidationError {
+                message: format!(
+                    "value \"{value}\" in <{context}> is not a valid boolean (expected true, false, 1, or 0)"
+                ),
+                line: None,
+                column: None,
+            });
         }
-        "date" => {
-            if !is_valid_date_pattern(value) {
-                errors.push(ValidationError {
-                    message: format!("value \"{value}\" in <{context}> is not a valid date (expected YYYY-MM-DD)"),
-                    line: None, column: None,
-                });
-            }
+        "date" if !is_valid_date_pattern(value) => {
+            errors.push(ValidationError {
+                message: format!(
+                    "value \"{value}\" in <{context}> is not a valid date (expected YYYY-MM-DD)"
+                ),
+                line: None,
+                column: None,
+            });
         }
-        "dateTime" => {
-            if !is_valid_datetime_pattern(value) {
-                errors.push(ValidationError {
-                    message: format!("value \"{value}\" in <{context}> is not a valid dateTime"),
-                    line: None,
-                    column: None,
-                });
-            }
+        "dateTime" if !is_valid_datetime_pattern(value) => {
+            errors.push(ValidationError {
+                message: format!("value \"{value}\" in <{context}> is not a valid dateTime"),
+                line: None,
+                column: None,
+            });
         }
-        "time" => {
-            if !is_valid_time_pattern(value) {
-                errors.push(ValidationError {
-                    message: format!(
-                        "value \"{value}\" in <{context}> is not a valid time (expected hh:mm:ss)"
-                    ),
-                    line: None,
-                    column: None,
-                });
-            }
+        "time" if !is_valid_time_pattern(value) => {
+            errors.push(ValidationError {
+                message: format!(
+                    "value \"{value}\" in <{context}> is not a valid time (expected hh:mm:ss)"
+                ),
+                line: None,
+                column: None,
+            });
         }
         _ => {}
     }
