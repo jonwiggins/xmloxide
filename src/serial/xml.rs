@@ -144,10 +144,8 @@ fn is_element_only(doc: &Document, id: NodeId) -> bool {
     for child in doc.children(id) {
         match &doc.node(child).kind {
             NodeKind::Element { .. } => has_element_child = true,
-            NodeKind::Text { content } => {
-                if !content.trim().is_empty() {
-                    return false;
-                }
+            NodeKind::Text { content } if !content.trim().is_empty() => {
+                return false;
             }
             NodeKind::CData { .. } | NodeKind::EntityRef { .. } => return false,
             _ => {}

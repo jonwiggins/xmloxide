@@ -4286,12 +4286,12 @@ impl<'a> TreeBuilder<'a> {
                     self.insert_html_element(&name, &attributes);
                 }
             }
-            Token::EndTag { ref name } if name == "frameset" => {
-                if self.current_node_name() != "html" {
-                    self.open_elements.pop();
-                    if self.current_node_name() != "frameset" {
-                        self.mode = InsertionMode::AfterFrameset;
-                    }
+            Token::EndTag { ref name }
+                if name == "frameset" && self.current_node_name() != "html" =>
+            {
+                self.open_elements.pop();
+                if self.current_node_name() != "frameset" {
+                    self.mode = InsertionMode::AfterFrameset;
                 }
             }
             Token::StartTag { ref name, .. } if name == "frame" => {

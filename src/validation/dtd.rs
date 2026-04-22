@@ -2556,18 +2556,18 @@ fn validate_attributes(
                         column: None,
                     });
                 }
-                (AttributeDefault::Fixed(fixed_val), Some(attr)) => {
-                    if attr.value != *fixed_val {
-                        errors.push(ValidationError {
-                            message: format!(
-                                "attribute '{}' on element '{elem_name}' must have \
-                                 fixed value '{fixed_val}', found '{}'",
-                                decl.attribute_name, attr.value
-                            ),
-                            line: None,
-                            column: None,
-                        });
-                    }
+                (AttributeDefault::Fixed(fixed_val), Some(attr))
+                    if attr.value != *fixed_val =>
+                {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "attribute '{}' on element '{elem_name}' must have \
+                             fixed value '{fixed_val}', found '{}'",
+                            decl.attribute_name, attr.value
+                        ),
+                        line: None,
+                        column: None,
+                    });
                 }
                 _ => {}
             }
