@@ -1775,9 +1775,7 @@ fn validate_builtin_value(
         }
         "dateTime" if !is_valid_datetime_pattern(value) => {
             errors.push(ValidationError {
-                message: format!(
-                    "value \"{value}\" in <{context}> is not a valid dateTime"
-                ),
+                message: format!("value \"{value}\" in <{context}> is not a valid dateTime"),
                 line: None,
                 column: None,
             });

@@ -2556,9 +2556,7 @@ fn validate_attributes(
                         column: None,
                     });
                 }
-                (AttributeDefault::Fixed(fixed_val), Some(attr))
-                    if attr.value != *fixed_val =>
-                {
+                (AttributeDefault::Fixed(fixed_val), Some(attr)) if attr.value != *fixed_val => {
                     errors.push(ValidationError {
                         message: format!(
                             "attribute '{}' on element '{elem_name}' must have \
