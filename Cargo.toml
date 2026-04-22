@@ -79,6 +79,9 @@ name = "xmllint"
 path = "src/bin/xmllint.rs"
 required-features = ["cli"]
 
+[profile.release]
+strip = true
+
 [profile.bench]
 lto = "thin"
 codegen-units = 1
