@@ -329,10 +329,26 @@ impl<'a> C14nContext<'a> {
         let mut ns_to_output: Vec<(String, String)> = Vec::new();
 
         for (ns_prefix, ns_uri) in &ns_decls {
-            if current_rendered.get(ns_prefix) != Some(ns_uri) {
-                ns_to_output.push((ns_prefix.clone(), ns_uri.clone()));
-                current_rendered.insert(ns_prefix.clone(), ns_uri.clone());
+            if current_rendered.get(ns_prefix) == Some(ns_uri) {
+                continue;
             }
+
+            // Special case for `xmlns=""`: per Canonical XML 1.0 §3.7 and
+            // c14n11 §3.1, the empty default-namespace declaration is only
+            // emitted to undeclare a *non-empty* inherited default. If no
+            // non-empty default is currently in scope (parent has no default,
+            // or the inherited default is itself empty), the `xmlns=""` from
+            // the source must not appear in the canonical form.
+            if ns_prefix.is_empty() && ns_uri.is_empty() {
+                let has_nonempty_inherited_default =
+                    current_rendered.get("").is_some_and(|s| !s.is_empty());
+                if !has_nonempty_inherited_default {
+                    continue;
+                }
+            }
+
+            ns_to_output.push((ns_prefix.clone(), ns_uri.clone()));
+            current_rendered.insert(ns_prefix.clone(), ns_uri.clone());
         }
 
         if !self.options.exclusive {
