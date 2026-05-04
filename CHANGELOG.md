@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-05-04
+
+### Fixed
+
+- **Exclusive C14N: emit `xmlns=""` default-namespace undeclaration** when an
+  element with no default namespace is canonicalized inside scope of an
+  inherited default namespace (#16, thanks @williamareynolds). Previously the
+  undeclaration was only emitted in inclusive C14N. Per Canonical XML 1.0 §2.3
+  (inherited by Exclusive C14N §3), the empty default namespace must be made
+  explicit so the canonical form correctly reflects the element's namespace
+  context.
+
+### CI / Maintenance
+
+- Bump `actions/checkout` 4.3.1 → 6.0.2 across all workflows (#14)
+- Bump `actions/download-artifact` v4 → v8.0.1 in release workflow (#13)
+- Bump `actions/upload-artifact` v4 → v7.0.1 in release workflow (#15)
+- Bump `softprops/action-gh-release` v2 → v3.0.0 in release workflow (#12)
+- Bump `taiki-e/install-action` 2.75.19 → 2.75.26 in release workflow (#17)
+- Remove `bench.yml` workflow — the regression check required a `gh-pages`
+  branch that was never created, so it had been failing on every PR. Run
+  benchmarks locally with `cargo bench`.
+
 ## [0.4.1] - 2026-03-15
 
 ### Added
