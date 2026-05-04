@@ -335,14 +335,20 @@ impl<'a> C14nContext<'a> {
             }
         }
 
-        if !self.options.exclusive {
-            self.check_default_ns_undeclaration(
-                &ns_decls,
-                attributes,
-                &mut ns_to_output,
-                &mut current_rendered,
-            );
-        }
+        // The default-namespace undeclaration rule applies in both modes. If
+        // the parent's default namespace is non-empty and visibly rendered in
+        // scope, and the current element is in no namespace (the source has
+        // an explicit `xmlns=""`), the canonical output must emit `xmlns=""`
+        // to undeclare it. Canonical XML 1.0 §2.3 covers the inclusive case;
+        // Exclusive C14N §3 inherits the rule (the default prefix is part of
+        // the visibly-utilized set when an explicit undeclaration is present
+        // in the source and the inherited default would otherwise propagate).
+        self.check_default_ns_undeclaration(
+            &ns_decls,
+            attributes,
+            &mut ns_to_output,
+            &mut current_rendered,
+        );
 
         // Suppress unused variable warnings for future use
         let _ = (id, name);
@@ -1100,5 +1106,63 @@ mod tests {
         // child element's unprefixed name, so it should appear.
         assert!(result.contains("xmlns=\"http://example.com\""));
         assert!(result.contains("xml:space=\"preserve\""));
+    }
+
+    /// W3C Canonical XML §2.3 — when a child element is in no namespace under
+    /// a parent that has a non-empty default namespace, the canonical output
+    /// must emit `xmlns=""` to undeclare the inherited default. This is the
+    /// inclusive-mode baseline; libxml2's `xmllint --c14n` exhibits the same.
+    #[test]
+    fn test_c14n_inclusive_emits_default_ns_undeclaration() {
+        let xml =
+            r#"<Envelope xmlns="http://example.org/usps"><NonNs xmlns="">child</NonNs></Envelope>"#;
+        let result = c14n(xml);
+        assert!(
+            result.contains("<NonNs xmlns=\"\">"),
+            "default namespace undeclaration missing, got: {result}"
+        );
+    }
+
+    /// W3C Exclusive C14N §3 inherits Canonical XML's default-namespace
+    /// undeclaration rule. Without it, the canonical form leaks the parent's
+    /// default namespace into a child that explicitly has none, producing a
+    /// digest that diverges from libxml2 / xmlsec.
+    #[test]
+    fn test_c14n_exclusive_emits_default_ns_undeclaration() {
+        let xml =
+            r#"<Envelope xmlns="http://example.org/usps"><NonNs xmlns="">child</NonNs></Envelope>"#;
+        let doc = Document::parse_str(xml).unwrap();
+        let result = canonicalize(
+            &doc,
+            &C14nOptions {
+                with_comments: false,
+                exclusive: true,
+                inclusive_prefixes: vec![],
+            },
+        );
+        assert!(
+            result.contains("<NonNs xmlns=\"\">"),
+            "exclusive C14N must emit xmlns=\"\" to undeclare inherited default ns, got: {result}"
+        );
+    }
+
+    /// Negative companion: when no inherited default exists, the output must
+    /// NOT emit a spurious `xmlns=""`.
+    #[test]
+    fn test_c14n_exclusive_no_undeclaration_when_no_inherited_default() {
+        let xml = r"<root><child>x</child></root>";
+        let doc = Document::parse_str(xml).unwrap();
+        let result = canonicalize(
+            &doc,
+            &C14nOptions {
+                with_comments: false,
+                exclusive: true,
+                inclusive_prefixes: vec![],
+            },
+        );
+        assert!(
+            !result.contains("xmlns=\"\""),
+            "exclusive C14N must not emit xmlns=\"\" when no inherited default to undeclare, got: {result}"
+        );
     }
 }
