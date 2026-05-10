@@ -1,0 +1,5 @@
+<n0:pdu xmlns:n0="http://a.example">
+   <n1:elem1 xmlns:n1="http://b.example">
+       content
+   </n1:elem1>
+</n0:pdu>

@@ -422,11 +422,14 @@ impl<'a> XmlParser<'a> {
             let _ = found_dup; // suppress unused warning
         }
 
-        // --- Apply #FIXED default attributes from DTD ATTLIST declarations ---
-        // Per XML 1.0 §3.3.2, if an attribute declared with #FIXED is not
+        // --- Apply DTD ATTLIST default attributes (#FIXED and #DEFAULT) ---
+        // Per XML 1.0 §3.3.2, when an attribute declared in an ATTLIST is not
         // present on the element, the parser must add it with the declared
-        // default value. #DEFAULT attributes are tracked for amplification
-        // factor checking but not inserted into the tree (matching libxml2).
+        // default value. This applies to both `#FIXED "v"` and bare `"v"`
+        // (so-called #DEFAULT) declarations. libxml2 applies both during
+        // normal parsing — verifiable via `xmllint --c14n` on a document
+        // with an ATTLIST default, which emits the default attribute in the
+        // canonical form.
         // Namespace declarations (xmlns, xmlns:prefix) are inserted before
         // other attributes to match libxml2's attribute ordering.
         if let Some(defaults) = if self.attr_defaults.is_empty() {
@@ -453,27 +456,29 @@ impl<'a> XmlParser<'a> {
                         .any(|a| a.name == decl_local && a.prefix.as_deref() == decl_pfx);
                     if !already_present {
                         // Track expansion for amplification factor check
-                        // (both #FIXED and #DEFAULT contribute to expansion)
+                        // (both #FIXED and #DEFAULT contribute to expansion).
                         self.expansion_size += attr_name.len() + value.len();
 
-                        // Only insert #FIXED attributes into the tree
-                        if is_fixed {
-                            let (decl_prefix, decl_local) = split_name(attr_name);
-                            let attr = Attribute {
-                                name: decl_local.to_string(),
-                                value,
-                                prefix: decl_prefix.map(String::from),
-                                namespace: None,
-                                raw_value: None,
-                            };
-                            let is_ns_decl =
-                                attr_name == "xmlns" || attr_name.starts_with("xmlns:");
-                            if is_ns_decl {
-                                attributes.insert(insert_pos, attr);
-                                insert_pos += 1;
-                            } else {
-                                attributes.push(attr);
-                            }
+                        // Insert both #FIXED and #DEFAULT defaults into the
+                        // tree. The `is_fixed` flag is no longer used to gate
+                        // insertion; it would only matter if we additionally
+                        // validated source attributes against #FIXED values,
+                        // which is a separate validation step.
+                        let _ = is_fixed;
+                        let (decl_prefix, decl_local) = split_name(attr_name);
+                        let attr = Attribute {
+                            name: decl_local.to_string(),
+                            value,
+                            prefix: decl_prefix.map(String::from),
+                            namespace: None,
+                            raw_value: None,
+                        };
+                        let is_ns_decl = attr_name == "xmlns" || attr_name.starts_with("xmlns:");
+                        if is_ns_decl {
+                            attributes.insert(insert_pos, attr);
+                            insert_pos += 1;
+                        } else {
+                            attributes.push(attr);
                         }
                     }
                 }
