@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-07-20
+
+### Security
+
+- **Fix stack exhaustion when parsing deeply-nested DTD content models**
+  (CVE-2026-61727 / GHSA-7jmw-29gc-ffx4, thanks @williamareynolds). The DTD
+  parser recursed without a depth bound when parsing an `<!ELEMENT>` content
+  model, so a small untrusted document with many nested `(` in a content model
+  could overflow the stack and abort the process — an uncatchable denial of
+  service (CWE-674). This is reachable on the default parse path because the
+  internal DTD subset is parsed during ordinary parsing, and the existing
+  `ParseOptions::max_depth` did not cover it (it bounds element nesting, not the
+  DTD content-model grammar). The content-model recursion is now bounded at 256
+  levels and returns a normal `ParseError` past the limit; well-formed DTDs are
+  unaffected.
+
 ## [0.4.3] - 2026-05-04
 
 ### Fixed

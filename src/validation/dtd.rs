@@ -629,6 +629,15 @@ pub fn parse_dtd(input: &str) -> Result<Dtd, ParseError> {
     parser.parse()
 }
 
+/// Maximum nesting depth for `<!ELEMENT>` content-model groups.
+///
+/// Bounds the mutual recursion between [`DtdParser::parse_content_spec_group`]
+/// and [`DtdParser::parse_content_particle`] so that a deeply-nested
+/// parenthesised content model cannot exhaust the stack (CWE-674). Matches
+/// the spirit of the parser's `DEFAULT_MAX_DEPTH`, which bounds element
+/// nesting but does not reach the DTD content-model grammar.
+const MAX_CONTENT_MODEL_DEPTH: u32 = 256;
+
 /// Internal DTD parser state.
 struct DtdParser<'a> {
     input: &'a [u8],
@@ -1097,15 +1106,26 @@ impl<'a> DtdParser<'a> {
             return Ok(ContentModel::Mixed(names));
         }
 
-        // Element-only content: parse as a content spec group
-        let spec = self.parse_content_spec_group()?;
+        // Element-only content: parse as a content spec group. The opening
+        // '(' has already been consumed, so we are one level deep.
+        let spec = self.parse_content_spec_group(1)?;
         Ok(ContentModel::Children(spec))
     }
 
     /// Parses a content spec starting after the opening '(' has been consumed
     /// and the first item is NOT `#PCDATA`.
-    fn parse_content_spec_group(&mut self) -> Result<ContentSpec, ParseError> {
-        let mut first = self.parse_content_particle()?;
+    ///
+    /// `depth` is the current parenthesis-nesting level (1 for the outermost
+    /// group). It bounds the mutual recursion with `parse_content_particle` so
+    /// that untrusted input cannot exhaust the stack; see
+    /// [`MAX_CONTENT_MODEL_DEPTH`].
+    fn parse_content_spec_group(&mut self, depth: u32) -> Result<ContentSpec, ParseError> {
+        if depth > MAX_CONTENT_MODEL_DEPTH {
+            return Err(self.fatal(format!(
+                "content model nesting exceeds maximum depth of {MAX_CONTENT_MODEL_DEPTH}"
+            )));
+        }
+        let mut first = self.parse_content_particle(depth)?;
         self.skip_whitespace();
 
         // Determine if this is a sequence (,) or choice (|)
@@ -1115,7 +1135,7 @@ impl<'a> DtdParser<'a> {
             while self.peek() == Some(b',') {
                 self.advance(1);
                 self.skip_whitespace();
-                let item = self.parse_content_particle()?;
+                let item = self.parse_content_particle(depth)?;
                 items.push(item);
                 self.skip_whitespace();
             }
@@ -1131,7 +1151,7 @@ impl<'a> DtdParser<'a> {
             while self.peek() == Some(b'|') {
                 self.advance(1);
                 self.skip_whitespace();
-                let item = self.parse_content_particle()?;
+                let item = self.parse_content_particle(depth)?;
                 items.push(item);
                 self.skip_whitespace();
             }
@@ -1169,11 +1189,16 @@ impl<'a> DtdParser<'a> {
         }
     }
 
-    fn parse_content_particle(&mut self) -> Result<ContentSpec, ParseError> {
+    /// Parses a single content particle: a name with an optional occurrence
+    /// indicator, or a nested parenthesised group.
+    ///
+    /// `depth` is the enclosing parenthesis-nesting level; a nested group
+    /// recurses at `depth + 1`. See [`MAX_CONTENT_MODEL_DEPTH`].
+    fn parse_content_particle(&mut self, depth: u32) -> Result<ContentSpec, ParseError> {
         if self.peek() == Some(b'(') {
             self.advance(1);
             self.skip_whitespace();
-            self.parse_content_spec_group()
+            self.parse_content_spec_group(depth + 1)
         } else {
             let name = self.parse_name()?;
             let occurrence = self.parse_occurrence();
@@ -3624,5 +3649,35 @@ mod tests {
         // Verify the nodes are the correct elements
         assert_eq!(doc.node_name(item_a.unwrap()), Some("item"));
         assert_eq!(doc.node_name(item_b.unwrap()), Some("item"));
+    }
+
+    #[test]
+    fn test_content_model_deep_nesting_is_bounded() {
+        // Regression test for CVE-2026-61727 (GHSA-7jmw-29gc-ffx4): a content
+        // model with deeply nested '(' must return a normal error instead of
+        // recursing until the stack overflows.
+        let depth = (MAX_CONTENT_MODEL_DEPTH as usize) + 50;
+        let mut src = String::from("<!ELEMENT r ");
+        src.push_str(&"(".repeat(depth));
+        src.push('a');
+        src.push_str(&")".repeat(depth));
+        src.push('>');
+
+        let result = parse_dtd(&src);
+        let Err(err) = result else {
+            panic!("expected deep content model to be rejected, got Ok");
+        };
+        assert!(
+            err.message.contains("maximum depth"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_content_model_shallow_nesting_still_parses() {
+        // The depth bound must not affect ordinary, shallowly-nested models.
+        let dtd = parse_dtd("<!ELEMENT a (b,(c|d),e)>").unwrap();
+        assert!(dtd.elements.contains_key("a"));
     }
 }
