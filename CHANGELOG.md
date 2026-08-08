@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-08
 
 ### Changed
 
@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `xmloxide_xpath_nodeset_item()` (returns the owner element id for
   attributes) and adds `xmloxide_xpath_nodeset_item_is_attribute()`,
   `..._attr_name()`, and `..._attr_value()`.
+- **XPath step predicates apply per context node** per XPath 1.0 §2.4:
+  `//a/b[1]` now selects the first `b` of *every* `a` (previously the first
+  of the merged set), and `position()`/`last()` in step predicates are
+  relative to each context node's own node-set, matching libxml2. The
+  parenthesized form `(//a/b)[1]` keeps global-position semantics.
+- **Schematron rules with attribute contexts** (`context="//@id"`) now fire
+  with the attribute itself as the context node — `.` is the attribute
+  value and `<value-of select="."/>` reads it, per ISO Schematron.
+  Previously such rules either never fired (single match) or misfired
+  against the owner element.
 
 ### Security
 
