@@ -712,15 +712,16 @@ fn validate_pattern_refs(
     let ns = &schema.namespaces;
 
     // Evaluate schema-level variables at the document root
-    let schema_vars = eval_variables(doc, root, &schema.variables, &HashMap::new(), ns);
+    let root_node = XPathNode::Node(root);
+    let schema_vars = eval_variables(doc, root_node, &schema.variables, &HashMap::new(), ns);
 
     for pattern in patterns {
         // Per-pattern fired_nodes tracking (firing rule semantics)
-        let mut fired_nodes: HashSet<NodeId> = HashSet::new();
+        let mut fired_nodes: HashSet<XPathNode> = HashSet::new();
 
         // Evaluate pattern-level variables
         let mut pattern_vars = schema_vars.clone();
-        let extra = eval_variables(doc, root, &pattern.variables, &pattern_vars, ns);
+        let extra = eval_variables(doc, root_node, &pattern.variables, &pattern_vars, ns);
         pattern_vars.extend(extra);
 
         for rule in &pattern.rules {
@@ -815,13 +816,16 @@ fn validate_pattern_refs(
 }
 
 /// Creates an `XPathContext` with variables and namespace bindings.
+///
+/// The context node may be an attribute node (e.g., for rules whose
+/// context expression selects attributes).
 fn make_xpath_context<'a>(
     doc: &'a Document,
-    node: NodeId,
+    node: XPathNode,
     variables: &HashMap<String, XPathValue>,
     ns_bindings: &[NamespaceBinding],
 ) -> XPathContext<'a> {
-    let mut ctx = XPathContext::new(doc, node);
+    let mut ctx = XPathContext::new_at(doc, node);
     for (name, value) in variables {
         ctx.set_variable(name, value.clone());
     }
@@ -833,20 +837,20 @@ fn make_xpath_context<'a>(
 
 /// Evaluates an `XPath` context expression and returns the matching nodes.
 ///
-/// Attribute nodes in the result are anchored to their owner element:
-/// Schematron rule contexts fire on the element carrying the attribute.
+/// The result may contain attribute nodes: a rule whose context selects
+/// attributes fires with the attribute itself as the context node.
 fn eval_context_xpath(
     doc: &Document,
     root: NodeId,
     xpath_expr: &str,
     variables: &HashMap<String, XPathValue>,
     ns_bindings: &[NamespaceBinding],
-) -> Result<Vec<NodeId>, XPathError> {
+) -> Result<Vec<XPathNode>, XPathError> {
     let expr = xpath::parser::parse(xpath_expr)?;
-    let ctx = make_xpath_context(doc, root, variables, ns_bindings);
+    let ctx = make_xpath_context(doc, XPathNode::Node(root), variables, ns_bindings);
     let result = ctx.evaluate(&expr)?;
     match result {
-        XPathValue::NodeSet(nodes) => Ok(nodes.into_iter().map(XPathNode::anchor).collect()),
+        XPathValue::NodeSet(nodes) => Ok(nodes),
         _ => Ok(vec![]),
     }
 }
@@ -854,7 +858,7 @@ fn eval_context_xpath(
 /// Evaluates a test expression at a context node, returning a boolean.
 fn eval_test(
     doc: &Document,
-    node: NodeId,
+    node: XPathNode,
     test_expr: &str,
     variables: &HashMap<String, XPathValue>,
     ns_bindings: &[NamespaceBinding],
@@ -868,7 +872,7 @@ fn eval_test(
 /// Evaluates `<sch:let>` bindings and returns the resulting variable map.
 fn eval_variables(
     doc: &Document,
-    context_node: NodeId,
+    context_node: XPathNode,
     bindings: &[LetBinding],
     existing: &HashMap<String, XPathValue>,
     ns_bindings: &[NamespaceBinding],
@@ -897,7 +901,7 @@ fn eval_variables(
 /// Interpolates message parts by evaluating `<sch:value-of>` expressions.
 fn interpolate_message(
     doc: &Document,
-    node: NodeId,
+    node: XPathNode,
     parts: &[MessagePart],
     variables: &HashMap<String, XPathValue>,
     ns_bindings: &[NamespaceBinding],
@@ -1483,6 +1487,61 @@ mod tests {
         let result = validate_schematron(&doc, &schema);
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].message, "Order 42 has 3 items");
+    }
+
+    #[test]
+    fn test_attribute_rule_context() {
+        // A rule context selecting attribute nodes evaluates its asserts
+        // with the ATTRIBUTE as the context node: `.` is the attribute
+        // value, not the owner element's text content.
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <pattern>
+                <rule context="//@id">
+                  <assert test=". = 'x'">id must be x (got <value-of select="."/>)</assert>
+                </rule>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+        // Valid: the id attribute IS 'x' even though the element text differs.
+        let doc = Document::parse_str(r#"<r><a id="x">element text</a></r>"#).unwrap();
+        let result = validate_schematron(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        // Invalid: the assert fails and value-of reads the attribute value.
+        let doc2 = Document::parse_str(r#"<r><a id="y">element text</a></r>"#).unwrap();
+        let result2 = validate_schematron(&doc2, &schema);
+        assert!(!result2.is_valid);
+        assert_eq!(result2.errors[0].message, "id must be x (got y)");
+    }
+
+    #[test]
+    fn test_attribute_rule_context_does_not_mask_element_rules() {
+        // Firing an attribute-context rule must not mark the owner ELEMENT
+        // as fired for later rules in the same pattern.
+        let schema = parse_schematron(
+            r#"
+            <schema xmlns="http://purl.oclc.org/dml/schematron">
+              <pattern>
+                <rule context="//item/@code">
+                  <assert test="string-length(.) >= 3">code too short</assert>
+                </rule>
+                <rule context="//item">
+                  <assert test="@name">item must have a name attribute</assert>
+                </rule>
+              </pattern>
+            </schema>
+            "#,
+        )
+        .unwrap();
+        // code is fine but @name is missing: exactly the element rule fires.
+        let doc = Document::parse_str(r#"<order><item code="XYZ"/></order>"#).unwrap();
+        let result = validate_schematron(&doc, &schema);
+        assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
+        assert_eq!(result.errors[0].message, "item must have a name attribute");
     }
 
     // ===================================================================

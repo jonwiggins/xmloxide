@@ -445,14 +445,15 @@ fn evaluate_xpath(filename: &str, doc: &Document, expression: &str) {
                             println!("{content}");
                         }
                         xpath::XPathNode::Attribute { owner, index } => {
-                            // Print attribute nodes as name="value", matching
-                            // libxml2's xmllint output.
+                            // Print attribute nodes as name="value" with the
+                            // value XML-escaped, matching libxml2's xmllint.
                             if let Some(attr) = doc.attributes(owner).get(index as usize) {
+                                let value = escape_attribute_value(&attr.value);
                                 match &attr.prefix {
                                     Some(prefix) => {
-                                        println!("{prefix}:{}=\"{}\"", attr.name, attr.value);
+                                        println!("{prefix}:{}=\"{value}\"", attr.name);
                                     }
-                                    None => println!("{}=\"{}\"", attr.name, attr.value),
+                                    None => println!("{}=\"{value}\"", attr.name),
                                 }
                             }
                         }
@@ -476,6 +477,21 @@ fn evaluate_xpath(filename: &str, doc: &Document, expression: &str) {
 }
 
 /// Serializes a single node and its subtree to XML.
+/// Escapes an attribute value for `name="value"` output (XML 1.0 §2.3).
+fn escape_attribute_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn serialize_subtree(doc: &Document, node_id: NodeId) -> String {
     let mut output = String::new();
     serialize_node_recursive(doc, node_id, &mut output);

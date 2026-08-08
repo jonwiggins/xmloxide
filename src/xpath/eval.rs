@@ -82,9 +82,20 @@ impl<'a> XPathContext<'a> {
     /// node is the only member of a singleton node-set).
     #[must_use]
     pub fn new(doc: &'a Document, context_node: NodeId) -> Self {
+        Self::new_at(doc, XPathNode::Node(context_node))
+    }
+
+    /// Creates a new evaluation context at an arbitrary `XPath` node,
+    /// including an attribute node.
+    ///
+    /// Used when the context node comes from a previous `XPath` evaluation
+    /// (e.g., a Schematron rule whose context expression selects
+    /// attributes).
+    #[must_use]
+    pub fn new_at(doc: &'a Document, context_node: XPathNode) -> Self {
         Self {
             doc,
-            context_node: XPathNode::Node(context_node),
+            context_node,
             context_position: 1,
             context_size: 1,
             variables: HashMap::new(),
@@ -313,30 +324,53 @@ impl<'a> XPathContext<'a> {
     fn apply_step(&self, input: &[XPathNode], step: &Step) -> Result<Vec<XPathNode>, XPathError> {
         let mut result: Vec<XPathNode> = Vec::new();
 
-        if input.len() == 1 {
-            // Fast path: single input node — no dedup needed.
-            self.expand_axis_filtered(input[0], step.axis, &step.node_test, &mut result);
+        if step.predicates.is_empty() {
+            if input.len() == 1 {
+                // Fast path: single input node — no dedup needed.
+                self.expand_axis_filtered(input[0], step.axis, &step.node_test, &mut result);
+            } else {
+                // Multiple input nodes — need dedup via HashSet.
+                let mut seen = HashSet::new();
+                for &node in input {
+                    self.expand_axis_filtered_dedup(
+                        node,
+                        step.axis,
+                        &step.node_test,
+                        &mut result,
+                        &mut seen,
+                    );
+                }
+            }
         } else {
-            // Multiple input nodes — need dedup via HashSet.
-            let mut seen = HashSet::new();
+            // Predicates filter the node-set generated for EACH context node
+            // separately, with proximity positions relative to that
+            // per-context set (XPath 1.0 §2.4/§3.3): //a/b[1] selects the
+            // first b of every a. The per-context results are then merged
+            // with duplicates removed.
+            let mut seen: HashSet<XPathNode> = HashSet::new();
             for &node in input {
-                self.expand_axis_filtered_dedup(
-                    node,
-                    step.axis,
-                    &step.node_test,
-                    &mut result,
-                    &mut seen,
-                );
+                let mut per_node = Vec::new();
+                self.expand_axis_filtered(node, step.axis, &step.node_test, &mut per_node);
+                for pred in &step.predicates {
+                    per_node = self.apply_predicate(&per_node, pred)?;
+                }
+                if input.len() == 1 {
+                    result = per_node;
+                    break;
+                }
+                for n in per_node {
+                    if seen.insert(n) {
+                        result.push(n);
+                    }
+                }
             }
         }
 
-        // Apply predicates
-        for pred in &step.predicates {
-            result = self.apply_predicate(&result, pred)?;
-        }
-
         // Sort into document order. Skip for axes that naturally produce
-        // document-order results when input is already ordered (the common case).
+        // document-order results when input is already ordered (the common
+        // case) — unless the input mixes in attribute entries, whose axis
+        // expansions (e.g. descendant-or-self, following) do not concatenate
+        // in document order with their owner's.
         let needs_sort = !matches!(
             step.axis,
             Axis::Child
@@ -346,7 +380,8 @@ impl<'a> XPathContext<'a> {
                 | Axis::Following
                 | Axis::FollowingSibling
         );
-        if needs_sort {
+        let attribute_input = input.len() > 1 && input.iter().any(|n| n.is_attribute());
+        if needs_sort || attribute_input {
             sort_document_order(&mut result);
         }
 
@@ -2348,6 +2383,50 @@ mod tests {
         assert!(!ns[0].is_attribute());
         assert!(ns[1].is_attribute());
         assert_eq!(ns[1].anchor(), ns[0].anchor());
+    }
+
+    #[test]
+    fn test_mixed_attribute_input_document_order() {
+        // Axis expansions from inputs that mix elements and attributes must
+        // come out in document order even on the sort-skipped axes.
+        let xml = "<root><e a='1'><c1/><c2/></e></root>";
+        let XPathValue::NodeSet(ns) = eval_xpath(xml, "(//e | //@a)/descendant-or-self::node()")
+        else {
+            panic!("expected node-set");
+        };
+        // Document order: e, @a, c1, c2.
+        assert_eq!(ns.len(), 4);
+        assert!(!ns[0].is_attribute());
+        assert!(ns[1].is_attribute());
+        assert_eq!(
+            eval_xpath(xml, "string(((//e | //@a)/descendant-or-self::node())[2])"),
+            XPathValue::String("1".to_owned())
+        );
+
+        let xml2 = "<root><e a='1'><child/></e><after/></root>";
+        assert_eq!(
+            eval_xpath(xml2, "name(((//e | //@a)/following::*)[1])"),
+            XPathValue::String("child".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_step_predicate_position_is_per_context_node() {
+        // XPath 1.0 §2.4: a step predicate filters the node-set generated
+        // for each context node separately — //a/b[1] selects the FIRST b
+        // of EVERY a, not the first of the merged set.
+        let xml = "<root><a><b>1</b><b>2</b></a><a><b>3</b><b>4</b></a></root>";
+        assert_eq!(eval_count(xml, "//a/b[1]"), 2);
+        assert_eq!(eval_count(xml, "//a/b[last()]"), 2);
+        assert_eq!(eval_count(xml, "//a/b[2]"), 2);
+        // The parenthesized form applies the position globally.
+        assert_eq!(eval_count(xml, "(//a/b)[1]"), 1);
+
+        // Same semantics over attribute steps.
+        let xml2 = "<root><a p='1' q='2'/><a p='3' q='4'/></root>";
+        assert_eq!(eval_count(xml2, "//a/@*[1]"), 2);
+        assert_eq!(eval_count(xml2, "//a/@*[last()]"), 2);
+        assert_eq!(eval_xpath(xml2, "sum(//a/@*[1])"), XPathValue::Number(4.0));
     }
 
     #[test]
