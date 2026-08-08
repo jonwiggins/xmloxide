@@ -1143,6 +1143,20 @@ impl<'a> ParserInput<'a> {
 
     // -- Reference parsing (XML 1.0 §4.1) --
 
+    /// Counts one entity expansion against the security limit.
+    ///
+    /// Returns an error if the configured maximum is exceeded.
+    pub fn count_entity_expansion(&mut self) -> Result<(), ParseError> {
+        self.entity_expansions += 1;
+        if self.entity_expansions > self.max_entity_expansions {
+            return Err(self.fatal(format!(
+                "entity expansion limit exceeded ({})",
+                self.max_entity_expansions
+            )));
+        }
+        Ok(())
+    }
+
     /// Parses an entity or character reference (`&...;`).
     ///
     /// Handles the five built-in XML entities (`amp`, `lt`, `gt`, `apos`,
@@ -1169,13 +1183,7 @@ impl<'a> ParserInput<'a> {
     /// Returns the resolved text as a `&str` slice of `buf` (the portion
     /// that was appended), which callers can use for validation.
     pub fn parse_reference_into<'b>(&mut self, buf: &'b mut String) -> Result<&'b str, ParseError> {
-        self.entity_expansions += 1;
-        if self.entity_expansions > self.max_entity_expansions {
-            return Err(self.fatal(format!(
-                "entity expansion limit exceeded ({})",
-                self.max_entity_expansions
-            )));
-        }
+        self.count_entity_expansion()?;
 
         self.expect_byte(b'&')?;
 
@@ -2399,11 +2407,9 @@ mod tests {
     #[test]
     fn test_entity_expansion_nested_dtd_entities() {
         use crate::parser::{parse_str_with_options, ParseOptions};
-        // Entity "b" references entity "a". The parser preserves text-only
-        // entities as EntityRef nodes with the raw replacement text, so
-        // text_content returns the un-expanded value "hello &a;".
-        // This verifies that nested entity references are stored correctly
-        // and the parser does not crash or reject them.
+        // Entity "b" references entity "a". The nested reference is parsed
+        // as content (XML 1.0 §4.4), so the entity expansion is visible
+        // through text_content.
         let xml = r#"<!DOCTYPE r [
 <!ENTITY a "world">
 <!ENTITY b "hello &a;">
@@ -2411,12 +2417,7 @@ mod tests {
 <r>&b;</r>"#;
         let doc = parse_str_with_options(xml, &ParseOptions::default()).unwrap();
         let root = doc.root_element().unwrap();
-        // The raw replacement text is preserved (not recursively expanded)
-        let content = doc.text_content(root);
-        assert!(
-            content.contains("hello"),
-            "entity value should contain 'hello', got: {content}"
-        );
+        assert_eq!(doc.text_content(root), "hello world");
     }
 
     #[test]

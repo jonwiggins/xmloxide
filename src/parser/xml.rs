@@ -24,6 +24,14 @@ use super::ParseOptions;
 /// is rejected as a potential denial-of-service attack.
 const DEFAULT_MAX_AMPLIFICATION: usize = 5;
 
+/// Maximum nesting depth of general entity expansion in content.
+///
+/// Bounds the recursion when an entity's replacement text references other
+/// entities (XML 1.0 §4.4 "Included"). Recursion is already rejected by the
+/// DTD parser (WFC: No Recursion), so this is defense-in-depth for
+/// resolver-provided external entities and stack safety.
+const MAX_ENTITY_DEPTH: u32 = 32;
+
 /// The core XML parser.
 pub(crate) struct XmlParser<'a> {
     /// Shared low-level input state (position, peek, advance, name parsing, etc.).
@@ -44,6 +52,8 @@ pub(crate) struct XmlParser<'a> {
     input_size: usize,
     /// Running total of bytes added through default attribute expansion.
     expansion_size: usize,
+    /// Current nesting depth of general entity expansion (0 = document level).
+    entity_depth: u32,
 }
 
 impl<'a> XmlParser<'a> {
@@ -66,6 +76,7 @@ impl<'a> XmlParser<'a> {
             attr_defaults: HashMap::new(),
             input_size: input.len(),
             expansion_size: 0,
+            entity_depth: 0,
         }
     }
 
@@ -1033,57 +1044,24 @@ impl<'a> XmlParser<'a> {
             }
 
             if self.input.peek() == Some(b'&') {
-                // Check if this is a named entity reference (not char ref, not builtin)
-                // whose replacement text is plain text (no '<'). If so, preserve
-                // it as an EntityRef node rather than expanding. Entities that
-                // contain XML markup ('<') must still be expanded so that the
-                // markup is validated (e.g., namespace prefix checking).
+                // A named general entity reference in content (not a char ref,
+                // not a builtin) is included per XML 1.0 §4.4: an EntityRef
+                // node is created and the entity's replacement text is parsed
+                // as content, attached as children of the EntityRef node.
                 // Skip the peek for builtins at byte level to avoid String allocation.
-                if self.input.peek_at(1) != Some(b'#') && !self.is_looking_at_builtin_entity_ref() {
-                    if let Some(entity_name) = self.peek_entity_ref_name() {
-                        // entity_name is guaranteed non-builtin at this point.
-                        // Preserve as EntityRef node if:
-                        // 1. The entity is internally declared and text-only (no '<'), OR
-                        // 2. The entity is undeclared but we're in tolerant mode
-                        //    (external DTD or PE refs make undeclared entities non-fatal)
-                        let is_text_only =
-                            self.input.entity_map.get(&entity_name).is_some_and(|v| {
-                                // Check the replacement text after expanding character
-                                // references, not the raw value. An entity like
-                                // "&#60;foo>" contains no literal '<' but expands to
-                                // "<foo>" which is markup and must be re-parsed.
-                                let replacement = crate::validation::dtd::expand_char_refs_only(v);
-                                !replacement.contains('<')
-                            });
-                        let is_undeclared_tolerant =
-                            !self.input.entity_map.contains_key(&entity_name)
-                                && !self.input.entity_external.contains_key(&entity_name)
-                                && (self.input.has_pe_references || self.input.has_external_dtd);
-                        let should_preserve = is_text_only || is_undeclared_tolerant;
-
-                        if should_preserve {
-                            // Flush accumulated text before the entity ref
-                            if !text.is_empty() {
-                                let text_id = self.doc.create_node(NodeKind::Text {
-                                    content: std::mem::take(&mut text),
-                                });
-                                self.doc.append_child(parent, text_id);
-                            }
-                            // Consume &name;
-                            self.input.advance(1); // &
-                            let name = self.input.parse_name()?;
-                            self.input.expect_byte(b';')?;
-                            // Count entity expansion for limit tracking
-                            self.input.entity_expansions += 1;
-                            let entity_value = self.input.entity_map.get(&name).cloned();
-                            let ref_id = self.doc.create_node(NodeKind::EntityRef {
-                                name,
-                                value: entity_value,
-                            });
-                            self.doc.append_child(parent, ref_id);
-                            continue;
-                        }
+                if self.input.peek_at(1) != Some(b'#')
+                    && !self.is_looking_at_builtin_entity_ref()
+                    && self.peek_entity_ref_name().is_some()
+                {
+                    // Flush accumulated text before the entity ref
+                    if !text.is_empty() {
+                        let text_id = self.doc.create_node(NodeKind::Text {
+                            content: std::mem::take(&mut text),
+                        });
+                        self.doc.append_child(parent, text_id);
                     }
+                    self.parse_entity_ref_in_content(parent)?;
+                    continue;
                 }
                 self.input.parse_reference_into(&mut text)?;
             } else {
@@ -1102,6 +1080,208 @@ impl<'a> XmlParser<'a> {
         }
 
         Ok(())
+    }
+
+    /// Parses a general entity reference (`&name;`) appearing in element
+    /// content per XML 1.0 §4.4 ("Included").
+    ///
+    /// Creates an `EntityRef` node under `parent`, then parses the entity's
+    /// replacement text (XML 1.0 §4.5: character references expanded at
+    /// declaration time) as content, attaching the resulting nodes as
+    /// children of the `EntityRef` node.
+    fn parse_entity_ref_in_content(&mut self, parent: NodeId) -> Result<(), ParseError> {
+        // Consume `&name;`
+        self.input.advance(1); // '&'
+        let name = self.input.parse_name()?;
+        self.input.expect_byte(b';')?;
+
+        // Count this reference against the expansion limit.
+        self.input.count_entity_expansion()?;
+
+        // Resolve the replacement text (XML 1.0 §4.5).
+        let replacement: Option<String> = if let Some(raw) = self.input.entity_map.get(&name) {
+            Some(crate::validation::dtd::expand_char_refs_only(raw))
+        } else if let Some(info) = self.input.entity_external.get(&name).cloned() {
+            if let Some(resolver) = self.options.entity_resolver.clone() {
+                let request = crate::parser::ExternalEntityRequest {
+                    name: &name,
+                    system_id: &info.system_id,
+                    public_id: info.public_id.as_deref(),
+                };
+                if let Some(resolved) = resolver(request) {
+                    // External parsed entities may begin with a text
+                    // declaration (XML 1.0 §4.3.1) which is not content.
+                    Some(strip_text_declaration(&resolved).to_string())
+                } else {
+                    return Err(self.input.fatal(format!(
+                        "reference to external entity '{name}' is not supported"
+                    )));
+                }
+            } else {
+                return Err(self.input.fatal(format!(
+                    "reference to external entity '{name}' is not supported"
+                )));
+            }
+        } else if self.input.has_pe_references || self.input.has_external_dtd {
+            // Undeclared entity in tolerant mode (external DTD or PE refs
+            // present, XML 1.0 §4.1 WFC: Entity Declared): preserve the
+            // reference without a value.
+            None
+        } else if self.options.recover {
+            self.input.push_diagnostic(
+                ErrorSeverity::Warning,
+                format!("unknown entity reference: &{name};"),
+            );
+            None
+        } else {
+            return Err(self
+                .input
+                .fatal(format!("unknown entity reference: &{name};")));
+        };
+
+        let ref_id = self.doc.create_node(NodeKind::EntityRef {
+            name: name.clone(),
+            value: replacement.clone(),
+        });
+        self.doc.append_child(parent, ref_id);
+
+        let Some(replacement) = replacement else {
+            return Ok(());
+        };
+        if replacement.is_empty() {
+            return Ok(());
+        }
+
+        // Amplification guard (matches libxml2's max amplification factor).
+        self.expansion_size += replacement.len();
+        if self.expansion_size > self.input_size.saturating_mul(DEFAULT_MAX_AMPLIFICATION) {
+            return Err(self
+                .input
+                .fatal("maximum entity amplification factor exceeded"));
+        }
+
+        if !replacement.contains('<') && !replacement.contains('&') {
+            // Fast path: plain character data — no markup, no references.
+            let content = if replacement.contains('\r') {
+                normalize_line_ends(&replacement)
+            } else {
+                replacement
+            };
+            let text_id = self.doc.create_node(NodeKind::Text { content });
+            self.doc.append_child(ref_id, text_id);
+        } else {
+            self.parse_replacement_as_content(&name, &replacement, ref_id)?;
+        }
+        Ok(())
+    }
+
+    /// Parses an entity's replacement text as XML content (XML 1.0 §4.3.2:
+    /// the replacement text must match the `content` production), attaching
+    /// the parsed nodes as children of `ref_id`.
+    ///
+    /// A nested sub-parser is used so the replacement text is processed with
+    /// the same entity declarations, namespace scope, options, and security
+    /// counters as the outer document.
+    fn parse_replacement_as_content(
+        &mut self,
+        entity_name: &str,
+        replacement: &str,
+        ref_id: NodeId,
+    ) -> Result<(), ParseError> {
+        if self.entity_depth >= MAX_ENTITY_DEPTH {
+            return Err(self.input.fatal(format!(
+                "entity '{entity_name}' exceeds maximum entity nesting depth"
+            )));
+        }
+
+        let mut sub = XmlParser::new(replacement, &self.options);
+        sub.entity_depth = self.entity_depth + 1;
+        sub.input_size = self.input_size;
+        sub.expansion_size = self.expansion_size;
+        // Move shared state into the sub-parser (returned below).
+        sub.input.entity_map = std::mem::take(&mut self.input.entity_map);
+        sub.input.entity_external = std::mem::take(&mut self.input.entity_external);
+        sub.input.has_pe_references = self.input.has_pe_references;
+        sub.input.has_external_dtd = self.input.has_external_dtd;
+        sub.input.entity_expansions = self.input.entity_expansions;
+        sub.attr_types = std::mem::take(&mut self.attr_types);
+        sub.attr_defaults = std::mem::take(&mut self.attr_defaults);
+        std::mem::swap(&mut sub.ns, &mut self.ns);
+
+        let sub_root = sub.doc.root();
+        let result = sub.parse_content_fragment(sub_root);
+
+        // Restore shared state regardless of outcome.
+        self.input.entity_map = std::mem::take(&mut sub.input.entity_map);
+        self.input.entity_external = std::mem::take(&mut sub.input.entity_external);
+        self.input.entity_expansions = sub.input.entity_expansions;
+        self.attr_types = std::mem::take(&mut sub.attr_types);
+        self.attr_defaults = std::mem::take(&mut sub.attr_defaults);
+        std::mem::swap(&mut self.ns, &mut sub.ns);
+        self.expansion_size = sub.expansion_size;
+        if !sub.input.diagnostics.is_empty() {
+            self.input.diagnostics.append(&mut sub.input.diagnostics);
+        }
+
+        if let Err(e) = result {
+            // Propagate security-limit errors and already-wrapped entity
+            // errors unchanged to avoid nested message wrapping.
+            if e.message.contains("exceeded")
+                || e.message.contains("replacement text is not well-formed")
+            {
+                return Err(e);
+            }
+            return Err(self.input.fatal(format!(
+                "entity '{entity_name}' replacement text is not well-formed \
+                 XML content: {}",
+                e.message
+            )));
+        }
+
+        // Graft the parsed nodes into our arena under the EntityRef node.
+        let sub_doc = sub.doc;
+        let top_level: Vec<NodeId> = sub_doc.children(sub_doc.root()).collect();
+        for child in top_level {
+            Self::import_subtree(&mut self.doc, &sub_doc, child, ref_id);
+        }
+        Ok(())
+    }
+
+    /// Parses content until end of input (used for entity replacement text,
+    /// which must match the `content` production — XML 1.0 §4.3.2).
+    ///
+    /// Unlike [`parse_content`](Self::parse_content), end of input is the
+    /// normal termination and an end tag (`</`) is an error (it would close
+    /// an element opened outside the entity — WFC violation).
+    fn parse_content_fragment(&mut self, parent: NodeId) -> Result<(), ParseError> {
+        while !self.input.at_end() {
+            if self.input.looking_at(b"</") {
+                return Err(self.input.fatal("unbalanced end tag"));
+            }
+            if self.input.looking_at(b"<![CDATA[") {
+                self.parse_cdata(parent)?;
+            } else if self.input.looking_at(b"<!--") {
+                self.parse_comment(parent)?;
+            } else if self.input.looking_at(b"<?") {
+                self.parse_processing_instruction(parent)?;
+            } else if self.input.peek() == Some(b'<') {
+                self.parse_element(parent)?;
+            } else {
+                self.parse_char_data(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively deep-copies a subtree from `src` into `dst`, appending
+    /// the copy under `dst_parent`.
+    fn import_subtree(dst: &mut Document, src: &Document, src_id: NodeId, dst_parent: NodeId) {
+        let kind = src.node(src_id).kind.clone();
+        let new_id = dst.create_node(kind);
+        dst.append_child(dst_parent, new_id);
+        for child in src.children(src_id) {
+            Self::import_subtree(dst, src, child, new_id);
+        }
     }
 
     /// Checks if the input is positioned at a builtin entity reference
@@ -1261,6 +1441,37 @@ impl<'a> XmlParser<'a> {
         self.doc.append_child(parent, pi_id);
         Ok(())
     }
+}
+
+/// Normalizes line ends per XML 1.0 §2.11: `\r\n` and lone `\r` become `\n`.
+fn normalize_line_ends(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Strips an optional leading text declaration (`<?xml ...?>`) from external
+/// parsed entity text (XML 1.0 §4.3.1: `TextDecl`).
+fn strip_text_declaration(s: &str) -> &str {
+    let rest = s.strip_prefix("<?xml").filter(|r| {
+        r.starts_with(' ') || r.starts_with('\t') || r.starts_with('\r') || r.starts_with('\n')
+    });
+    if let Some(rest) = rest {
+        if let Some(end) = rest.find("?>") {
+            return &rest[end + 2..];
+        }
+    }
+    s
 }
 
 /// Returns true if the entity name is one of the five XML builtin entities.
@@ -1792,5 +2003,170 @@ mod tests {
         let xmlns_attr = attrs.iter().find(|a| a.name == "app").unwrap();
         assert_eq!(xmlns_attr.prefix.as_deref(), Some("xmlns"));
         assert_eq!(xmlns_attr.namespace, None);
+    }
+
+    // -- General entity inclusion in content (issue #43) --------------------
+    //
+    // XML 1.0 §4.4 "Included": a general entity referenced in content has
+    // its replacement text parsed as content. §4.5: character references in
+    // the declaration are expanded when the replacement text is built.
+
+    #[test]
+    fn test_parse_entity_charref_replacement() {
+        let doc = parse("<!DOCTYPE d [<!ENTITY e \"caf&#233;\">]><d>&e;</d>");
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.text_content(root), "caf\u{e9}");
+    }
+
+    #[test]
+    fn test_parse_entity_nested_reference() {
+        let doc = parse("<!DOCTYPE d [<!ENTITY a \"XYZ\"><!ENTITY b \"&a;\">]><d>&b;</d>");
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.text_content(root), "XYZ");
+        // Tree shape: EntityRef(b) -> EntityRef(a) -> Text("XYZ").
+        let outer = doc.first_child(root).unwrap();
+        let NodeKind::EntityRef { ref name, .. } = doc.node(outer).kind else {
+            panic!("expected EntityRef, got {:?}", doc.node(outer).kind);
+        };
+        assert_eq!(name, "b");
+        let inner = doc.first_child(outer).unwrap();
+        let NodeKind::EntityRef { ref name, .. } = doc.node(inner).kind else {
+            panic!("expected EntityRef, got {:?}", doc.node(inner).kind);
+        };
+        assert_eq!(name, "a");
+    }
+
+    #[test]
+    fn test_parse_entity_amp_double_reference() {
+        // "&#38;amp;" builds replacement text "&amp;", which is then parsed
+        // as content, yielding "&".
+        let doc = parse("<!DOCTYPE d [<!ENTITY e \"&#38;amp;\">]><d>&e;</d>");
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.text_content(root), "&");
+    }
+
+    #[test]
+    fn test_parse_entity_markup_content() {
+        // Markup in the replacement text becomes real element children of
+        // the EntityRef node — not escaped text.
+        let doc = parse("<!DOCTYPE d [<!ENTITY e \"<b>hi</b>\">]><d>&e;</d>");
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.text_content(root), "hi");
+        let entity_ref = doc.first_child(root).unwrap();
+        let element = doc.first_child(entity_ref).unwrap();
+        assert_eq!(doc.node_name(element), Some("b"));
+        // Serialization re-emits the entity reference, preserving roundtrip.
+        let out = crate::serial::serialize(&doc);
+        assert!(
+            out.contains("<d>&e;</d>"),
+            "unexpected serialization: {out}"
+        );
+    }
+
+    #[test]
+    fn test_parse_entity_charref_markup() {
+        // "&#60;b>hi&#60;/b>" expands to "<b>hi</b>" at declaration time
+        // (§4.5) and must be parsed as markup at reference time.
+        let doc = parse("<!DOCTYPE d [<!ENTITY e \"&#60;b>hi&#60;/b>\">]><d>&e;</d>");
+        let root = doc.root_element().unwrap();
+        let entity_ref = doc.first_child(root).unwrap();
+        let element = doc.first_child(entity_ref).unwrap();
+        assert_eq!(doc.node_name(element), Some("b"));
+        assert_eq!(doc.text_content(root), "hi");
+    }
+
+    #[test]
+    fn test_parse_entity_markup_roundtrip() {
+        // parse -> serialize -> parse must preserve the element structure
+        // inside the entity expansion.
+        let input = "<!DOCTYPE d [<!ENTITY e \"<b>hi</b>\">]><d>&e;</d>";
+        let doc = parse(input);
+        let out = crate::serial::serialize(&doc);
+        let doc2 = parse(&out);
+        let root2 = doc2.root_element().unwrap();
+        assert_eq!(doc2.text_content(root2), "hi");
+        let entity_ref = doc2.first_child(root2).unwrap();
+        let element = doc2.first_child(entity_ref).unwrap();
+        assert_eq!(doc2.node_name(element), Some("b"));
+    }
+
+    #[test]
+    fn test_parse_entity_unbalanced_markup_rejected() {
+        // §4.3.2: replacement text must match the content production; an
+        // unbalanced start tag is not well-formed.
+        let result = Document::parse_str("<!DOCTYPE d [<!ENTITY e \"<b>hi\">]><d>&e;</d>");
+        assert!(
+            result.is_err(),
+            "unbalanced entity content must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_entity_split_tags_rejected() {
+        // A start tag in one entity and its end tag in another violates
+        // WFC: Element Type Match within the replacement text.
+        let result = Document::parse_str(
+            "<!DOCTYPE d [<!ENTITY open \"<b>\"><!ENTITY close \"</b>\">]><d>&open;hi&close;</d>",
+        );
+        assert!(result.is_err(), "split tag pair must be rejected");
+    }
+
+    #[test]
+    fn test_parse_entity_namespace_inherited() {
+        // Elements produced by entity expansion resolve namespaces in scope
+        // at the point of reference.
+        let doc = parse("<!DOCTYPE d [<!ENTITY e \"<b/>\">]><d xmlns=\"urn:x\">&e;</d>");
+        let root = doc.root_element().unwrap();
+        let entity_ref = doc.first_child(root).unwrap();
+        let element = doc.first_child(entity_ref).unwrap();
+        let NodeKind::Element { ref namespace, .. } = doc.node(element).kind else {
+            panic!("expected Element, got {:?}", doc.node(element).kind);
+        };
+        assert_eq!(namespace.as_deref(), Some("urn:x"));
+    }
+
+    #[test]
+    fn test_parse_entity_nesting_depth_limit() {
+        // A 40-deep reference chain exceeds MAX_ENTITY_DEPTH when expanded.
+        use std::fmt::Write as _;
+        let mut dtd = String::from("<!ENTITY e0 \"<b/>\">");
+        for i in 1..40u32 {
+            let _ = write!(dtd, "<!ENTITY e{i} \"<b>&e{};</b>\">", i - 1);
+        }
+        let xml = format!("<!DOCTYPE d [{dtd}]><d>&e39;</d>");
+        let result = Document::parse_str(&xml);
+        let Err(err) = result else {
+            panic!("expected depth-limited parse to fail");
+        };
+        assert!(
+            err.message.contains("depth"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_entity_amplification_rejected() {
+        // Many references to a large entity trip the amplification guard
+        // (or the expansion counter) — billion-laughs protection.
+        let mut xml = String::from(
+            "<!DOCTYPE d [<!ENTITY a \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\">\
+             <!ENTITY b \"&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;\">\
+             <!ENTITY c \"&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;\">\
+             <!ENTITY e \"&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;\">]><d>",
+        );
+        for _ in 0..20 {
+            xml.push_str("&e;");
+        }
+        xml.push_str("</d>");
+        let result = Document::parse_str(&xml);
+        let Err(err) = result else {
+            panic!("expected amplification attack to be rejected");
+        };
+        assert!(
+            err.message.contains("amplification") || err.message.contains("expansion limit"),
+            "unexpected error message: {}",
+            err.message
+        );
     }
 }

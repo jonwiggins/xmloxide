@@ -458,7 +458,14 @@ impl Document {
                 buf.push_str(content);
             }
             NodeKind::EntityRef { value, .. } => {
-                if let Some(val) = value {
+                // When the entity's replacement text was parsed as content
+                // (XML 1.0 §4.4), the expansion lives in the children.
+                // Fall back to the stored replacement value otherwise.
+                if self.node(id).first_child.is_some() {
+                    for child in self.children(id) {
+                        self.collect_text(child, buf);
+                    }
+                } else if let Some(val) = value {
                     buf.push_str(val);
                 }
             }
@@ -1349,6 +1356,38 @@ mod tests {
         doc.append_child(bold, text2);
 
         assert_eq!(doc.text_content(p), "hello world");
+    }
+
+    #[test]
+    fn test_text_content_entity_ref_children_take_priority() {
+        // When an EntityRef node carries parsed replacement children
+        // (XML 1.0 §4.4), text_content reads them, not the stored value.
+        let mut doc = Document::new();
+        let root = doc.root();
+        let entity = doc.create_node(NodeKind::EntityRef {
+            name: "e".to_string(),
+            value: Some("raw value".to_string()),
+        });
+        let text = doc.create_node(NodeKind::Text {
+            content: "expanded".to_string(),
+        });
+        doc.append_child(root, entity);
+        doc.append_child(entity, text);
+        assert_eq!(doc.text_content(root), "expanded");
+    }
+
+    #[test]
+    fn test_text_content_entity_ref_value_fallback() {
+        // A childless EntityRef (e.g. built programmatically) falls back to
+        // its stored replacement value.
+        let mut doc = Document::new();
+        let root = doc.root();
+        let entity = doc.create_node(NodeKind::EntityRef {
+            name: "e".to_string(),
+            value: Some("fallback".to_string()),
+        });
+        doc.append_child(root, entity);
+        assert_eq!(doc.text_content(root), "fallback");
     }
 
     #[test]

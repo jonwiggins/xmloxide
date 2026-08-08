@@ -1856,14 +1856,17 @@ impl<'a> XPathContext<'a> {
         }
         let kind = &self.doc.node(node).kind;
         match kind {
-            NodeKind::Document | NodeKind::Element { .. } => self.doc.text_content(node),
+            // EntityRef: the expansion lives in the node's children, so the
+            // string-value is the same concatenation of descendant text.
+            NodeKind::Document | NodeKind::Element { .. } | NodeKind::EntityRef { .. } => {
+                self.doc.text_content(node)
+            }
             NodeKind::Text { content }
             | NodeKind::CData { content }
             | NodeKind::Comment { content } => content.clone(),
             NodeKind::ProcessingInstruction { data, .. } => {
                 data.as_deref().unwrap_or("").to_owned()
             }
-            NodeKind::EntityRef { name, .. } => name.clone(),
             NodeKind::DocumentType { .. } => String::new(),
         }
     }
