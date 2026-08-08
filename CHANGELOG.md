@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Fix exponential-time entity recursion check** (#42, thanks @hey-jj). The
+  WFC: No Recursion walks in the DTD validator re-visited entities once per
+  path, so a 474-byte document with chained entity declarations took 8+
+  seconds to parse and a 694-byte one about 22 hours. The walks (including
+  parameter entities and ATTLIST-default validation) now memoize entities
+  proven acyclic, making the check linear in the size of the DTD. Cycle
+  detection is unaffected.
+- **Bound element nesting across entity expansions.** Entity replacement text
+  is parsed by nested sub-parsers, which now inherit the outer parser's
+  nesting depth so total element depth stays bounded by
+  `ParseOptions::max_depth` instead of `max_depth` per expansion level.
+
+### Fixed
+
+- **General entity replacement text is parsed as content** per XML 1.0 §4.4
+  (#43, thanks @hey-jj). `EntityRef` nodes now carry their parsed expansion
+  as children: character references in declarations are expanded when
+  replacement text is built (§4.5), nested entity references are included,
+  and markup-bearing entities produce real element children instead of
+  escaped text — while serialization still emits `&name;`, keeping
+  round-trips lossless. Replacement text must match the content production
+  (§4.3.2); unbalanced or split tags are rejected. Entity expansion is
+  subject to the expansion counter, a nesting-depth cap, and the 5x
+  amplification guard, matching libxml2. DTD content-model validation sees
+  through entity references (§4.4.3), so entity-supplied elements are
+  validated too.
+- **XPath `!=` uses its own existential semantics for node-sets** per XPath
+  1.0 §3.4 (#44, thanks @hey-jj). `!=` was evaluated as `not(=)`, inverting
+  empty-node-set comparisons and breaking multi-node sets (both `=` and `!=`
+  can hold at once). Node-set vs boolean keeps boolean-conversion semantics;
+  scalar comparisons are unchanged. An absent attribute step now also yields
+  an empty node-set (false under both `=` and `!=`) instead of an
+  empty-string sentinel.
+- **XPath filter-path continuations navigate instead of filtering** (#20,
+  thanks @ancientcatz). `(//a)[1]/@href` parsed to the same AST as
+  `(//a)[@href]`, so the trailing path acted as a predicate and
+  `string((//a)[1]/@href)` returned the anchor text. A new
+  `Expr::FilterPath` AST variant evaluates the continuation steps against
+  the filter's node-set. **Breaking:** downstream exhaustive matches on
+  `xpath::ast::Expr` must handle the new variant.
+
 ## [0.4.4] - 2026-07-20
 
 ### Security
