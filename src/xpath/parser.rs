@@ -987,9 +987,7 @@ mod tests {
                 assert_eq!(steps.len(), 1);
                 assert_eq!(steps[0].predicates.len(), 1);
                 match &steps[0].predicates[0] {
-                    Expr::BinaryOp {
-                        op, left, right: _, ..
-                    } => {
+                    Expr::BinaryOp { op, left, .. } => {
                         assert_eq!(*op, BinaryOp::Eq);
                         match left.as_ref() {
                             Expr::FunctionCall { name, args } => {
