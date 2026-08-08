@@ -208,12 +208,7 @@ impl<'a> XPathContext<'a> {
             BinaryOp::Eq | BinaryOp::Neq => {
                 let lv = self.eval_expr(left)?;
                 let rv = self.eval_expr(right)?;
-                let eq = self.compare_equality(&lv, &rv);
-                if op == BinaryOp::Eq {
-                    Ok(XPathValue::Boolean(eq))
-                } else {
-                    Ok(XPathValue::Boolean(!eq))
-                }
+                Ok(XPathValue::Boolean(self.compare_equality(op, &lv, &rv)))
             }
             BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte => {
                 let lv = self.eval_expr(left)?;
@@ -1869,9 +1864,21 @@ impl<'a> XPathContext<'a> {
     // Comparison helpers
     // -----------------------------------------------------------------------
 
-    /// Compares two values for equality per `XPath` 1.0 section 3.4.
+    /// Compares two values with `=` or `!=` per `XPath` 1.0 section 3.4.
+    ///
+    /// When either operand is a node-set (and the other is not a boolean),
+    /// both operators are existential: the result is true iff *some* node
+    /// satisfies the predicate. `!=` is therefore **not** the negation of
+    /// `=` — an empty node-set compares false under both operators, and a
+    /// multi-node set can satisfy both at once. A node-set compared against
+    /// a boolean is converted to a boolean first, and scalar operands are
+    /// compared directly.
     #[allow(clippy::float_cmp)]
-    fn compare_equality(&self, lhs: &XPathValue, rhs: &XPathValue) -> bool {
+    fn compare_equality(&self, op: BinaryOp, lhs: &XPathValue, rhs: &XPathValue) -> bool {
+        let ne = op == BinaryOp::Neq;
+        let str_cmp = |a: &str, b: &str| (a == b) != ne;
+        let num_cmp = |a: f64, b: f64| (a == b) != ne;
+        let bool_cmp = |a: bool, b: bool| (a == b) != ne;
         match (lhs, rhs) {
             // node-set = node-set
             (XPathValue::NodeSet(lns), XPathValue::NodeSet(rns)) => {
@@ -1879,7 +1886,7 @@ impl<'a> XPathContext<'a> {
                     let lsv = self.string_value(ln);
                     for &rn in rns {
                         let rsv = self.string_value(rn);
-                        if lsv == rsv {
+                        if str_cmp(&lsv, &rsv) {
                             return true;
                         }
                     }
@@ -1888,34 +1895,30 @@ impl<'a> XPathContext<'a> {
             }
             // node-set = boolean
             (XPathValue::NodeSet(ns), XPathValue::Boolean(b))
-            | (XPathValue::Boolean(b), XPathValue::NodeSet(ns)) => ns.is_empty() != *b,
+            | (XPathValue::Boolean(b), XPathValue::NodeSet(ns)) => bool_cmp(!ns.is_empty(), *b),
             // node-set = number
-            (XPathValue::NodeSet(ns), XPathValue::Number(n)) => ns
+            (XPathValue::NodeSet(ns), XPathValue::Number(n))
+            | (XPathValue::Number(n), XPathValue::NodeSet(ns)) => ns
                 .iter()
-                .any(|&node| parse_xpath_number(&self.string_value(node)) == *n),
-            (XPathValue::Number(n), XPathValue::NodeSet(ns)) => ns
-                .iter()
-                .any(|&node| parse_xpath_number(&self.string_value(node)) == *n),
+                .any(|&node| num_cmp(parse_xpath_number(&self.string_value(node)), *n)),
             // node-set = string
-            (XPathValue::NodeSet(ns), XPathValue::String(s)) => {
-                ns.iter().any(|&node| self.string_value(node) == *s)
-            }
-            (XPathValue::String(s), XPathValue::NodeSet(ns)) => {
-                ns.iter().any(|&node| self.string_value(node) == *s)
+            (XPathValue::NodeSet(ns), XPathValue::String(s))
+            | (XPathValue::String(s), XPathValue::NodeSet(ns)) => {
+                ns.iter().any(|&node| str_cmp(&self.string_value(node), s))
             }
             // Both booleans
-            (XPathValue::Boolean(a), XPathValue::Boolean(b)) => a == b,
+            (XPathValue::Boolean(a), XPathValue::Boolean(b)) => bool_cmp(*a, *b),
             // If either is boolean, convert both to boolean
             (XPathValue::Boolean(_), _) | (_, XPathValue::Boolean(_)) => {
-                lhs.to_boolean() == rhs.to_boolean()
+                bool_cmp(lhs.to_boolean(), rhs.to_boolean())
             }
             // If either is number, convert both to number
-            (XPathValue::Number(a), XPathValue::Number(b)) => a == b,
+            (XPathValue::Number(a), XPathValue::Number(b)) => num_cmp(*a, *b),
             (XPathValue::Number(_), _) | (_, XPathValue::Number(_)) => {
-                self.value_to_number(lhs) == self.value_to_number(rhs)
+                num_cmp(self.value_to_number(lhs), self.value_to_number(rhs))
             }
             // Otherwise compare as strings
-            _ => self.value_to_string(lhs) == self.value_to_string(rhs),
+            _ => str_cmp(&self.value_to_string(lhs), &self.value_to_string(rhs)),
         }
     }
 
@@ -2115,6 +2118,127 @@ mod tests {
 
         let result = eval_xpath("<r/>", "'a' != 'a'");
         assert_eq!(result, XPathValue::Boolean(false));
+    }
+
+    // Regression tests for issue #44: with a node-set operand, `!=` is its
+    // own existential test (XPath 1.0 §3.4), not the negation of `=`.
+    const NEQ_DOC: &str =
+        "<r><a x='1'>one</a><a x='2'>two</a><g><b>p</b><b>q</b></g><h><b>p</b><b>p</b></h></r>";
+
+    #[test]
+    fn test_neq_empty_nodeset_is_false() {
+        // An empty node-set satisfies neither `=` nor `!=`.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere != 'x'"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere != 1"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere != //a"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere != //nothere"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere = 'x'"),
+            XPathValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_neq_nodeset_string_existential() {
+        // The node "one" makes `//a != 'two'` true, while the node "two"
+        // makes `//a = 'two'` true as well: both hold simultaneously.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//a != 'two'"),
+            XPathValue::Boolean(true)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//a = 'two'"),
+            XPathValue::Boolean(true)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//a = 'two' and //a != 'two'"),
+            XPathValue::Boolean(true)
+        );
+        // Single-node sets behave like scalars.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//g/b[1] != 'p'"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//g/b[2] != 'p'"),
+            XPathValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_neq_attribute_nodeset_number() {
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//a/@x != 1"),
+            XPathValue::Boolean(true)
+        );
+        assert_eq!(eval_xpath(NEQ_DOC, "//a/@x = 1"), XPathValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_neq_nodeset_nodeset() {
+        // g/b = {p, q}, h/b = {p, p}: the pair (q, p) is unequal.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//g/b != //h/b"),
+            XPathValue::Boolean(true)
+        );
+        // h/b vs itself: every pair is (p, p), so no unequal pair exists.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//h/b != //h/b"),
+            XPathValue::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_neq_in_predicate() {
+        // Only <g> has a b child whose string-value differs from 'p'.
+        assert_eq!(eval_count(NEQ_DOC, "//*[b != 'p']"), 1);
+    }
+
+    #[test]
+    fn test_neq_nodeset_boolean_stays_negation() {
+        // Node-set vs boolean converts the node-set to a boolean first
+        // (XPath 1.0 §3.4), so `!=` IS plain negation there.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere != true()"),
+            XPathValue::Boolean(true)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere != false()"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//a != true()"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//a != false()"),
+            XPathValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_neq_scalar_nan() {
+        // NaN is unequal to everything, including itself.
+        assert_eq!(
+            eval_xpath("<r/>", "number('foo') != number('foo')"),
+            XPathValue::Boolean(true)
+        );
+        assert_eq!(
+            eval_xpath("<r/>", "number('foo') = number('foo')"),
+            XPathValue::Boolean(false)
+        );
     }
 
     #[test]
