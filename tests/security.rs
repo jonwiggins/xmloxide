@@ -211,6 +211,86 @@ fn test_default_limits_allow_moderate_entities() {
 }
 
 // ---------------------------------------------------------------------------
+// Entity recursion-check complexity (issue #42)
+// ---------------------------------------------------------------------------
+
+/// Builds a document whose DTD declares an entity chain where each level
+/// references the previous entity ten times (`e1` = ten refs to `a`,
+/// `e2` = ten refs to `e1`, ...).
+fn entity_chain_doc(levels: u32, body: &str) -> String {
+    let mut s = String::from("<!DOCTYPE d [<!ENTITY a \"AAAA\">");
+    for i in 1..=levels {
+        let prev = if i == 1 {
+            "a".to_string()
+        } else {
+            format!("e{}", i - 1)
+        };
+        let refs = format!("&{prev};").repeat(10);
+        let _ = write!(s, "<!ENTITY e{i} \"{refs}\">");
+    }
+    let _ = write!(s, "]><d>{body}</d>");
+    s
+}
+
+#[test]
+fn test_deep_entity_chain_parses_quickly() {
+    // Issue #42: the WFC: No Recursion check walked the entity-reference
+    // graph as a tree, costing 10^levels traversals — a 474-byte document
+    // (8 levels) took seconds and 12 levels took days. With memoization the
+    // check is linear in the size of the DTD. The generous bound below only
+    // catches exponential blowup, not normal variance.
+    let doc = entity_chain_doc(10, "&e10;");
+    let start = std::time::Instant::now();
+    let result = Document::parse_str(&doc);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "entity recursion check took {elapsed:?}; exponential blowup?"
+    );
+    // The parse outcome (unexpanded entity refs, or a security-limit
+    // rejection if expansion is attempted) is a policy question — the DoS
+    // guard under test here is about time, not the verdict.
+    if let Err(e) = result {
+        assert!(
+            e.message.contains("entity"),
+            "unexpected error: {}",
+            e.message
+        );
+    }
+}
+
+#[test]
+fn test_deep_entity_chain_in_attr_default_parses_quickly() {
+    // Same blowup through the ATTLIST-default validation path
+    // (validate_attr_default_entities), which walks the same graph.
+    let mut doc = String::from("<!DOCTYPE d [<!ENTITY a \"AAAA\">");
+    for i in 1..=10u32 {
+        let prev = if i == 1 {
+            "a".to_string()
+        } else {
+            format!("e{}", i - 1)
+        };
+        let refs = format!("&{prev};").repeat(10);
+        let _ = write!(doc, "<!ENTITY e{i} \"{refs}\">");
+    }
+    doc.push_str("<!ATTLIST d x CDATA \"&e10;\">]><d/>");
+    let start = std::time::Instant::now();
+    let result = Document::parse_str(&doc);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "attr-default entity check took {elapsed:?}; exponential blowup?"
+    );
+    if let Err(e) = result {
+        assert!(
+            e.message.contains("entity"),
+            "unexpected error: {}",
+            e.message
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SAX parser security limits
 // ---------------------------------------------------------------------------
 

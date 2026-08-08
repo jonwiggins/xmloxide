@@ -699,12 +699,20 @@ impl<'a> DtdParser<'a> {
     /// references in attribute defaults refer to internal parsed entities,
     /// and checks for `<` in entity replacement text used in attributes.
     fn post_validate(&self) -> Result<(), ParseError> {
-        // Check for entity recursion (WFC: No Recursion, XML 1.0 §4.1)
+        // Check for entity recursion (WFC: No Recursion, XML 1.0 §4.1).
+        // `safe` memoizes entities already proven acyclic so the walk is
+        // linear in the total size of the entity declarations rather than
+        // exponential in chain depth.
+        let mut safe = std::collections::HashSet::new();
         for (name, decl) in &self.dtd.entities {
             if let EntityKind::Internal(ref value) = decl.kind {
+                if safe.contains(name.as_str()) {
+                    continue;
+                }
                 let mut visited = std::collections::HashSet::new();
                 visited.insert(name.clone());
-                self.check_entity_recursion(value, &mut visited)?;
+                self.check_entity_recursion(value, &mut visited, &mut safe)?;
+                safe.insert(name.clone());
             }
         }
 
@@ -712,12 +720,17 @@ impl<'a> DtdParser<'a> {
         // PE values may contain encoded PE references via &#37; (which is '%').
         // After char ref expansion, if %name; appears in its own value, that's
         // direct or indirect recursion.
+        let mut safe = std::collections::HashSet::new();
         for (name, decl) in &self.dtd.param_entities {
             if let EntityKind::Internal(ref value) = decl.kind {
+                if safe.contains(name.as_str()) {
+                    continue;
+                }
                 let expanded = expand_char_refs_only(value);
                 let mut visited = std::collections::HashSet::new();
                 visited.insert(name.clone());
-                self.check_pe_recursion(&expanded, &mut visited)?;
+                self.check_pe_recursion(&expanded, &mut visited, &mut safe)?;
+                safe.insert(name.clone());
             }
         }
 
@@ -741,7 +754,10 @@ impl<'a> DtdParser<'a> {
         // here, because it only applies to entities that are actually
         // referenced in the document.
 
-        // Validate entity references in ATTLIST defaults
+        // Validate entity references in ATTLIST defaults. `checked`
+        // memoizes entities already validated so shared references are
+        // walked once (the reference graph is acyclic at this point).
+        let mut checked = std::collections::HashSet::new();
         for attrs in self.dtd.attributes.values() {
             for attr in attrs {
                 let (AttributeDefault::Default(default_value)
@@ -749,7 +765,7 @@ impl<'a> DtdParser<'a> {
                 else {
                     continue;
                 };
-                self.validate_attr_default_entities(default_value)?;
+                self.validate_attr_default_entities(default_value, &mut checked)?;
             }
         }
 
@@ -887,16 +903,21 @@ impl<'a> DtdParser<'a> {
         &self,
         value: &str,
         visited: &mut std::collections::HashSet<String>,
+        safe: &mut std::collections::HashSet<String>,
     ) -> Result<(), ParseError> {
         for ref_name in Self::extract_entity_refs(value) {
+            if safe.contains(ref_name) {
+                continue;
+            }
             if visited.contains(ref_name) {
                 return Err(self.fatal(format!("recursive entity reference: '{ref_name}'")));
             }
             if let Some(decl) = self.dtd.entities.get(ref_name) {
                 if let EntityKind::Internal(ref inner_value) = decl.kind {
                     visited.insert(ref_name.to_string());
-                    self.check_entity_recursion(inner_value, visited)?;
+                    self.check_entity_recursion(inner_value, visited, safe)?;
                     visited.remove(ref_name);
+                    safe.insert(ref_name.to_string());
                 }
             }
         }
@@ -910,8 +931,12 @@ impl<'a> DtdParser<'a> {
         &self,
         value: &str,
         visited: &mut std::collections::HashSet<String>,
+        safe: &mut std::collections::HashSet<String>,
     ) -> Result<(), ParseError> {
         for ref_name in Self::extract_pe_refs(value) {
+            if safe.contains(&ref_name) {
+                continue;
+            }
             if visited.contains(&ref_name) {
                 return Err(self.fatal(format!(
                     "recursive parameter entity reference: '%{ref_name}'"
@@ -921,8 +946,9 @@ impl<'a> DtdParser<'a> {
                 if let EntityKind::Internal(ref inner_value) = decl.kind {
                     let expanded = expand_char_refs_only(inner_value);
                     visited.insert(ref_name.clone());
-                    self.check_pe_recursion(&expanded, visited)?;
+                    self.check_pe_recursion(&expanded, visited, safe)?;
                     visited.remove(&ref_name);
+                    safe.insert(ref_name.clone());
                 }
             }
         }
@@ -960,10 +986,17 @@ impl<'a> DtdParser<'a> {
     ///
     /// Checks WFC: No External Entity References (§3.1) and
     /// WFC: No `<` in Attribute Values for entity replacement text.
-    fn validate_attr_default_entities(&self, value: &str) -> Result<(), ParseError> {
+    fn validate_attr_default_entities(
+        &self,
+        value: &str,
+        checked: &mut std::collections::HashSet<String>,
+    ) -> Result<(), ParseError> {
         for ref_name in Self::extract_entity_refs(value) {
             // Built-in entities are always fine
             if matches!(ref_name, "amp" | "lt" | "gt" | "apos" | "quot") {
+                continue;
+            }
+            if checked.contains(ref_name) {
                 continue;
             }
             match self.dtd.entities.get(ref_name) {
@@ -990,7 +1023,8 @@ impl<'a> DtdParser<'a> {
                             )));
                         }
                         // Recursively check referenced entities
-                        self.validate_attr_default_entities(text)?;
+                        checked.insert(ref_name.to_string());
+                        self.validate_attr_default_entities(text, checked)?;
                     }
                 },
             }
@@ -3679,5 +3713,101 @@ mod tests {
         // The depth bound must not affect ordinary, shallowly-nested models.
         let dtd = parse_dtd("<!ELEMENT a (b,(c|d),e)>").unwrap();
         assert!(dtd.elements.contains_key("a"));
+    }
+
+    // --- Entity recursion checks (WFC: No Recursion, XML 1.0 §4.1) ---
+
+    #[test]
+    fn test_entity_recursion_direct_cycle_rejected() {
+        let err = parse_dtd("<!ENTITY x \"&x;\">").unwrap_err();
+        assert!(
+            err.message.contains("recursive entity reference"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_entity_recursion_indirect_cycle_rejected() {
+        let err =
+            parse_dtd("<!ENTITY a \"&b;\"><!ENTITY b \"&c;\"><!ENTITY c \"&a;\">").unwrap_err();
+        assert!(
+            err.message.contains("recursive entity reference"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_entity_recursion_cycle_behind_safe_entity_rejected() {
+        // Regression test for the memoized walk (issue #42): `ok` is acyclic
+        // and shared by both cycle members. Marking `ok` as proven-safe must
+        // not mask the a<->b cycle behind it.
+        let err = parse_dtd(
+            "<!ENTITY ok \"text\">\
+             <!ENTITY a \"&ok;&b;\">\
+             <!ENTITY b \"&ok;&a;\">",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("recursive entity reference"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_entity_recursion_acyclic_diamond_accepted() {
+        // d is reachable through two paths (a->b->d and a->c->d) but there
+        // is no cycle; the memoized walk must accept this.
+        let dtd = parse_dtd(
+            "<!ENTITY d \"leaf\">\
+             <!ENTITY b \"&d;&d;\">\
+             <!ENTITY c \"&d;&d;\">\
+             <!ENTITY a \"&b;&c;\">",
+        )
+        .unwrap();
+        assert_eq!(dtd.entities.len(), 4);
+    }
+
+    #[test]
+    fn test_entity_recursion_deep_chain_is_linear() {
+        // Regression test for issue #42: each level references the previous
+        // entity 10 times. Without memoization the recursion check walks
+        // 10^30 paths and never finishes; with it, this parses instantly.
+        use std::fmt::Write as _;
+        let mut src = String::from("<!ENTITY a \"AAAA\">");
+        for i in 1..=30u32 {
+            let prev = if i == 1 {
+                "a".to_string()
+            } else {
+                format!("e{}", i - 1)
+            };
+            let refs = format!("&{prev};").repeat(10);
+            let _ = write!(src, "<!ENTITY e{i} \"{refs}\">");
+        }
+        let dtd = parse_dtd(&src).unwrap();
+        assert_eq!(dtd.entities.len(), 31);
+    }
+
+    #[test]
+    fn test_pe_recursion_direct_cycle_rejected() {
+        // %p; encoded as &#37;p; inside the value (XML 1.0 §4.1).
+        let err = parse_dtd("<!ENTITY % p \"&#37;p;\">").unwrap_err();
+        assert!(
+            err.message.contains("recursive parameter entity reference"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_pe_recursion_indirect_cycle_rejected() {
+        let err = parse_dtd("<!ENTITY % p \"&#37;q;\"><!ENTITY % q \"&#37;p;\">").unwrap_err();
+        assert!(
+            err.message.contains("recursive parameter entity reference"),
+            "unexpected error message: {}",
+            err.message
+        );
     }
 }
