@@ -297,15 +297,28 @@ fn test_entity_expansion_depth_shared_with_element_depth() {
     // sub-parsers: 32 entity levels each wrapping 250 nested elements would
     // otherwise build ~8000 real stack frames and overflow the stack, while
     // staying under the per-parser depth limit and the amplification guard.
-    let mut s = String::from("<!DOCTYPE d [<!ENTITY e0 \"leaf\">");
-    let open = "<a>".repeat(250);
-    let close = "</a>".repeat(250);
-    for i in 1..=31u32 {
-        let prev = i - 1;
-        let _ = write!(s, "<!ENTITY e{i} \"{open}&e{prev};{close}\">");
-    }
-    s.push_str("]><d>&e31;</d>");
-    let result = Document::parse_str(&s);
+    // Run in a thread with a larger stack: even with the fix, the parser
+    // legitimately nests up to max_depth (256) parse_element frames before
+    // erroring, which is too deep for the default test-thread stack in
+    // debug mode (same pattern as test_deeply_nested_elements_rejected).
+    // Without the fix the document needs ~8000 frames and overflows even
+    // this 8 MB stack.
+    let result = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut s = String::from("<!DOCTYPE d [<!ENTITY e0 \"leaf\">");
+            let open = "<a>".repeat(250);
+            let close = "</a>".repeat(250);
+            for i in 1..=31u32 {
+                let prev = i - 1;
+                let _ = write!(s, "<!ENTITY e{i} \"{open}&e{prev};{close}\">");
+            }
+            s.push_str("]><d>&e31;</d>");
+            Document::parse_str(&s)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
     let Err(err) = result else {
         panic!("expected cumulative depth limit to reject the document");
     };
