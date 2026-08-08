@@ -2372,9 +2372,12 @@ fn validate_element_recursive(
         idref_values,
     );
 
-    // Collect child element IDs first to avoid borrow conflicts
-    let child_ids: Vec<NodeId> = doc
-        .children(node_id)
+    // Collect child element IDs first to avoid borrow conflicts. Entity
+    // references are looked through so that entity-supplied elements are
+    // validated too (XML 1.0 §4.4.3: included replacement text participates
+    // in validation).
+    let child_ids: Vec<NodeId> = effective_content_children(doc, node_id)
+        .into_iter()
         .filter(|&child_id| matches!(doc.node(child_id).kind, NodeKind::Element { .. }))
         .collect();
 
@@ -2392,6 +2395,29 @@ fn validate_element_recursive(
     }
 }
 
+/// Collects an element's content children in document order, transparently
+/// expanding entity-reference nodes into their parsed replacement children.
+///
+/// Per XML 1.0 §4.4.3, replacement text included for an entity reference is
+/// part of the document's content and participates in validation, so the
+/// content-model checks must see through `EntityRef` nodes. An entity
+/// reference without parsed children (e.g. an undeclared entity preserved in
+/// tolerant mode) contributes nothing.
+fn effective_content_children(doc: &Document, node_id: NodeId) -> Vec<NodeId> {
+    fn collect(doc: &Document, node_id: NodeId, out: &mut Vec<NodeId>) {
+        for child in doc.children(node_id) {
+            if matches!(doc.node(child).kind, NodeKind::EntityRef { .. }) {
+                collect(doc, child, out);
+            } else {
+                out.push(child);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(doc, node_id, &mut out);
+    out
+}
+
 /// Validates that an element's children match its declared content model.
 fn validate_content_model(
     doc: &Document,
@@ -2400,10 +2426,13 @@ fn validate_content_model(
     model: &ContentModel,
     errors: &mut Vec<ValidationError>,
 ) {
+    // Entity references are looked through: their parsed replacement
+    // children are part of the content being validated (XML 1.0 §4.4.3).
+    let content_children = effective_content_children(doc, node_id);
     match model {
         ContentModel::Empty => {
             // No children at all
-            let has_content = doc.children(node_id).any(|child| {
+            let has_content = content_children.iter().any(|&child| {
                 matches!(
                     doc.node(child).kind,
                     NodeKind::Element { .. } | NodeKind::Text { .. } | NodeKind::CData { .. }
@@ -2425,7 +2454,7 @@ fn validate_content_model(
         }
         ContentModel::Mixed(allowed_names) => {
             // Text is always allowed. Check that element children are in the allowed list.
-            for child_id in doc.children(node_id) {
+            for &child_id in &content_children {
                 if let NodeKind::Element { ref name, .. } = doc.node(child_id).kind {
                     if !allowed_names.contains(name) {
                         errors.push(ValidationError {
@@ -2447,9 +2476,9 @@ fn validate_content_model(
         }
         ContentModel::Children(spec) => {
             // Collect element child names (ignore text, comments, PIs)
-            let child_names: Vec<String> = doc
-                .children(node_id)
-                .filter_map(|child_id| {
+            let child_names: Vec<String> = content_children
+                .iter()
+                .filter_map(|&child_id| {
                     if let NodeKind::Element { ref name, .. } = doc.node(child_id).kind {
                         Some(name.clone())
                     } else {
@@ -2459,7 +2488,7 @@ fn validate_content_model(
                 .collect();
 
             // Check for text content in element-only content model
-            let has_text = doc.children(node_id).any(|child_id| {
+            let has_text = content_children.iter().any(|&child_id| {
                 if let NodeKind::Text { ref content } = doc.node(child_id).kind {
                     !content.trim().is_empty()
                 } else {
@@ -3809,5 +3838,55 @@ mod tests {
             "unexpected error message: {}",
             err.message
         );
+    }
+
+    // --- Content-model validation through entity references (§4.4.3) ---
+
+    #[test]
+    fn test_validate_entity_supplied_child_matches_model() {
+        // The required <x> child arrives via an entity reference; the
+        // content model must see through the EntityRef node.
+        let dtd = parse_dtd("<!ELEMENT d (x)><!ELEMENT x (#PCDATA)>").unwrap();
+        let mut doc = make_doc("<!DOCTYPE d [<!ENTITY e \"<x>hi</x>\">]><d>&e;</d>");
+        let result = validate(&mut doc, &dtd);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_validate_entity_supplied_child_violates_model() {
+        // An entity-supplied element that violates the content model must
+        // still be reported.
+        let dtd =
+            parse_dtd("<!ELEMENT d (x)><!ELEMENT x (#PCDATA)><!ELEMENT y (#PCDATA)>").unwrap();
+        let mut doc = make_doc("<!DOCTYPE d [<!ENTITY e \"<y>hi</y>\">]><d>&e;</d>");
+        let result = validate(&mut doc, &dtd);
+        assert!(!result.is_valid, "expected content-model violation");
+    }
+
+    #[test]
+    fn test_validate_entity_supplied_element_content_checked() {
+        // Elements inside entity expansions are themselves validated: <x>
+        // is declared EMPTY but the entity gives it text content.
+        let dtd = parse_dtd("<!ELEMENT d (x)><!ELEMENT x EMPTY>").unwrap();
+        let mut doc = make_doc("<!DOCTYPE d [<!ENTITY e \"<x>hi</x>\">]><d>&e;</d>");
+        let result = validate(&mut doc, &dtd);
+        assert!(!result.is_valid, "expected EMPTY-content violation");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("EMPTY") && e.message.contains("has content")),
+            "errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_validate_mixed_content_through_entity() {
+        let dtd = parse_dtd("<!ELEMENT p (#PCDATA|em)*><!ELEMENT em (#PCDATA)>").unwrap();
+        let mut doc =
+            make_doc("<!DOCTYPE p [<!ENTITY e \"text <em>emph</em>\">]><p>before &e; after</p>");
+        let result = validate(&mut doc, &dtd);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
     }
 }
