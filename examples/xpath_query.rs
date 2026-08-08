@@ -38,7 +38,7 @@ fn main() {
     let result = evaluate(&doc, root, "book[@genre='fiction']/title").expect("XPath failed");
     if let XPathValue::NodeSet(nodes) = &result {
         for &node in nodes {
-            println!("  - {}", doc.text_content(node));
+            println!("  - {}", doc.text_content(node.anchor()));
         }
     }
 
@@ -47,7 +47,7 @@ fn main() {
     let result = evaluate(&doc, root, "book[number(price) > 10]/title").expect("XPath failed");
     if let XPathValue::NodeSet(nodes) = &result {
         for &node in nodes {
-            println!("  - {}", doc.text_content(node));
+            println!("  - {}", doc.text_content(node.anchor()));
         }
     }
 

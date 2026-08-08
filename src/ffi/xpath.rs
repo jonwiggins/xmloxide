@@ -2,10 +2,10 @@
 #![allow(unsafe_code, clippy::missing_safety_doc)]
 
 use std::ffi::CStr;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 
 use crate::tree::{Document, NodeId};
-use crate::xpath::XPathValue;
+use crate::xpath::{XPathNode, XPathValue};
 
 use super::strings::to_c_string;
 use super::{clear_last_error, set_last_error};
@@ -165,6 +165,11 @@ pub unsafe extern "C" fn xmloxide_xpath_nodeset_count(result: *const XPathValue)
 
 /// Returns the node id at the given index in an `XPath` nodeset result.
 ///
+/// For attribute nodes, returns the id of the owner element (use
+/// `xmloxide_xpath_nodeset_item_is_attribute`,
+/// `xmloxide_xpath_nodeset_item_attr_name`, and
+/// `xmloxide_xpath_nodeset_item_attr_value` to inspect the attribute).
+///
 /// Returns 0 if the result is not a nodeset or the index is out of bounds.
 ///
 /// # Safety
@@ -181,9 +186,105 @@ pub unsafe extern "C" fn xmloxide_xpath_nodeset_item(
     // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
     let val = unsafe { &*result };
     match val {
-        XPathValue::NodeSet(nodes) => nodes.get(index).map_or(0, |id| id.into_raw()),
+        XPathValue::NodeSet(nodes) => nodes.get(index).map_or(0, |n| n.anchor().into_raw()),
         _ => 0,
     }
+}
+
+/// Returns 1 if the nodeset entry at `index` is an attribute node, 0
+/// otherwise (including out-of-bounds and non-nodeset results).
+///
+/// # Safety
+///
+/// `result` must be a valid pointer returned by `xmloxide_xpath_eval`.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_xpath_nodeset_item_is_attribute(
+    result: *const XPathValue,
+    index: usize,
+) -> c_int {
+    if result.is_null() {
+        return 0;
+    }
+    // SAFETY: Null check above. Caller guarantees `result` is a valid pointer from `xmloxide_xpath_eval`.
+    let val = unsafe { &*result };
+    match val {
+        XPathValue::NodeSet(nodes) => {
+            c_int::from(nodes.get(index).is_some_and(|n| n.is_attribute()))
+        }
+        _ => 0,
+    }
+}
+
+/// Returns the qualified name of the attribute at `index` in a nodeset
+/// result, or null if the entry is not an attribute.
+///
+/// The returned string must be freed with `xmloxide_free_string`.
+///
+/// # Safety
+///
+/// `result` must be a valid pointer returned by `xmloxide_xpath_eval`, and
+/// `doc` must be the document the result was evaluated against.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_xpath_nodeset_item_attr_name(
+    doc: *const Document,
+    result: *const XPathValue,
+    index: usize,
+) -> *mut c_char {
+    // SAFETY: Null checks below; caller guarantees validity per the contract.
+    let (doc, val) = unsafe {
+        match (doc.as_ref(), result.as_ref()) {
+            (Some(d), Some(v)) => (d, v),
+            _ => return std::ptr::null_mut(),
+        }
+    };
+    let XPathValue::NodeSet(nodes) = val else {
+        return std::ptr::null_mut();
+    };
+    let Some(&XPathNode::Attribute { owner, index }) = nodes.get(index) else {
+        return std::ptr::null_mut();
+    };
+    let Some(attr) = doc.attributes(owner).get(index as usize) else {
+        return std::ptr::null_mut();
+    };
+    let qname = match &attr.prefix {
+        Some(prefix) => format!("{prefix}:{}", attr.name),
+        None => attr.name.clone(),
+    };
+    to_c_string(&qname)
+}
+
+/// Returns the value of the attribute at `index` in a nodeset result, or
+/// null if the entry is not an attribute.
+///
+/// The returned string must be freed with `xmloxide_free_string`.
+///
+/// # Safety
+///
+/// `result` must be a valid pointer returned by `xmloxide_xpath_eval`, and
+/// `doc` must be the document the result was evaluated against.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_xpath_nodeset_item_attr_value(
+    doc: *const Document,
+    result: *const XPathValue,
+    index: usize,
+) -> *mut c_char {
+    // SAFETY: Null checks below; caller guarantees validity per the contract.
+    let (doc, val) = unsafe {
+        match (doc.as_ref(), result.as_ref()) {
+            (Some(d), Some(v)) => (d, v),
+            _ => return std::ptr::null_mut(),
+        }
+    };
+    let XPathValue::NodeSet(nodes) = val else {
+        return std::ptr::null_mut();
+    };
+    let Some(&XPathNode::Attribute { owner, index }) = nodes.get(index) else {
+        return std::ptr::null_mut();
+    };
+    let Some(attr) = doc.attributes(owner).get(index as usize) else {
+        return std::ptr::null_mut();
+    };
+    to_c_string(&attr.value)
 }
 
 /// Frees an `XPath` result previously returned by `xmloxide_xpath_eval`.

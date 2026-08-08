@@ -143,11 +143,14 @@ impl Document {
     }
 
     /// Evaluate an XPath expression and return matching node ids.
+    ///
+    /// Attribute nodes in the result are anchored to their owner element,
+    /// since the bindings expose tree-node handles only.
     fn xpath(&self, node: &NodeId, expr: &str) -> PyResult<Vec<NodeId>> {
         match xmloxide::xpath::evaluate(&self.inner, node.id, expr) {
             Ok(value) => {
                 let nodes = value.as_node_set().cloned().unwrap_or_default();
-                Ok(nodes.into_iter().map(|id| NodeId { id }).collect())
+                Ok(nodes.into_iter().map(|n| NodeId { id: n.anchor() }).collect())
             }
             Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
         }

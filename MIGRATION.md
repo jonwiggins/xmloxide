@@ -121,6 +121,13 @@ xmlFreeNode(root);
 - No `xmlXPathContext` needed — pass the context node directly
 - `xmlXPathNodeSetItem()` takes the document pointer as an extra argument
 - Node handles from XPath results must be freed
+- Attribute-axis results are attribute nodes: `xmloxide_xpath_nodeset_item()`
+  returns the owner element's id for them, and
+  `xmloxide_xpath_nodeset_item_is_attribute()` /
+  `xmloxide_xpath_nodeset_item_attr_name()` /
+  `xmloxide_xpath_nodeset_item_attr_value()` expose the attribute itself
+  (libxml2 instead returns an `XML_ATTRIBUTE_NODE` from
+  `xmlXPathNodeSetItem`)
 
 ### Error handling
 

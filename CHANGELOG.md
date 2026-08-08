@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **XPath attribute results are first-class attribute nodes** (#47).
+  Node-sets (`XPathValue::NodeSet`) now hold `XPathNode` entries — either a
+  tree node or an attribute identified by owner element and index — instead
+  of bare `NodeId`s. This fixes a family of wrong-answer bugs rooted in the
+  old one-value-per-element override map: `//a/@x != //a/@y` comparisons no
+  longer clobber each other's values, `@*` yields one node per attribute
+  (previously only the first per element), `count((//a)[1]/@href)` returns a
+  number instead of a type error, `name()`/`local-name()`/`namespace-uri()`
+  work on attribute nodes, `@attr/..` navigates to the owner element,
+  predicates evaluate with the attribute as context node, and namespace
+  declarations (`xmlns`, `xmlns:*`) are no longer visible as attributes per
+  the XPath 1.0 data model. Mixed node-sets (`//a | //a/@x`) sort in
+  document order with attributes directly after their owner element.
+  **Breaking:** code matching `XPathValue::NodeSet` must handle
+  `XPathNode`; use `.anchor()` for the owning tree node or
+  `.as_tree_node()` to filter attributes out. The single-match collapse
+  (attribute paths returning `XPathValue::String`) is gone — convert with
+  `string()` where a string is wanted. `xmllint --xpath` prints attribute
+  results as `name="value"` lines, matching libxml2. The C API keeps
+  `xmloxide_xpath_nodeset_item()` (returns the owner element id for
+  attributes) and adds `xmloxide_xpath_nodeset_item_is_attribute()`,
+  `..._attr_name()`, and `..._attr_value()`.
+
 ### Security
 
 - **Fix exponential-time entity recursion check** (#42, thanks @hey-jj). The

@@ -438,9 +438,25 @@ fn evaluate_xpath(filename: &str, doc: &Document, expression: &str) {
     match xpath::evaluate(doc, context_node, expression) {
         Ok(value) => match &value {
             xpath::XPathValue::NodeSet(nodes) => {
-                for &node_id in nodes {
-                    let content = serialize_subtree(doc, node_id);
-                    println!("{content}");
+                for &node in nodes {
+                    match node {
+                        xpath::XPathNode::Node(node_id) => {
+                            let content = serialize_subtree(doc, node_id);
+                            println!("{content}");
+                        }
+                        xpath::XPathNode::Attribute { owner, index } => {
+                            // Print attribute nodes as name="value", matching
+                            // libxml2's xmllint output.
+                            if let Some(attr) = doc.attributes(owner).get(index as usize) {
+                                match &attr.prefix {
+                                    Some(prefix) => {
+                                        println!("{prefix}:{}=\"{}\"", attr.name, attr.value);
+                                    }
+                                    None => println!("{}=\"{}\"", attr.name, attr.value),
+                                }
+                            }
+                        }
+                    }
                 }
             }
             xpath::XPathValue::String(s) => {

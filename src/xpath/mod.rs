@@ -19,8 +19,8 @@
 //! # Known Limitations
 //!
 //! - The `namespace::` axis returns the element's `NodeId` when in-scope
-//!   namespaces match (following the same pattern as the attribute axis).
-//!   Namespace nodes are not materialized as separate tree nodes.
+//!   namespaces match. Namespace nodes are not materialized as separate
+//!   nodes (attribute nodes are — see [`types::XPathNode`]).
 //!
 //! # Submodules
 //!
@@ -38,7 +38,7 @@ pub(crate) mod regex;
 pub mod types;
 
 pub use eval::XPathContext;
-pub use types::{XPathError, XPathValue};
+pub use types::{XPathError, XPathNode, XPathValue};
 
 use crate::tree::{Document, NodeId};
 

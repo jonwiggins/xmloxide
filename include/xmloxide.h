@@ -616,10 +616,40 @@ size_t xmloxide_xpath_nodeset_count(const xmloxide_xpath_value *result);
 
 /**
  * Returns the node id at the given index in an XPath nodeset result.
+ * For attribute nodes, returns the id of the owner element (use the
+ * item_is_attribute / item_attr_name / item_attr_value accessors to
+ * inspect the attribute itself).
  * Returns 0 if the result is not a nodeset or the index is out of bounds.
  */
 uint32_t xmloxide_xpath_nodeset_item(const xmloxide_xpath_value *result,
                                      size_t index);
+
+/**
+ * Returns 1 if the nodeset entry at the given index is an attribute node,
+ * 0 otherwise (including out-of-bounds and non-nodeset results).
+ */
+int xmloxide_xpath_nodeset_item_is_attribute(const xmloxide_xpath_value *result,
+                                             size_t index);
+
+/**
+ * Returns the qualified name (prefix:local) of the attribute at the given
+ * index in a nodeset result, or NULL if the entry is not an attribute.
+ * `doc` must be the document the result was evaluated against.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_xpath_nodeset_item_attr_name(const xmloxide_document *doc,
+                                            const xmloxide_xpath_value *result,
+                                            size_t index);
+
+/**
+ * Returns the value of the attribute at the given index in a nodeset
+ * result, or NULL if the entry is not an attribute.
+ * `doc` must be the document the result was evaluated against.
+ * The returned string must be freed with xmloxide_free_string().
+ */
+char *xmloxide_xpath_nodeset_item_attr_value(const xmloxide_document *doc,
+                                             const xmloxide_xpath_value *result,
+                                             size_t index);
 
 /**
  * Frees an XPath result previously returned by xmloxide_xpath_eval().

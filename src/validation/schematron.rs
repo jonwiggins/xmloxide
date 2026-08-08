@@ -55,7 +55,7 @@ use crate::tree::{Document, NodeId, NodeKind};
 use crate::validation::{ValidationError, ValidationResult};
 use crate::xpath;
 use crate::xpath::eval::XPathContext;
-use crate::xpath::types::{XPathError, XPathValue};
+use crate::xpath::types::{XPathError, XPathNode, XPathValue};
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -832,6 +832,9 @@ fn make_xpath_context<'a>(
 }
 
 /// Evaluates an `XPath` context expression and returns the matching nodes.
+///
+/// Attribute nodes in the result are anchored to their owner element:
+/// Schematron rule contexts fire on the element carrying the attribute.
 fn eval_context_xpath(
     doc: &Document,
     root: NodeId,
@@ -843,7 +846,7 @@ fn eval_context_xpath(
     let ctx = make_xpath_context(doc, root, variables, ns_bindings);
     let result = ctx.evaluate(&expr)?;
     match result {
-        XPathValue::NodeSet(nodes) => Ok(nodes),
+        XPathValue::NodeSet(nodes) => Ok(nodes.into_iter().map(XPathNode::anchor).collect()),
         _ => Ok(vec![]),
     }
 }
@@ -921,13 +924,15 @@ fn interpolate_message(
 /// empty for node-sets without document access).
 fn xpath_value_to_string(doc: &Document, val: &XPathValue) -> String {
     match val {
-        XPathValue::NodeSet(nodes) => {
-            if let Some(&first) = nodes.first() {
-                doc.text_content(first)
-            } else {
-                String::new()
-            }
-        }
+        XPathValue::NodeSet(nodes) => match nodes.first() {
+            Some(&XPathNode::Attribute { owner, index }) => doc
+                .attributes(owner)
+                .get(index as usize)
+                .map(|a| a.value.clone())
+                .unwrap_or_default(),
+            Some(&XPathNode::Node(id)) => doc.text_content(id),
+            None => String::new(),
+        },
         _ => val.to_xpath_string(),
     }
 }

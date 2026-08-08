@@ -22,12 +22,11 @@
 //! All 27 core `XPath` 1.0 functions are implemented (node-set, string,
 //! boolean, and number function groups).
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::ast::{Axis, BinaryOp, Expr, NodeTest, Step};
-use super::types::XPathError;
-use crate::tree::{Document, NodeId, NodeKind};
+use super::types::{XPathError, XPathNode};
+use crate::tree::{Attribute, Document, NodeId, NodeKind};
 
 /// Evaluation context for an `XPath` 1.0 expression.
 ///
@@ -51,8 +50,9 @@ use crate::tree::{Document, NodeId, NodeKind};
 pub struct XPathContext<'a> {
     /// The document being queried.
     doc: &'a Document,
-    /// The context node for expression evaluation.
-    context_node: NodeId,
+    /// The context node for expression evaluation (may be an attribute node
+    /// when evaluating predicates over attribute-axis results).
+    context_node: XPathNode,
     /// 1-based position of the context node within its context node-set.
     context_position: usize,
     /// The size of the context node-set.
@@ -66,13 +66,6 @@ pub struct XPathContext<'a> {
     /// the prefix to a URI and comparing against the element's namespace URI
     /// and local name.
     namespaces: HashMap<String, String>,
-    /// Attribute string values for nodes returned by attribute axis steps.
-    ///
-    /// When a location path ends with an attribute axis (e.g., `item/@amount`),
-    /// the element `NodeId` is returned in the node-set, but its string value
-    /// for `XPath` purposes should be the attribute value, not the element's
-    /// text content. This map provides that override.
-    attr_string_values: RefCell<HashMap<NodeId, String>>,
 }
 
 /// An `XPath` 1.0 value.
@@ -91,13 +84,17 @@ impl<'a> XPathContext<'a> {
     pub fn new(doc: &'a Document, context_node: NodeId) -> Self {
         Self {
             doc,
-            context_node,
+            context_node: XPathNode::Node(context_node),
             context_position: 1,
             context_size: 1,
             variables: HashMap::new(),
             namespaces: HashMap::new(),
-            attr_string_values: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Looks up an attribute node's underlying [`Attribute`] data.
+    fn attr(&self, owner: NodeId, index: u32) -> Option<&Attribute> {
+        self.doc.attributes(owner).get(index as usize)
     }
 
     /// Registers a namespace prefix → URI binding for name resolution.
@@ -240,22 +237,16 @@ impl<'a> XPathContext<'a> {
     /// Applies location path `steps` to an initial node-set.
     ///
     /// Shared by relative paths, absolute paths, and filter-path expressions
-    /// (e.g., `(//a)[1]/@href`). Handles the final-attribute-axis special
-    /// case and the `descendant-or-self::node()/child::X` fusion.
+    /// (e.g., `(//a)[1]/@href`). Handles the
+    /// `descendant-or-self::node()/child::X` fusion.
     fn eval_steps_from(
         &self,
-        mut nodes: Vec<NodeId>,
+        mut nodes: Vec<XPathNode>,
         steps: &[Step],
     ) -> Result<XPathValue, XPathError> {
         let mut i = 0;
         while i < steps.len() {
             let step = &steps[i];
-            // If the last step is an attribute axis, collect attribute values
-            // into the attr_string_values map so that string_value() returns
-            // the attribute value rather than the element's text content.
-            if i == steps.len() - 1 && step.axis == Axis::Attribute && step.predicates.is_empty() {
-                return Ok(self.collect_attribute_nodeset(&nodes, &step.node_test));
-            }
             // Optimization: fuse descendant-or-self::node()/child::X into
             // descendant::X — avoids materializing the huge intermediate
             // node-set that `//` produces.
@@ -287,53 +278,6 @@ impl<'a> XPathContext<'a> {
         self.eval_steps_from(nodes, steps)
     }
 
-    /// Collects attribute values from a set of element nodes, returning them
-    /// as a `NodeSet` (using element `NodeId`s) with `attr_string_values`
-    /// overrides so that `string_value()` returns the attribute value.
-    ///
-    /// This handles the fact that attributes are not tree nodes in our arena.
-    /// For a single matching attribute, returns the value as a `String` for
-    /// backwards compatibility with expressions like `@id` in string context.
-    fn collect_attribute_nodeset(&self, nodes: &[NodeId], test: &NodeTest) -> XPathValue {
-        let mut result_nodes = Vec::new();
-        let mut attr_map = self.attr_string_values.borrow_mut();
-
-        for &node in nodes {
-            let attrs = self.doc.attributes(node);
-            match test {
-                NodeTest::Name(name) => {
-                    if let Some(attr) = attrs.iter().find(|a| a.name == *name) {
-                        attr_map.insert(node, attr.value.clone());
-                        result_nodes.push(node);
-                    }
-                }
-                NodeTest::Wildcard | NodeTest::Node => {
-                    // For wildcard, return one entry per attribute
-                    // Since we map NodeId → String, we can only store one value
-                    // per element. Use the first attribute's value.
-                    if let Some(attr) = attrs.first() {
-                        attr_map.insert(node, attr.value.clone());
-                        result_nodes.push(node);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // For a single result, return as String for backwards compatibility
-        // with expressions like `@id` used in string context.
-        if result_nodes.len() == 1 {
-            if let Some(val) = attr_map.get(&result_nodes[0]) {
-                return XPathValue::String(val.clone());
-            }
-        }
-
-        // No matching attribute is an empty node-set (XPath 1.0 §3.4: an
-        // empty node-set compares false under both `=` and `!=`, which a
-        // String sentinel would break).
-        XPathValue::NodeSet(result_nodes)
-    }
-
     /// Tries to fuse `descendant-or-self::node()` + `child::X` at position `i`
     /// into a single `descendant::X` step. Returns `None` if the pattern doesn't
     /// match (e.g., the first step has predicates, or the second step isn't `child`).
@@ -361,13 +305,13 @@ impl<'a> XPathContext<'a> {
     }
 
     fn eval_root_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
-        self.eval_steps_from(vec![self.doc.root()], steps)
+        self.eval_steps_from(vec![XPathNode::Node(self.doc.root())], steps)
     }
 
     /// Applies a single step to every node in `input`, producing a new node
     /// set in document order with duplicates removed.
-    fn apply_step(&self, input: &[NodeId], step: &Step) -> Result<Vec<NodeId>, XPathError> {
-        let mut result: Vec<NodeId> = Vec::new();
+    fn apply_step(&self, input: &[XPathNode], step: &Step) -> Result<Vec<XPathNode>, XPathError> {
+        let mut result: Vec<XPathNode> = Vec::new();
 
         if input.len() == 1 {
             // Fast path: single input node — no dedup needed.
@@ -418,17 +362,28 @@ impl<'a> XPathContext<'a> {
     #[allow(clippy::too_many_lines)]
     fn expand_axis_filtered(
         &self,
-        node: NodeId,
+        node: XPathNode,
         axis: Axis,
         test: &NodeTest,
-        result: &mut Vec<NodeId>,
+        result: &mut Vec<XPathNode>,
     ) {
+        let node = match node {
+            XPathNode::Attribute { owner, index } => {
+                self.expand_axis_from_attribute(owner, index, axis, test, result);
+                return;
+            }
+            XPathNode::Node(id) => id,
+        };
         if axis == Axis::Attribute {
-            result.extend(self.apply_attribute_node_test(node, test));
+            self.push_matching_attributes(node, test, result);
             return;
         }
         if axis == Axis::Namespace {
-            result.extend(self.apply_namespace_node_test(node, test));
+            result.extend(
+                self.apply_namespace_node_test(node, test)
+                    .into_iter()
+                    .map(XPathNode::Node),
+            );
             return;
         }
 
@@ -450,7 +405,7 @@ impl<'a> XPathContext<'a> {
                             } = &self.doc.node(child).kind
                             {
                                 if elem_name == name {
-                                    result.push(child);
+                                    result.push(XPathNode::Node(child));
                                 }
                             }
                         }
@@ -463,7 +418,7 @@ impl<'a> XPathContext<'a> {
                             } = &self.doc.node(desc).kind
                             {
                                 if elem_name == name {
-                                    result.push(desc);
+                                    result.push(XPathNode::Node(desc));
                                 }
                             }
                         }
@@ -475,7 +430,7 @@ impl<'a> XPathContext<'a> {
                         } = &self.doc.node(node).kind
                         {
                             if elem_name == name {
-                                result.push(node);
+                                result.push(XPathNode::Node(node));
                             }
                         }
                         for desc in self.doc.descendants(node) {
@@ -484,7 +439,7 @@ impl<'a> XPathContext<'a> {
                             } = &self.doc.node(desc).kind
                             {
                                 if elem_name == name {
-                                    result.push(desc);
+                                    result.push(XPathNode::Node(desc));
                                 }
                             }
                         }
@@ -499,36 +454,36 @@ impl<'a> XPathContext<'a> {
             Axis::Child => {
                 for child in self.doc.children(node) {
                     if self.node_matches_test(child, test, axis) {
-                        result.push(child);
+                        result.push(XPathNode::Node(child));
                     }
                 }
             }
             Axis::Descendant => {
                 for desc in self.doc.descendants(node) {
                     if self.node_matches_test(desc, test, axis) {
-                        result.push(desc);
+                        result.push(XPathNode::Node(desc));
                     }
                 }
             }
             Axis::DescendantOrSelf => {
                 if self.node_matches_test(node, test, axis) {
-                    result.push(node);
+                    result.push(XPathNode::Node(node));
                 }
                 for desc in self.doc.descendants(node) {
                     if self.node_matches_test(desc, test, axis) {
-                        result.push(desc);
+                        result.push(XPathNode::Node(desc));
                     }
                 }
             }
             Axis::Self_ => {
                 if self.node_matches_test(node, test, axis) {
-                    result.push(node);
+                    result.push(XPathNode::Node(node));
                 }
             }
             Axis::Parent => {
                 if let Some(p) = self.doc.parent(node) {
                     if self.node_matches_test(p, test, axis) {
-                        result.push(p);
+                        result.push(XPathNode::Node(p));
                     }
                 }
             }
@@ -537,7 +492,7 @@ impl<'a> XPathContext<'a> {
                 let axis_nodes = self.expand_axis(node, axis);
                 for id in axis_nodes {
                     if self.node_matches_test(id, test, axis) {
-                        result.push(id);
+                        result.push(XPathNode::Node(id));
                     }
                 }
             }
@@ -547,67 +502,147 @@ impl<'a> XPathContext<'a> {
     /// Like `expand_axis_filtered` but with deduplication via `seen` `HashSet`.
     fn expand_axis_filtered_dedup(
         &self,
-        node: NodeId,
+        node: XPathNode,
         axis: Axis,
         test: &NodeTest,
-        result: &mut Vec<NodeId>,
-        seen: &mut HashSet<NodeId>,
+        result: &mut Vec<XPathNode>,
+        seen: &mut HashSet<XPathNode>,
     ) {
-        if axis == Axis::Attribute {
-            for id in self.apply_attribute_node_test(node, test) {
-                if seen.insert(id) {
-                    result.push(id);
-                }
+        // Expand into a scratch vec, then dedup-push. Axis expansion from a
+        // single node never yields duplicates, so dedup is only needed
+        // across input nodes.
+        let mut scratch = Vec::new();
+        self.expand_axis_filtered(node, axis, test, &mut scratch);
+        for n in scratch {
+            if seen.insert(n) {
+                result.push(n);
             }
-            return;
         }
-        if axis == Axis::Namespace {
-            for id in self.apply_namespace_node_test(node, test) {
-                if seen.insert(id) {
-                    result.push(id);
-                }
-            }
-            return;
-        }
+    }
+
+    /// Expands an axis from an attribute node (`XPath` 1.0 section 2.2):
+    /// the owner element is the attribute's parent, and attributes have no
+    /// children and are not siblings of any node.
+    fn expand_axis_from_attribute(
+        &self,
+        owner: NodeId,
+        index: u32,
+        axis: Axis,
+        test: &NodeTest,
+        result: &mut Vec<XPathNode>,
+    ) {
         match axis {
-            Axis::Child => {
-                for child in self.doc.children(node) {
-                    if self.node_matches_test(child, test, axis) && seen.insert(child) {
-                        result.push(child);
+            Axis::Parent if self.node_matches_test(owner, test, axis) => {
+                result.push(XPathNode::Node(owner));
+            }
+            Axis::Ancestor => {
+                let mut current = Some(owner);
+                while let Some(n) = current {
+                    if self.node_matches_test(n, test, axis) {
+                        result.push(XPathNode::Node(n));
+                    }
+                    current = self.doc.parent(n);
+                }
+            }
+            Axis::Self_ | Axis::AncestorOrSelf | Axis::DescendantOrSelf => {
+                // The principal node type of these axes is element, so only
+                // node() matches the attribute itself (XPath 1.0 §2.3).
+                if *test == NodeTest::Node {
+                    result.push(XPathNode::Attribute { owner, index });
+                }
+                if axis == Axis::AncestorOrSelf {
+                    let mut current = Some(owner);
+                    while let Some(n) = current {
+                        if self.node_matches_test(n, test, axis) {
+                            result.push(XPathNode::Node(n));
+                        }
+                        current = self.doc.parent(n);
                     }
                 }
             }
-            Axis::Descendant => {
-                for desc in self.doc.descendants(node) {
-                    if self.node_matches_test(desc, test, axis) && seen.insert(desc) {
-                        result.push(desc);
+            Axis::Following => {
+                // Everything after the attribute in document order except
+                // attribute/namespace nodes: the owner's descendants, then
+                // the owner's following nodes (XPath 1.0 §2.2).
+                for desc in self.doc.descendants(owner) {
+                    if self.node_matches_test(desc, test, axis) {
+                        result.push(XPathNode::Node(desc));
+                    }
+                }
+                for id in self.following_nodes(owner) {
+                    if self.node_matches_test(id, test, axis) {
+                        result.push(XPathNode::Node(id));
                     }
                 }
             }
-            Axis::DescendantOrSelf => {
-                if self.node_matches_test(node, test, axis) && seen.insert(node) {
-                    result.push(node);
-                }
-                for desc in self.doc.descendants(node) {
-                    if self.node_matches_test(desc, test, axis) && seen.insert(desc) {
-                        result.push(desc);
+            Axis::Preceding => {
+                for id in self.preceding_nodes(owner) {
+                    if self.node_matches_test(id, test, axis) {
+                        result.push(XPathNode::Node(id));
                     }
                 }
             }
-            Axis::Self_ => {
-                if self.node_matches_test(node, test, axis) && seen.insert(node) {
-                    result.push(node);
-                }
+            // Child, Descendant, Attribute, Namespace, FollowingSibling,
+            // PrecedingSibling: empty for attribute nodes.
+            _ => {}
+        }
+    }
+
+    /// Expands the attribute axis of an element: one entry per matching
+    /// attribute, in attribute-list order.
+    ///
+    /// Namespace declarations (`xmlns`, `xmlns:*`) are not attribute nodes
+    /// in the `XPath` 1.0 data model (section 5.3) and are skipped.
+    fn push_matching_attributes(
+        &self,
+        element: NodeId,
+        test: &NodeTest,
+        result: &mut Vec<XPathNode>,
+    ) {
+        for (i, attr) in self.doc.attributes(element).iter().enumerate() {
+            if attr.prefix.as_deref() == Some("xmlns")
+                || (attr.prefix.is_none() && attr.name == "xmlns")
+            {
+                continue;
             }
-            _ => {
-                let axis_nodes = self.expand_axis(node, axis);
-                for id in axis_nodes {
-                    if self.node_matches_test(id, test, axis) && seen.insert(id) {
-                        result.push(id);
+            let matches = match test {
+                NodeTest::Name(name) => self.attr_name_matches(attr, name),
+                NodeTest::Wildcard | NodeTest::Node => true,
+                NodeTest::PrefixWildcard(prefix) => {
+                    if let Some(uri) = self.namespaces.get(prefix.as_str()) {
+                        attr.namespace.as_deref() == Some(uri.as_str())
+                    } else {
+                        attr.prefix.as_deref() == Some(prefix.as_str())
                     }
                 }
+                _ => false,
+            };
+            if matches {
+                #[allow(clippy::cast_possible_truncation)]
+                result.push(XPathNode::Attribute {
+                    owner: element,
+                    index: i as u32,
+                });
             }
         }
+    }
+
+    /// Tests an attribute against a name test.
+    ///
+    /// A `prefix:local` test matches namespace-aware when the prefix is
+    /// registered via [`set_namespace`](Self::set_namespace), and by literal
+    /// prefix otherwise. An unprefixed test matches on the local name
+    /// (matching the evaluator's historical behavior for element names).
+    fn attr_name_matches(&self, attr: &Attribute, name: &str) -> bool {
+        if let Some(colon) = name.find(':') {
+            let prefix = &name[..colon];
+            let local = &name[colon + 1..];
+            if let Some(uri) = self.namespaces.get(prefix) {
+                return attr.namespace.as_deref() == Some(uri.as_str()) && attr.name == local;
+            }
+            return attr.prefix.as_deref() == Some(prefix) && attr.name == local;
+        }
+        attr.name == name
     }
 
     // -----------------------------------------------------------------------
@@ -820,44 +855,6 @@ impl<'a> XPathContext<'a> {
         }
     }
 
-    /// Handles the attribute axis: returns a sentinel for each matching
-    /// attribute. Since attributes are not tree nodes in our arena, we
-    /// return the element's own `NodeId` tagged appropriately. For the
-    /// evaluator, attribute access is handled specially when string-value
-    /// is needed.
-    ///
-    /// In practice, the attribute axis is most useful in predicates like
-    /// `[@id='foo']` where we test attribute values. We return the element
-    /// node itself if an attribute matches, allowing predicate evaluation to
-    /// work correctly.
-    fn apply_attribute_node_test(&self, element: NodeId, test: &NodeTest) -> Vec<NodeId> {
-        let attrs = self.doc.attributes(element);
-        if attrs.is_empty() {
-            return Vec::new();
-        }
-
-        match test {
-            NodeTest::Name(name) => {
-                if attrs.iter().any(|a| a.name == *name) {
-                    vec![element]
-                } else {
-                    Vec::new()
-                }
-            }
-            NodeTest::Wildcard | NodeTest::Node => {
-                // Return the element once for each attribute (for count purposes).
-                // However for simplicity we return once — this is a known
-                // simplification.
-                if attrs.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![element]
-                }
-            }
-            _ => Vec::new(),
-        }
-    }
-
     /// Handles the namespace axis: returns the element's `NodeId` if the
     /// element has any in-scope namespace bindings that match `test`.
     ///
@@ -940,9 +937,9 @@ impl<'a> XPathContext<'a> {
     /// it is converted to boolean.
     fn apply_predicate(
         &self,
-        nodes: &[NodeId],
+        nodes: &[XPathNode],
         predicate: &Expr,
-    ) -> Result<Vec<NodeId>, XPathError> {
+    ) -> Result<Vec<XPathNode>, XPathError> {
         let size = nodes.len();
         let mut result = Vec::new();
 
@@ -979,7 +976,6 @@ impl<'a> XPathContext<'a> {
                     self.variables.clone()
                 },
                 namespaces: self.namespaces.clone(),
-                attr_string_values: RefCell::new(HashMap::new()),
             };
             let val = ctx.eval_expr(predicate)?;
             let keep = match &val {
@@ -1050,7 +1046,7 @@ impl<'a> XPathContext<'a> {
         };
 
         // Merge, dedup, sort
-        let seen: HashSet<NodeId> = lnodes.iter().copied().collect();
+        let seen: HashSet<XPathNode> = lnodes.iter().copied().collect();
         for id in rnodes {
             if !seen.contains(&id) {
                 lnodes.push(id);
@@ -1179,7 +1175,11 @@ impl<'a> XPathContext<'a> {
                 }
             }
         };
-        let name = self.doc.node_name(node).unwrap_or("");
+        if let XPathNode::Attribute { owner, index } = node {
+            let local = self.attr(owner, index).map(|a| a.name.clone());
+            return Ok(XPathValue::String(local.unwrap_or_default()));
+        }
+        let name = self.doc.node_name(node.anchor()).unwrap_or("");
         // Strip prefix if present (local-name returns the part after ':')
         let local = name.split(':').next_back().unwrap_or(name);
         Ok(XPathValue::String(local.to_owned()))
@@ -1208,7 +1208,11 @@ impl<'a> XPathContext<'a> {
                 }
             }
         };
-        let uri = self.doc.node_namespace(node).unwrap_or("");
+        if let XPathNode::Attribute { owner, index } = node {
+            let uri = self.attr(owner, index).and_then(|a| a.namespace.clone());
+            return Ok(XPathValue::String(uri.unwrap_or_default()));
+        }
+        let uri = self.doc.node_namespace(node.anchor()).unwrap_or("");
         Ok(XPathValue::String(uri.to_owned()))
     }
 
@@ -1235,7 +1239,14 @@ impl<'a> XPathContext<'a> {
                 }
             }
         };
-        let name = self.doc.node_name(node).unwrap_or("");
+        if let XPathNode::Attribute { owner, index } = node {
+            let qname = self.attr(owner, index).map(|a| match &a.prefix {
+                Some(prefix) => format!("{prefix}:{}", a.name),
+                None => a.name.clone(),
+            });
+            return Ok(XPathValue::String(qname.unwrap_or_default()));
+        }
+        let name = self.doc.node_name(node.anchor()).unwrap_or("");
         Ok(XPathValue::String(name.to_owned()))
     }
 
@@ -1454,7 +1465,7 @@ impl<'a> XPathContext<'a> {
         let target_lower = target.to_lowercase();
 
         // Walk ancestors looking for xml:lang attribute
-        let mut node = Some(self.context_node);
+        let mut node = Some(self.context_node.anchor());
         while let Some(n) = node {
             if let Some(lang) = self.doc.attribute(n, "xml:lang") {
                 let lang_lower = lang.to_lowercase();
@@ -1550,7 +1561,7 @@ impl<'a> XPathContext<'a> {
             for token in id_str.split_whitespace() {
                 if let Some(node) = self.doc.element_by_id(token) {
                     if seen.insert(node) {
-                        result.push(node);
+                        result.push(XPathNode::Node(node));
                     }
                 }
             }
@@ -1843,16 +1854,20 @@ impl<'a> XPathContext<'a> {
     /// Computes the string-value of a node per `XPath` 1.0 section 5.
     ///
     /// - Root / Element: concatenation of all descendant text nodes
+    /// - Attribute: the attribute value
     /// - Text / CDATA: the text content
     /// - Comment: the comment text
     /// - PI: the PI data
-    /// - Attribute: would be the attribute value (handled separately)
-    fn string_value(&self, node: NodeId) -> String {
-        // Check if this node has an attribute string value override
-        // (set when a location path ended with an attribute axis step).
-        if let Some(val) = self.attr_string_values.borrow().get(&node) {
-            return val.clone();
-        }
+    fn string_value(&self, node: XPathNode) -> String {
+        let node = match node {
+            XPathNode::Attribute { owner, index } => {
+                return self
+                    .attr(owner, index)
+                    .map(|a| a.value.clone())
+                    .unwrap_or_default();
+            }
+            XPathNode::Node(id) => id,
+        };
         let kind = &self.doc.node(node).kind;
         match kind {
             // EntityRef: the expansion lives in the node's children, so the
@@ -2000,8 +2015,9 @@ impl<'a> XPathContext<'a> {
 /// Sorts a node-set into document order using the arena index as a proxy.
 ///
 /// Since nodes are allocated in document order during parsing, the arena
-/// index (encoded in `NodeId`) directly reflects document order.
-fn sort_document_order(nodes: &mut [NodeId]) {
+/// index (encoded in `NodeId`) directly reflects document order; attribute
+/// nodes sort just after their owner element, by attribute index.
+fn sort_document_order(nodes: &mut [XPathNode]) {
     nodes.sort_unstable();
 }
 
@@ -2223,6 +2239,125 @@ mod tests {
         assert_eq!(
             eval_xpath(NEQ_DOC, "string(//g/@missing)"),
             XPathValue::String(String::new())
+        );
+    }
+
+    // -- First-class attribute nodes (issue #47) ----------------------------
+
+    #[test]
+    fn test_attr_vs_attr_comparison_not_clobbered() {
+        // Two attribute node-sets in one comparison must each keep their own
+        // values: x = {1,2}, y = {3,3} has an unequal pair, so != is true.
+        let xml = "<r><a x='1' y='3'/><a x='2' y='3'/></r>";
+        assert_eq!(
+            eval_xpath(xml, "//a/@x != //a/@y"),
+            XPathValue::Boolean(true)
+        );
+        // x = {1,3}, y = {2,4} share no value, so = is false.
+        let xml2 = "<r><a x='1' y='2'/><a x='3' y='4'/></r>";
+        assert_eq!(
+            eval_xpath(xml2, "//a/@x = //a/@y"),
+            XPathValue::Boolean(false)
+        );
+        // And a genuinely shared value makes = true.
+        let xml3 = "<r><a x='1' y='2'/><a x='3' y='1'/></r>";
+        assert_eq!(
+            eval_xpath(xml3, "//a/@x = //a/@y"),
+            XPathValue::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_count_single_attribute_filter_path() {
+        // A single-match attribute step is a node-set of one attribute node,
+        // usable in node-set contexts like count().
+        let xml = "<r><a href='u1'/><a/></r>";
+        assert_eq!(
+            eval_xpath(xml, "count((//a)[1]/@href)"),
+            XPathValue::Number(1.0)
+        );
+        assert_eq!(eval_xpath(xml, "count(//a/@href)"), XPathValue::Number(1.0));
+    }
+
+    #[test]
+    fn test_attribute_wildcard_counts_all_attributes() {
+        // @* yields one node per attribute — not one per element.
+        let xml = "<r><a x='1' y='2' z='3'/><b w='4'/></r>";
+        assert_eq!(eval_xpath(xml, "count(//@*)"), XPathValue::Number(4.0));
+        assert_eq!(eval_count(xml, "//a/@*"), 3);
+        // sum() over the wildcard sees every value.
+        assert_eq!(eval_xpath(xml, "sum(//@*)"), XPathValue::Number(10.0));
+    }
+
+    #[test]
+    fn test_attribute_wildcard_excludes_namespace_declarations() {
+        // xmlns/xmlns:* are namespace declarations, not attribute nodes
+        // (XPath 1.0 §5.3).
+        let xml = "<r xmlns:p='urn:p' id='1'><p:a p:x='2'/></r>";
+        assert_eq!(eval_count(xml, "//@*"), 2);
+    }
+
+    #[test]
+    fn test_attribute_node_name_functions() {
+        let xml = "<r xmlns:p='urn:p'><a p:href='u1'/></r>";
+        assert_eq!(
+            eval_xpath(xml, "name(//a/@*)"),
+            XPathValue::String("p:href".to_owned())
+        );
+        assert_eq!(
+            eval_xpath(xml, "local-name(//a/@*)"),
+            XPathValue::String("href".to_owned())
+        );
+        assert_eq!(
+            eval_xpath(xml, "namespace-uri(//a/@*)"),
+            XPathValue::String("urn:p".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_attribute_parent_axis() {
+        let xml = "<r><a x='1'/></r>";
+        assert_eq!(
+            eval_xpath(xml, "name(//a/@x/..)"),
+            XPathValue::String("a".to_owned())
+        );
+        assert_eq!(eval_count(xml, "//a/@x/ancestor::*"), 2);
+    }
+
+    #[test]
+    fn test_attribute_predicate_on_attribute_step() {
+        // Predicates over attribute node-sets see the attribute's own
+        // string-value as the context node.
+        let xml = "<r><a x='1'/><a x='2'/><a x='3'/></r>";
+        assert_eq!(eval_count(xml, "//a/@x[. > 1]"), 2);
+        assert_eq!(
+            eval_xpath(xml, "string(//a/@x[. = '2'])"),
+            XPathValue::String("2".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_union_of_elements_and_attributes() {
+        // Mixed node-sets sort in document order with an attribute directly
+        // after its owner element.
+        let xml = "<r><a x='1'>t</a></r>";
+        let XPathValue::NodeSet(ns) = eval_xpath(xml, "//a | //a/@x") else {
+            panic!("expected node-set");
+        };
+        assert_eq!(ns.len(), 2);
+        assert!(!ns[0].is_attribute());
+        assert!(ns[1].is_attribute());
+        assert_eq!(ns[1].anchor(), ns[0].anchor());
+    }
+
+    #[test]
+    fn test_prefixed_attribute_name_test() {
+        // A prefixed attribute name test matches by literal prefix without
+        // bindings, and namespace-aware with bindings.
+        let xml = "<r xmlns:xl='http://www.w3.org/1999/xlink'><a xl:href='u1'/></r>";
+        assert_eq!(
+            eval_xpath(xml, "string(//a/@xl:href)"),
+            XPathValue::String("u1".to_owned())
         );
     }
 
@@ -2536,7 +2671,7 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => {
                 assert_eq!(ns.len(), 1);
-                assert_eq!(ns[0], a);
+                assert_eq!(ns[0], XPathNode::Node(a));
             }
             _ => panic!("expected node-set"),
         }
@@ -2554,7 +2689,7 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => {
                 assert_eq!(ns.len(), 1);
-                assert_eq!(ns[0], root_elem);
+                assert_eq!(ns[0], XPathNode::Node(root_elem));
             }
             _ => panic!("expected node-set"),
         }
@@ -2588,7 +2723,7 @@ mod tests {
             XPathValue::NodeSet(ns) => {
                 assert_eq!(ns.len(), 1);
                 // Check it's the right element
-                assert_eq!(doc.attribute(ns[0], "id"), Some("x"));
+                assert_eq!(doc.attribute(ns[0].anchor(), "id"), Some("x"));
             }
             _ => panic!("expected node-set"),
         }
@@ -2664,7 +2799,7 @@ mod tests {
             XPathValue::NodeSet(ns) => {
                 assert_eq!(ns.len(), 1);
                 let doc = Document::parse_str(xml).unwrap();
-                assert_eq!(doc.text_content(ns[0]), "deep");
+                assert_eq!(doc.text_content(ns[0].anchor()), "deep");
             }
             _ => panic!("expected node-set"),
         }
@@ -2769,8 +2904,8 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => {
                 assert_eq!(ns.len(), 1);
-                assert_eq!(doc.node_name(ns[0]), Some("item"));
-                assert_eq!(doc.text_content(ns[0]), "Hello");
+                assert_eq!(doc.node_name(ns[0].anchor()), Some("item"));
+                assert_eq!(doc.text_content(ns[0].anchor()), "Hello");
             }
             other => panic!("expected node-set, got {other:?}"),
         }
@@ -2793,8 +2928,8 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => {
                 assert_eq!(ns.len(), 2);
-                assert_eq!(doc.node_name(ns[0]), Some("a"));
-                assert_eq!(doc.node_name(ns[1]), Some("c"));
+                assert_eq!(doc.node_name(ns[0].anchor()), Some("a"));
+                assert_eq!(doc.node_name(ns[1].anchor()), Some("c"));
             }
             other => panic!("expected node-set, got {other:?}"),
         }

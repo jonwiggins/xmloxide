@@ -150,11 +150,17 @@ impl WasmDocument {
     }
 
     /// Evaluate an XPath expression and return matching nodes.
+    ///
+    /// Attribute nodes in the result are anchored to their owner element,
+    /// since the bindings expose tree-node handles only.
     pub fn xpath(&self, node: &WasmNodeId, expr: &str) -> Result<Vec<WasmNodeId>, JsError> {
         match xmloxide::xpath::evaluate(&self.inner, node.id, expr) {
             Ok(value) => {
                 let nodes = value.as_node_set().cloned().unwrap_or_default();
-                Ok(nodes.into_iter().map(|id| WasmNodeId { id }).collect())
+                Ok(nodes
+                    .into_iter()
+                    .map(|n| WasmNodeId { id: n.anchor() })
+                    .collect())
             }
             Err(e) => Err(JsError::new(&e.to_string())),
         }

@@ -368,7 +368,7 @@ proptest! {
         let result = xmloxide::xpath::evaluate(&doc, root, ".").unwrap();
         let nodes = result.as_node_set().unwrap();
         prop_assert_eq!(nodes.len(), 1);
-        prop_assert_eq!(nodes[0], root);
+        prop_assert_eq!(nodes[0], xmloxide::xpath::XPathNode::Node(root));
     }
 
     #[test]
@@ -386,8 +386,8 @@ proptest! {
         let xpath_elements = result.as_node_set().unwrap();
 
         prop_assert_eq!(nav_elements.len(), xpath_elements.len());
-        for (nav, xpath) in nav_elements.iter().zip(xpath_elements.iter()) {
-            prop_assert_eq!(nav, xpath);
+        for (&nav, &xpath) in nav_elements.iter().zip(xpath_elements.iter()) {
+            prop_assert_eq!(xmloxide::xpath::XPathNode::Node(nav), xpath);
         }
     }
 }

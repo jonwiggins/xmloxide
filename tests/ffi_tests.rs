@@ -459,6 +459,43 @@ fn test_xpath_eval_nodeset() {
 }
 
 #[test]
+fn test_xpath_eval_attribute_nodeset() {
+    let xml = CString::new(r#"<root><a href="u1"/><a href="u2"/></root>"#).unwrap();
+    let expr = CString::new("//a/@href").unwrap();
+    unsafe {
+        let doc = xmloxide_parse_str(xml.as_ptr());
+        assert!(!doc.is_null());
+
+        let result = xmloxide_xpath_eval(doc, 0, expr.as_ptr());
+        assert!(!result.is_null());
+        assert_eq!(xmloxide_xpath_result_type(result), XMLOXIDE_XPATH_NODESET);
+        assert_eq!(xmloxide_xpath_nodeset_count(result), 2);
+
+        // Attribute entries anchor to their owner element...
+        let owner = xmloxide_xpath_nodeset_item(result, 0);
+        assert_ne!(owner, 0);
+        let owner_name = c_string_to_owned(xmloxide_node_name(doc, owner));
+        assert_eq!(owner_name.as_deref(), Some("a"));
+
+        // ...and expose attribute identity through the new accessors.
+        assert_eq!(xmloxide_xpath_nodeset_item_is_attribute(result, 0), 1);
+        let name = c_string_to_owned(xmloxide_xpath_nodeset_item_attr_name(doc, result, 0));
+        assert_eq!(name.as_deref(), Some("href"));
+        let v0 = c_string_to_owned(xmloxide_xpath_nodeset_item_attr_value(doc, result, 0));
+        assert_eq!(v0.as_deref(), Some("u1"));
+        let v1 = c_string_to_owned(xmloxide_xpath_nodeset_item_attr_value(doc, result, 1));
+        assert_eq!(v1.as_deref(), Some("u2"));
+
+        // Element entries are not attributes and yield null attr accessors.
+        assert_eq!(xmloxide_xpath_nodeset_item_is_attribute(result, 99), 0);
+        assert!(xmloxide_xpath_nodeset_item_attr_name(doc, result, 99).is_null());
+
+        xmloxide_xpath_free_result(result);
+        xmloxide_free_doc(doc);
+    }
+}
+
+#[test]
 fn test_xpath_eval_boolean() {
     let xml = CString::new("<root><a/></root>").unwrap();
     let expr = CString::new("boolean(//a)").unwrap();

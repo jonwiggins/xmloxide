@@ -443,7 +443,7 @@ fn bench_xpath_ancestor(c: &mut Criterion) {
     let root = doc.root_element().expect("no root element");
     // Get a deep node to evaluate ancestor axis from
     let result = evaluate(&doc, root, "//book[1]/title").expect("xpath failed");
-    let title_node = result.as_node_set().expect("expected nodeset")[0];
+    let title_node = result.as_node_set().expect("expected nodeset")[0].anchor();
     c.bench_function("xpath_ancestor", |b| {
         b.iter(|| evaluate(black_box(&doc), title_node, "ancestor::*"));
     });

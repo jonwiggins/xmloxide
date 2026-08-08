@@ -12,6 +12,93 @@ use crate::tree::NodeId;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
+// XPathNode
+// ---------------------------------------------------------------------------
+
+/// A node in an `XPath` node-set.
+///
+/// The `XPath` 1.0 data model (section 5) includes attribute nodes, but the
+/// tree arena stores attributes inline on their owner element rather than as
+/// tree nodes. This enum lets node-sets carry both kinds: ordinary tree
+/// nodes by [`NodeId`], and attributes by owner element plus position in the
+/// element's attribute list.
+///
+/// Ordering follows document order: an attribute sorts immediately after its
+/// owner element (and before the element's children — sufficient for the
+/// stable, consistent ordering `XPath` 1.0 section 5.3 requires), and
+/// attributes of the same element sort by attribute index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum XPathNode {
+    /// A tree node (element, text, comment, PI, or the document root).
+    Node(NodeId),
+    /// An attribute node, identified by its owner element and its index in
+    /// the element's attribute list.
+    Attribute {
+        /// The element that carries the attribute.
+        owner: NodeId,
+        /// The index of the attribute in the owner's attribute list.
+        index: u32,
+    },
+}
+
+impl XPathNode {
+    /// Returns the tree node this entry anchors to: the node itself, or the
+    /// owner element for an attribute.
+    #[must_use]
+    pub fn anchor(self) -> NodeId {
+        match self {
+            Self::Node(id) => id,
+            Self::Attribute { owner, .. } => owner,
+        }
+    }
+
+    /// Returns the inner [`NodeId`] if this is a tree node, or `None` for
+    /// an attribute.
+    #[must_use]
+    pub fn as_tree_node(self) -> Option<NodeId> {
+        match self {
+            Self::Node(id) => Some(id),
+            Self::Attribute { .. } => None,
+        }
+    }
+
+    /// Returns `true` if this entry is an attribute node.
+    #[must_use]
+    pub fn is_attribute(self) -> bool {
+        matches!(self, Self::Attribute { .. })
+    }
+
+    /// Document-order sort key: `(anchor, is-attribute, attribute-index)`.
+    ///
+    /// Relies on the arena property that `NodeId`s of a parsed document are
+    /// allocated in document order.
+    fn sort_key(self) -> (NodeId, u8, u32) {
+        match self {
+            Self::Node(id) => (id, 0, 0),
+            Self::Attribute { owner, index } => (owner, 1, index),
+        }
+    }
+}
+
+impl Ord for XPathNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+impl PartialOrd for XPathNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl From<NodeId> for XPathNode {
+    fn from(id: NodeId) -> Self {
+        Self::Node(id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // XPathValue
 // ---------------------------------------------------------------------------
 
@@ -38,11 +125,13 @@ pub enum XPathValue {
     /// See `XPath` 1.0 section 4.2.
     String(String),
 
-    /// An ordered set of nodes, identified by their arena indices.
+    /// An ordered set of nodes.
     ///
-    /// Node-sets are ordered in document order. Duplicates should not appear
-    /// (the caller is responsible for deduplication). See `XPath` 1.0 section 3.3.
-    NodeSet(Vec<NodeId>),
+    /// Node-sets are ordered in document order and may contain both tree
+    /// nodes and attribute nodes (see [`XPathNode`]). Duplicates should not
+    /// appear (the caller is responsible for deduplication). See `XPath` 1.0
+    /// section 3.3.
+    NodeSet(Vec<XPathNode>),
 }
 
 impl XPathValue {
@@ -164,7 +253,7 @@ impl XPathValue {
     /// Returns a reference to the inner node-set if this value is a
     /// `NodeSet`, or `None` otherwise.
     #[must_use]
-    pub fn as_node_set(&self) -> Option<&Vec<NodeId>> {
+    pub fn as_node_set(&self) -> Option<&Vec<XPathNode>> {
         match self {
             Self::NodeSet(nodes) => Some(nodes),
             _ => None,
@@ -534,7 +623,7 @@ mod tests {
     fn test_to_boolean_from_nodeset() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        assert!(XPathValue::NodeSet(vec![id]).to_boolean());
+        assert!(XPathValue::NodeSet(vec![id.into()]).to_boolean());
         assert!(!XPathValue::NodeSet(vec![]).to_boolean());
     }
 
@@ -567,14 +656,14 @@ mod tests {
     fn test_to_number_from_nodeset_without_doc() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        assert!(XPathValue::NodeSet(vec![id]).to_number().is_nan());
+        assert!(XPathValue::NodeSet(vec![id.into()]).to_number().is_nan());
     }
 
     #[test]
     fn test_to_number_with_string_value() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        let val = XPathValue::NodeSet(vec![id]);
+        let val = XPathValue::NodeSet(vec![id.into()]);
         assert_eq!(val.to_number_with_string_value(Some("42")), 42.0);
         assert!(val.to_number_with_string_value(Some("abc")).is_nan());
         assert!(val.to_number_with_string_value(None).is_nan());
@@ -650,7 +739,7 @@ mod tests {
     fn test_as_node_set() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        let ns = XPathValue::NodeSet(vec![id]);
+        let ns = XPathValue::NodeSet(vec![id.into()]);
         assert!(ns.as_node_set().is_some());
         assert_eq!(ns.as_node_set().unwrap().len(), 1);
 
@@ -682,7 +771,7 @@ mod tests {
         assert_eq!(XPathValue::Number(42.0).to_string(), "42");
         assert_eq!(XPathValue::String("hi".to_owned()).to_string(), "hi");
         assert_eq!(
-            XPathValue::NodeSet(vec![id1, id2]).to_string(),
+            XPathValue::NodeSet(vec![id1.into(), id2.into()]).to_string(),
             "<node-set of 2 nodes>"
         );
     }
@@ -750,7 +839,7 @@ mod tests {
     fn test_compare_values_eq_with_nodeset_returns_none() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        let ns = XPathValue::NodeSet(vec![id]);
+        let ns = XPathValue::NodeSet(vec![id.into()]);
         let s = XPathValue::String("x".to_owned());
         assert_eq!(compare_values_eq(&ns, &s), None);
         assert_eq!(compare_values_eq(&s, &ns), None);
@@ -761,7 +850,7 @@ mod tests {
         let mut doc = Document::new();
         let id1 = make_node_id_in_doc(&mut doc);
         let id2 = make_node_id_in_doc(&mut doc);
-        let ns = XPathValue::NodeSet(vec![id1, id2]);
+        let ns = XPathValue::NodeSet(vec![id1.into(), id2.into()]);
         let s = XPathValue::String("hello".to_owned());
         let node_strings = vec!["world".to_owned(), "hello".to_owned()];
 
@@ -778,7 +867,7 @@ mod tests {
         let mut doc = Document::new();
         let id1 = make_node_id_in_doc(&mut doc);
         let id2 = make_node_id_in_doc(&mut doc);
-        let ns = XPathValue::NodeSet(vec![id1, id2]);
+        let ns = XPathValue::NodeSet(vec![id1.into(), id2.into()]);
         let n = XPathValue::Number(42.0);
         let node_strings = vec!["10".to_owned(), "42".to_owned()];
 
@@ -794,7 +883,7 @@ mod tests {
     fn test_compare_with_string_values_nodeset_to_boolean() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        let ns = XPathValue::NodeSet(vec![id]);
+        let ns = XPathValue::NodeSet(vec![id.into()]);
         let b = XPathValue::Boolean(true);
 
         assert!(compare_values_with_string_values(&ns, &b, &[], &[]));
@@ -808,8 +897,8 @@ mod tests {
         let mut doc = Document::new();
         let id1 = make_node_id_in_doc(&mut doc);
         let id2 = make_node_id_in_doc(&mut doc);
-        let ns1 = XPathValue::NodeSet(vec![id1]);
-        let ns2 = XPathValue::NodeSet(vec![id2]);
+        let ns1 = XPathValue::NodeSet(vec![id1.into()]);
+        let ns2 = XPathValue::NodeSet(vec![id2.into()]);
 
         let strings1 = vec!["hello".to_owned()];
         let strings2 = vec!["hello".to_owned()];
@@ -904,7 +993,7 @@ mod tests {
     fn test_to_string_with_string_value_nodeset() {
         let mut doc = Document::new();
         let id = make_node_id_in_doc(&mut doc);
-        let val = XPathValue::NodeSet(vec![id]);
+        let val = XPathValue::NodeSet(vec![id.into()]);
         assert_eq!(val.to_string_with_string_value(Some("hello")), "hello");
         assert_eq!(val.to_string_with_string_value(None), "");
     }
