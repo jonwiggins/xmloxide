@@ -327,11 +327,10 @@ impl<'a> XPathContext<'a> {
                 return XPathValue::String(val.clone());
             }
         }
-        // Empty result
-        if result_nodes.is_empty() {
-            return XPathValue::String(String::new());
-        }
 
+        // No matching attribute is an empty node-set (XPath 1.0 §3.4: an
+        // empty node-set compares false under both `=` and `!=`, which a
+        // String sentinel would break).
         XPathValue::NodeSet(result_nodes)
     }
 
@@ -2195,6 +2194,47 @@ mod tests {
             XPathValue::Boolean(true)
         );
         assert_eq!(eval_xpath(NEQ_DOC, "//a/@x = 1"), XPathValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_neq_absent_attribute_is_false() {
+        // An attribute step matching nothing is an EMPTY node-set, so both
+        // `=` and `!=` are false — not a String("") sentinel that would
+        // make `!=` true through the scalar branch.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//g/@missing != 'v'"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//g/@missing = 'v'"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//g/@missing != 5"),
+            XPathValue::Boolean(false)
+        );
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "//nothere/@x != 'v'"),
+            XPathValue::Boolean(false)
+        );
+        // A predicate on a missing attribute selects nothing.
+        assert_eq!(eval_count(NEQ_DOC, "//*[@missing != 'v']"), 0);
+        // string() of an absent attribute is still the empty string.
+        assert_eq!(
+            eval_xpath(NEQ_DOC, "string(//g/@missing)"),
+            XPathValue::String(String::new())
+        );
+    }
+
+    #[test]
+    fn test_count_of_absent_attribute_filter_path() {
+        // count() over a filter-path attribute step with no matches must
+        // return 0, not a type error.
+        let xml = "<r><a href='u1'/><a/></r>";
+        assert_eq!(
+            eval_xpath(xml, "count((//a)/@missing)"),
+            XPathValue::Number(0.0)
+        );
     }
 
     #[test]

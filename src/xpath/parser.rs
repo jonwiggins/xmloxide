@@ -421,10 +421,9 @@ impl Parser {
     /// Parses the `'/' relative_path` or `'//' relative_path` continuation
     /// after a filter expression.
     ///
-    /// Represents `filter_expr / relative_path` by wrapping the filter
-    /// expression in a `Filter` node with the path steps stored as a `Path`
-    /// expression in the predicates list. The evaluator will interpret this
-    /// structure when processing filter-path combinations.
+    /// Produces an [`Expr::FilterPath`] holding the filter expression and
+    /// the continuation steps; the evaluator applies the steps to the
+    /// filter's node-set result. See `XPath` 1.0 section 3.3 (`PathExpr`).
     fn parse_filter_path_continuation(&mut self, filter: Expr) -> Result<Expr, XPathError> {
         let mut steps = Vec::new();
 
