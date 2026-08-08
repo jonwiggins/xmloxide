@@ -418,9 +418,17 @@ impl<'a> ParserInput<'a> {
     }
 
     /// Returns the current nesting depth.
-    #[allow(dead_code)]
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Sets the current nesting depth.
+    ///
+    /// Used when a nested sub-parser (entity replacement text) must inherit
+    /// the outer parser's depth so the total element nesting across entity
+    /// expansions stays bounded by `max_depth`.
+    pub fn set_depth(&mut self, depth: u32) {
+        self.depth = depth;
     }
 
     // -- Position queries --

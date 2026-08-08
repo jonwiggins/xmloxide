@@ -1198,6 +1198,11 @@ impl<'a> XmlParser<'a> {
         sub.entity_depth = self.entity_depth + 1;
         sub.input_size = self.input_size;
         sub.expansion_size = self.expansion_size;
+        // Inherit the element nesting depth so total depth across entity
+        // expansions stays bounded by max_depth (a fresh counter per
+        // sub-parser would allow MAX_ENTITY_DEPTH * max_depth stack frames —
+        // enough to overflow the stack).
+        sub.input.set_depth(self.input.depth());
         // Move shared state into the sub-parser (returned below).
         sub.input.entity_map = std::mem::take(&mut self.input.entity_map);
         sub.input.entity_external = std::mem::take(&mut self.input.entity_external);

@@ -290,6 +290,32 @@ fn test_deep_entity_chain_in_attr_default_parses_quickly() {
     }
 }
 
+#[test]
+fn test_entity_expansion_depth_shared_with_element_depth() {
+    // Nested entity expansions each parse their replacement text with a
+    // sub-parser. The element nesting depth must be inherited across those
+    // sub-parsers: 32 entity levels each wrapping 250 nested elements would
+    // otherwise build ~8000 real stack frames and overflow the stack, while
+    // staying under the per-parser depth limit and the amplification guard.
+    let mut s = String::from("<!DOCTYPE d [<!ENTITY e0 \"leaf\">");
+    let open = "<a>".repeat(250);
+    let close = "</a>".repeat(250);
+    for i in 1..=31u32 {
+        let prev = i - 1;
+        let _ = write!(s, "<!ENTITY e{i} \"{open}&e{prev};{close}\">");
+    }
+    s.push_str("]><d>&e31;</d>");
+    let result = Document::parse_str(&s);
+    let Err(err) = result else {
+        panic!("expected cumulative depth limit to reject the document");
+    };
+    assert!(
+        err.message.contains("depth"),
+        "error should mention depth: {}",
+        err.message
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SAX parser security limits
 // ---------------------------------------------------------------------------
