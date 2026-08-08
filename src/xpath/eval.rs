@@ -146,6 +146,7 @@ impl<'a> XPathContext<'a> {
             Expr::Path { steps } => self.eval_relative_path(steps),
             Expr::RootPath { steps } => self.eval_root_path(steps),
             Expr::Filter { expr, predicates } => self.eval_filter(expr, predicates),
+            Expr::FilterPath { expr, steps } => self.eval_filter_path(expr, steps),
             Expr::Union(left, right) => self.eval_union(left, right),
         }
     }
@@ -233,7 +234,19 @@ impl<'a> XPathContext<'a> {
     // -----------------------------------------------------------------------
 
     fn eval_relative_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
-        let mut nodes = vec![self.context_node];
+        self.eval_steps_from(vec![self.context_node], steps)
+    }
+
+    /// Applies location path `steps` to an initial node-set.
+    ///
+    /// Shared by relative paths, absolute paths, and filter-path expressions
+    /// (e.g., `(//a)[1]/@href`). Handles the final-attribute-axis special
+    /// case and the `descendant-or-self::node()/child::X` fusion.
+    fn eval_steps_from(
+        &self,
+        mut nodes: Vec<NodeId>,
+        steps: &[Step],
+    ) -> Result<XPathValue, XPathError> {
         let mut i = 0;
         while i < steps.len() {
             let step = &steps[i];
@@ -255,6 +268,23 @@ impl<'a> XPathContext<'a> {
             }
         }
         Ok(XPathValue::NodeSet(nodes))
+    }
+
+    /// Evaluates a filter expression followed by a relative location path,
+    /// e.g., `(//a)[1]/@href`: the filter yields a node-set, and the steps
+    /// are applied to it like any other location path continuation.
+    fn eval_filter_path(&self, expr: &Expr, steps: &[Step]) -> Result<XPathValue, XPathError> {
+        let val = self.eval_expr(expr)?;
+        let nodes = match val {
+            XPathValue::NodeSet(ns) => ns,
+            other => {
+                return Err(XPathError::TypeError {
+                    expected: "node-set".to_owned(),
+                    found: other.type_name().to_owned(),
+                });
+            }
+        };
+        self.eval_steps_from(nodes, steps)
     }
 
     /// Collects attribute values from a set of element nodes, returning them
@@ -332,29 +362,7 @@ impl<'a> XPathContext<'a> {
     }
 
     fn eval_root_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
-        let root = self.doc.root();
-        if steps.is_empty() {
-            return Ok(XPathValue::NodeSet(vec![root]));
-        }
-        let mut nodes = vec![root];
-        let mut i = 0;
-        while i < steps.len() {
-            let step = &steps[i];
-            // Handle final attribute axis step
-            if i == steps.len() - 1 && step.axis == Axis::Attribute && step.predicates.is_empty() {
-                return Ok(self.collect_attribute_nodeset(&nodes, &step.node_test));
-            }
-            // Optimization: fuse descendant-or-self::node()/child::X into
-            // descendant::X.
-            if let Some(fused) = Self::try_fuse_descendant_child(steps, i) {
-                nodes = self.apply_step(&nodes, &fused)?;
-                i += 2;
-            } else {
-                nodes = self.apply_step(&nodes, step)?;
-                i += 1;
-            }
-        }
-        Ok(XPathValue::NodeSet(nodes))
+        self.eval_steps_from(vec![self.doc.root()], steps)
     }
 
     /// Applies a single step to every node in `input`, producing a new node
@@ -2225,6 +2233,55 @@ mod tests {
         assert_eq!(
             eval_xpath(NEQ_DOC, "//a != false()"),
             XPathValue::Boolean(true)
+        );
+    }
+
+    // -- Filter-path expressions (issue #20) --------------------------------
+
+    #[test]
+    fn test_filter_path_attribute_value() {
+        // Regression test for issue #20: `string((//span/a)[1]/@href)` must
+        // return the attribute value, not the anchor's text content.
+        let xml =
+            "<r><span class='titleline'><a href='https://x.example/'>Link Text</a></span></r>";
+        let result = eval_xpath(xml, "string((//span[@class='titleline']/a)[1]/@href)");
+        assert_eq!(result, XPathValue::String("https://x.example/".to_owned()));
+    }
+
+    #[test]
+    fn test_filter_path_element_step() {
+        // `(//a)/b` navigates to the b children; `(//a)[b]` filters the a
+        // elements by the existence of a b child. They must differ.
+        let xml = "<r><a><b>1</b><b>2</b></a><a/></r>";
+        assert_eq!(eval_count(xml, "(//a)/b"), 2);
+        assert_eq!(eval_count(xml, "(//a)[b]"), 1);
+    }
+
+    #[test]
+    fn test_filter_path_double_slash() {
+        let xml = "<r><a><b><c>deep</c></b></a><a><c>direct</c></a></r>";
+        assert_eq!(eval_count(xml, "(//a)[1]//c"), 1);
+        assert_eq!(eval_count(xml, "(//a)//c"), 2);
+    }
+
+    #[test]
+    fn test_filter_path_parent_step() {
+        let xml = "<r><a><b/></a></r>";
+        let result = eval_xpath(xml, "name((//b)[1]/..)");
+        assert_eq!(result, XPathValue::String("a".to_owned()));
+    }
+
+    #[test]
+    fn test_filter_path_non_nodeset_is_type_error() {
+        // A location-path continuation on a non-node-set is a type error.
+        let doc = Document::parse_str("<r/>").unwrap();
+        let root = doc.root_element().unwrap();
+        let expr = parse("('str')/a").unwrap();
+        let ctx = XPathContext::new(&doc, root);
+        let err = ctx.evaluate(&expr).unwrap_err();
+        assert!(
+            matches!(err, XPathError::TypeError { .. }),
+            "expected TypeError, got: {err:?}"
         );
     }
 

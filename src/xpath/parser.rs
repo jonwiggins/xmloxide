@@ -442,9 +442,9 @@ impl Parser {
         // Parse the relative location path
         self.parse_relative_location_path_into(&mut steps)?;
 
-        Ok(Expr::Filter {
+        Ok(Expr::FilterPath {
             expr: Box::new(filter),
-            predicates: vec![Expr::Path { steps }],
+            steps,
         })
     }
 
@@ -1460,5 +1460,42 @@ mod tests {
             }
             _ => panic!("expected BinaryOp Or, got: {expr:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Filter-path expressions (issue #20)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_filter_path_continuation() {
+        // `(//a)[1]/@href`: a filter expression followed by a relative
+        // location path must parse to FilterPath, not to a predicate.
+        let (inner, steps) = match p("(//a)[1]/@href") {
+            Expr::FilterPath { expr, steps } => (expr, steps),
+            other => panic!("expected FilterPath, got: {other:?}"),
+        };
+        match *inner {
+            Expr::Filter { ref predicates, .. } => assert_eq!(predicates.len(), 1),
+            ref other => panic!("expected inner Filter, got: {other:?}"),
+        }
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].axis, Axis::Attribute);
+        assert_eq!(steps[0].node_test, NodeTest::Name("href".to_string()));
+    }
+
+    #[test]
+    fn test_parse_filter_path_vs_predicate_distinct() {
+        // `(//a)/b` (path continuation) and `(//a)[b]` (predicate) must
+        // produce different ASTs — they mean different things.
+        let path = p("(//a)/b");
+        assert!(
+            matches!(path, Expr::FilterPath { .. }),
+            "expected FilterPath, got: {path:?}"
+        );
+        let filter = p("(//a)[b]");
+        assert!(
+            matches!(filter, Expr::Filter { .. }),
+            "expected Filter, got: {filter:?}"
+        );
     }
 }

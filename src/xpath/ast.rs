@@ -88,6 +88,17 @@ pub enum Expr {
         predicates: Vec<Expr>,
     },
 
+    /// A filter expression followed by a relative location path
+    /// (e.g., `(//a)[1]/@href` or `$nodes//b`).
+    ///
+    /// See `XPath` 1.0 section 3.3 (`PathExpr`).
+    FilterPath {
+        /// The filter expression producing the initial node-set.
+        expr: Box<Expr>,
+        /// The location path steps applied to that node-set.
+        steps: Vec<Step>,
+    },
+
     /// A union of two node-sets (e.g., `a | b`).
     ///
     /// See `XPath` 1.0 section 3.3.
