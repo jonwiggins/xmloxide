@@ -58,4 +58,4 @@ pub mod xinclude;
 pub mod xpath;
 
 // Re-export primary types at the crate root for convenience.
-pub use tree::{Attribute, Document, NodeId};
+pub use tree::{Attribute, Document, Element, NodeId};

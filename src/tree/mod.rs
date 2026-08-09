@@ -15,8 +15,10 @@
 //! prev\_sibling). This avoids borrow checker issues, reference cycles,
 //! and per-node heap allocation.
 
+mod element;
 mod node;
 
+pub use element::{Attribute as ElementAttribute, Element, TagName};
 pub use node::NodeKind;
 
 use crate::error::{ParseDiagnostic, ParseError};
