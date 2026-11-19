@@ -3023,7 +3023,7 @@ mod tests {
         let ctx = XPathContext::new(&doc, root);
         let result = ctx.evaluate(&expr).unwrap();
         match &result {
-            XPathValue::NodeSet(ns) => assert!(ns.is_empty()),
+            XPathValue::NodeSet(ns) => assert_eq!(ns.as_slice(), []),
             other => panic!("expected empty node-set, got {other:?}"),
         }
     }

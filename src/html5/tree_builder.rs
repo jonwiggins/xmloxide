@@ -1220,11 +1220,7 @@ impl<'a> TreeBuilder<'a> {
         }
 
         // EOF always uses normal rules.
-        if *token == Token::Eof {
-            return false;
-        }
-
-        true
+        *token != Token::Eof
     }
 
     #[allow(clippy::too_many_lines)]

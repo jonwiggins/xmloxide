@@ -637,7 +637,7 @@ fn test_parse_error_message() {
         let err = last_error();
         assert!(err.is_some());
         // Error message should contain something meaningful
-        assert!(!err.unwrap().is_empty());
+        assert_ne!(err.unwrap(), "");
     }
 }
 
@@ -1283,7 +1283,7 @@ fn test_dtd_validate_invalid() {
         // Get error message
         let msg = c_string_to_owned(xmloxide_validation_error_message(result, 0));
         assert!(msg.is_some());
-        assert!(!msg.unwrap().is_empty());
+        assert_ne!(msg.unwrap(), "");
 
         // Out of bounds returns null
         let bad = xmloxide_validation_error_message(result, 999);
