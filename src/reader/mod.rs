@@ -931,9 +931,7 @@ impl<'a> XmlReader<'a> {
 
             // Parse DTD internal subset for entity declarations
             let end = self.parser_input.pos() - 1;
-            let subset_text = std::str::from_utf8(self.parser_input.slice(start, end))
-                .ok()
-                .map(str::to_string);
+            let subset_text = self.parser_input.str_slice(start, end).map(str::to_string);
             if let Some(subset_text) = subset_text {
                 if subset_text.contains('%') {
                     self.parser_input.has_pe_references = true;

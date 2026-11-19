@@ -309,6 +309,18 @@ impl<'a> HtmlParser<'a> {
         }
     }
 
+    /// Returns the input from `start` to `end` as an owned string.
+    ///
+    /// Takes the text straight from the input string. Only if a bound splits
+    /// a character does it fall back to a lossy conversion, so the result is
+    /// always what `String::from_utf8_lossy` on the same bytes would give.
+    fn input_text(&self, start: usize, end: usize) -> String {
+        match self.input.str_slice(start, end) {
+            Some(text) => text.to_owned(),
+            None => String::from_utf8_lossy(self.input.slice(start, end)).into_owned(),
+        }
+    }
+
     /// Main parse entry point. Parses the entire HTML document.
     fn parse(&mut self) -> Result<Document, ParseError> {
         self.input.skip_whitespace();
@@ -870,7 +882,7 @@ impl<'a> HtmlParser<'a> {
             }
             self.input.advance(1);
         }
-        String::from_utf8_lossy(self.input.slice(start, self.input.pos())).to_string()
+        self.input_text(start, self.input.pos())
     }
 
     /// Parses an attribute value. Handles quoted and unquoted values.
@@ -1187,7 +1199,7 @@ impl<'a> HtmlParser<'a> {
                 break;
             }
         }
-        String::from_utf8_lossy(self.input.slice(start, self.input.pos())).to_string()
+        self.input_text(start, self.input.pos())
     }
 
     /// Tries to parse a quoted value for DOCTYPE SYSTEM/PUBLIC identifiers.
@@ -1201,7 +1213,7 @@ impl<'a> HtmlParser<'a> {
         while !self.input.at_end() && self.input.peek() != Some(quote) {
             self.input.advance(1);
         }
-        let value = String::from_utf8_lossy(self.input.slice(start, self.input.pos())).to_string();
+        let value = self.input_text(start, self.input.pos());
         if !self.input.at_end() {
             self.input.advance(1); // closing quote
         }
@@ -1267,7 +1279,7 @@ impl<'a> HtmlParser<'a> {
                 break;
             }
         }
-        String::from_utf8_lossy(self.input.slice(start, self.input.pos())).to_string()
+        self.input_text(start, self.input.pos())
     }
 
     /// Pushes a warning diagnostic to the document. Respects the
@@ -1300,6 +1312,18 @@ mod tests {
     }
 
     // --- Basic parsing ---
+
+    #[test]
+    fn test_parse_non_ascii_text_and_attribute_values() {
+        let doc = parse("<p title=\"naïve €\" lang=ü>café</p>");
+        let p = doc
+            .descendants(doc.root())
+            .find(|&n| doc.node_name(n) == Some("p"))
+            .unwrap();
+        assert_eq!(doc.attribute(p, "title"), Some("naïve €"));
+        assert_eq!(doc.attribute(p, "lang"), Some("ü"));
+        assert_eq!(doc.text_content(p), "café");
+    }
 
     #[test]
     fn test_parse_simple_html() {
