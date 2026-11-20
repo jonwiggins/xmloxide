@@ -404,7 +404,8 @@ int32_t xmloxide_rename_element(xmloxide_document *doc, uint32_t node,
 
 /**
  * Returns the element with the given ID attribute, or 0 if not found.
- * The document's id_map must be populated first (typically via DTD validation).
+ * IDs registered by DTD validation (xmloxide_validate_dtd) are checked first;
+ * otherwise the element whose unprefixed `id` attribute matches is returned.
  */
 uint32_t xmloxide_element_by_id(const xmloxide_document *doc, const char *id);
 
