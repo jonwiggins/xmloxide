@@ -166,6 +166,31 @@ pub(crate) fn may_contain_invalid_xml_chars(bytes: &[u8]) -> bool {
     false
 }
 
+/// Appends literal attribute-value text to `out` with whitespace normalized.
+///
+/// Applies line-ending normalization (XML 1.0 §2.11: `\r\n` and a lone `\r`
+/// become `\n`) followed by attribute-value normalization (XML 1.0 §3.3.3:
+/// each literal `\t`, `\n` or `\r` becomes a single space). The net effect is
+/// that every `\r\n` pair and every other literal tab/CR/LF becomes one space.
+///
+/// Only *literal* characters may be passed here — character references such
+/// as `&#9;` are exempt from normalization and must be decoded separately.
+pub(crate) fn push_normalized_attr_chunk(out: &mut String, text: &str) {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push(' ');
+            }
+            '\t' | '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+}
+
 /// Splits a qualified name into optional prefix and local part.
 ///
 /// `"foo:bar"` → `(Some("foo"), "bar")`
@@ -1524,18 +1549,15 @@ impl<'a> ParserInput<'a> {
                         );
                     }
                 }
-                // Normalize whitespace in chunk (XML 1.0 §3.3.3)
+                // Normalize whitespace in chunk (XML 1.0 §3.3.3). Line
+                // endings are normalized first (§2.11), so a `\r\n` pair is
+                // a single line break and becomes a single space.
                 if chunk
                     .as_bytes()
                     .iter()
                     .any(|&b| b == b'\t' || b == b'\n' || b == b'\r')
                 {
-                    for ch in chunk.chars() {
-                        match ch {
-                            '\t' | '\n' | '\r' => value.push(' '),
-                            _ => value.push(ch),
-                        }
-                    }
+                    push_normalized_attr_chunk(&mut value, chunk);
                 } else {
                     value.push_str(chunk);
                 }
@@ -1583,6 +1605,41 @@ impl<'a> ParserInput<'a> {
         }
 
         Ok(value)
+    }
+
+    /// Normalizes an unquoted attribute-value literal (e.g. an `<!ATTLIST>`
+    /// default value) exactly as [`Self::parse_attribute_value`] would.
+    ///
+    /// Character and entity references are expanded using this input's
+    /// entity declarations and literal whitespace is normalized (XML 1.0
+    /// §3.3.3), so a defaulted attribute gets the same value as if it had
+    /// been written on the element. The entity-expansion counter is shared
+    /// with this input so the usual expansion limits apply.
+    ///
+    /// Returns `None` if the literal is not a well-formed attribute value.
+    pub(crate) fn normalize_attr_literal(&mut self, literal: &str) -> Option<String> {
+        let quote = if literal.contains('"') { '\'' } else { '"' };
+        if literal.contains(quote) {
+            return None;
+        }
+        let quoted = format!("{quote}{literal}{quote}");
+        let mut sub = ParserInput::new(&quoted);
+        sub.max_entity_expansions = self.max_entity_expansions;
+        sub.entity_expansions = self.entity_expansions;
+        sub.recover = self.recover;
+        sub.has_pe_references = self.has_pe_references;
+        sub.has_external_dtd = self.has_external_dtd;
+        sub.entity_map = std::mem::take(&mut self.entity_map);
+        sub.entity_external = std::mem::take(&mut self.entity_external);
+
+        let result = sub.parse_attribute_value();
+
+        self.entity_map = std::mem::take(&mut sub.entity_map);
+        self.entity_external = std::mem::take(&mut sub.entity_external);
+        self.entity_expansions = sub.entity_expansions;
+        // Diagnostics are dropped: entity references in defaults were
+        // already checked when the DTD was parsed.
+        result.ok().filter(|_| sub.at_end())
     }
 
     /// Parses a simple quoted value (single or double quotes, no entity
@@ -3493,5 +3550,44 @@ mod tests {
         assert!(may_contain_invalid_xml_chars(b"bad\x00char"));
         assert!(may_contain_invalid_xml_chars(b"bad\x01char"));
         assert!(may_contain_invalid_xml_chars(b"\x7F")); // DEL
+    }
+
+    #[test]
+    fn test_push_normalized_attr_chunk_whitespace() {
+        let mut out = String::new();
+        push_normalized_attr_chunk(&mut out, "a\tb\nc\rd\r\ne\r\r\nf");
+        assert_eq!(out, "a b c d e  f");
+    }
+
+    #[test]
+    fn test_parse_attribute_value_crlf_is_single_space() {
+        // XML 1.0 §2.11 normalizes `\r\n` to `\n` before §3.3.3 turns it
+        // into a space, so a CRLF pair yields exactly one space.
+        let mut input = ParserInput::new("\"a\r\nb\rc\nd\te\"");
+        assert_eq!(input.parse_attribute_value().unwrap(), "a b c d e");
+    }
+
+    #[test]
+    fn test_parse_attribute_value_char_ref_whitespace_not_normalized() {
+        let mut input = ParserInput::new("\"a&#9;b&#10;c&#13;d&#x9;e\"");
+        assert_eq!(input.parse_attribute_value().unwrap(), "a\tb\nc\rd\te");
+    }
+
+    #[test]
+    fn test_normalize_attr_literal_expands_and_normalizes() {
+        let mut input = ParserInput::new("");
+        input
+            .entity_map
+            .insert("e".to_string(), "E&amp;F".to_string());
+        assert_eq!(
+            input.normalize_attr_literal("p&amp;q\tr\r\ns&#9;t&e;"),
+            Some("p&q r s\ttE&F".to_string())
+        );
+        // Literals containing both quote kinds cannot be re-quoted.
+        assert_eq!(input.normalize_attr_literal("'\""), None);
+        // An undeclared entity is not a well-formed attribute value.
+        assert_eq!(input.normalize_attr_literal("&nope;"), None);
+        // The entity map is handed back after use.
+        assert!(input.entity_map.contains_key("e"));
     }
 }

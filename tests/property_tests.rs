@@ -68,6 +68,31 @@ fn xml_with_attrs() -> impl Strategy<Value = String> {
         })
 }
 
+/// Generate attribute-value source text mixing literal whitespace (which
+/// parsing normalizes to spaces), character references to whitespace (which
+/// it preserves) and entity references, per XML 1.0 §3.3.3.
+fn xml_attr_value_with_whitespace() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            "[a-z ]{1,3}",
+            Just("\t".to_string()),
+            Just("\n".to_string()),
+            Just("\r".to_string()),
+            Just("\r\n".to_string()),
+            Just("&#9;".to_string()),
+            Just("&#10;".to_string()),
+            Just("&#13;".to_string()),
+            Just("&#xD;".to_string()),
+            Just("&amp;".to_string()),
+            Just("&lt;".to_string()),
+            Just("&quot;".to_string()),
+            Just("&e;".to_string()),
+        ],
+        0..8,
+    )
+    .prop_map(|parts| parts.concat())
+}
+
 // ---------------------------------------------------------------------------
 // Property: parse → serialize → parse roundtrip
 // ---------------------------------------------------------------------------
@@ -235,6 +260,37 @@ proptest! {
             .collect();
 
         prop_assert_eq!(attrs, attrs2);
+    }
+
+    /// Regression property for #50: whitespace in attribute values, literal or
+    /// character-referenced, mixed with entity references, survives
+    /// parse → serialize → parse unchanged — both written on the element and
+    /// supplied as a DTD default.
+    #[test]
+    fn attr_whitespace_survives_roundtrip(
+        explicit in xml_attr_value_with_whitespace(),
+        default in xml_attr_value_with_whitespace(),
+    ) {
+        let xml = format!(
+            "<!DOCTYPE r [<!ENTITY e 'E'><!ATTLIST r d CDATA \"{default}\">]>\
+             <r a=\"{explicit}\"/>"
+        );
+        let doc = Document::parse_str(&xml).unwrap();
+        let root = doc.root_element().unwrap();
+        let attrs: Vec<_> = doc.attributes(root)
+            .iter()
+            .map(|a| (a.name.clone(), a.value.clone()))
+            .collect();
+
+        let serialized = xmloxide::serial::serialize(&doc);
+        let doc2 = Document::parse_str(&serialized).unwrap();
+        let root2 = doc2.root_element().unwrap();
+        let attrs2: Vec<_> = doc2.attributes(root2)
+            .iter()
+            .map(|a| (a.name.clone(), a.value.clone()))
+            .collect();
+
+        prop_assert_eq!(attrs, attrs2, "serialized: {:?}", serialized);
     }
 }
 
