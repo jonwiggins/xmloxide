@@ -1282,7 +1282,7 @@ impl ValidationContext<'_> {
         let children: Vec<NodeId> = self.doc.children(element).collect();
 
         // Separate attribute patterns from child-content patterns.
-        let (attr_patterns, content_pattern) = split_attributes(pattern);
+        let (attr_patterns, content_pattern) = split_attributes(pattern, self.defines);
 
         // Validate attributes.
         let mut attr_ok = true;
@@ -1992,54 +1992,116 @@ fn is_xmlns_attribute(attr: &crate::tree::Attribute) -> bool {
         || attr.namespace.as_deref() == Some("http://www.w3.org/2000/xmlns/")
 }
 
+/// Upper bound on the pattern nodes visited by one [`split_attributes`]
+/// call. Bounds the work an adversarial schema (e.g. defines that each
+/// reference the next one twice) can cause per validated element; when it
+/// is exhausted, the remaining attribute patterns stay unextracted and the
+/// element's attributes are reported as unexpected (fail closed).
+const MAX_ATTR_SPLIT_STEPS: usize = 100_000;
+
 /// Splits a pattern into attribute patterns and the remaining content pattern.
 ///
 /// This walks the pattern tree and extracts all `Attribute` patterns,
 /// returning them separately from the content pattern (which has the
-/// attribute patterns replaced with `Empty`).
-fn split_attributes(pattern: &Pattern) -> (Vec<Pattern>, Pattern) {
+/// attribute patterns replaced with `Empty`). Attributes inside an
+/// `Optional` are returned wrapped in `Optional`.
+///
+/// `Ref`s are looked through: in `RelaxNG`, a `ref` is equivalent to the
+/// content of the define it names (§4.19 expands every `ref` that does not
+/// refer to an `element`), so attributes factored out into a shared define
+/// belong to the element exactly as if written inline. A `Ref` whose
+/// definition contains no attributes is kept as-is in the content pattern.
+fn split_attributes(
+    pattern: &Pattern,
+    defines: &HashMap<String, Pattern>,
+) -> (Vec<Pattern>, Pattern) {
+    let mut splitter = AttrSplitter {
+        defines,
+        steps_left: MAX_ATTR_SPLIT_STEPS,
+    };
     let mut attrs = Vec::new();
-    let content = extract_attrs(pattern, &mut attrs);
+    let content = splitter.extract(pattern, &mut attrs, false, 0);
     (attrs, content)
 }
 
-/// Recursively extracts attribute patterns from a pattern tree.
-fn extract_attrs(pattern: &Pattern, attrs: &mut Vec<Pattern>) -> Pattern {
-    match pattern {
-        Pattern::Attribute { .. } => {
-            attrs.push(pattern.clone());
-            Pattern::Empty
+/// State for [`split_attributes`].
+struct AttrSplitter<'a> {
+    defines: &'a HashMap<String, Pattern>,
+    steps_left: usize,
+}
+
+impl AttrSplitter<'_> {
+    /// Recursively extracts attribute patterns from a pattern tree.
+    ///
+    /// `optional` is set below an `Optional`, so extracted attributes are
+    /// not required. `ref_depth` counts the `Ref`s being looked through;
+    /// schemas from [`parse_relaxng`] have no ref cycles outside elements
+    /// and bounded ref chains (§4.19), but [`RelaxNgSchema`] can also be
+    /// built by hand, so both the depth and the total work are capped.
+    fn extract(
+        &mut self,
+        pattern: &Pattern,
+        attrs: &mut Vec<Pattern>,
+        optional: bool,
+        ref_depth: usize,
+    ) -> Pattern {
+        if self.steps_left == 0 {
+            return pattern.clone();
         }
-        Pattern::Group(a, b) => {
-            let a2 = extract_attrs(a, attrs);
-            let b2 = extract_attrs(b, attrs);
-            match (&a2, &b2) {
-                (Pattern::Empty, _) => b2,
-                (_, Pattern::Empty) => a2,
-                _ => Pattern::Group(Box::new(a2), Box::new(b2)),
-            }
-        }
-        Pattern::Interleave(a, b) => {
-            let a2 = extract_attrs(a, attrs);
-            let b2 = extract_attrs(b, attrs);
-            match (&a2, &b2) {
-                (Pattern::Empty, _) => b2,
-                (_, Pattern::Empty) => a2,
-                _ => Pattern::Interleave(Box::new(a2), Box::new(b2)),
-            }
-        }
-        Pattern::Optional(inner) => {
-            if matches!(inner.as_ref(), Pattern::Attribute { .. }) {
-                // Optional attribute: still extract it but mark it optional
-                // by wrapping in Optional.
-                attrs.push(Pattern::Optional(inner.clone()));
+        self.steps_left -= 1;
+
+        match pattern {
+            Pattern::Attribute { .. } => {
+                attrs.push(if optional {
+                    Pattern::Optional(Box::new(pattern.clone()))
+                } else {
+                    pattern.clone()
+                });
                 Pattern::Empty
-            } else {
-                let inner2 = extract_attrs(inner, attrs);
-                Pattern::Optional(Box::new(inner2))
             }
+            Pattern::Group(a, b) => {
+                let a2 = self.extract(a, attrs, optional, ref_depth);
+                let b2 = self.extract(b, attrs, optional, ref_depth);
+                match (&a2, &b2) {
+                    (Pattern::Empty, _) => b2,
+                    (_, Pattern::Empty) => a2,
+                    _ => Pattern::Group(Box::new(a2), Box::new(b2)),
+                }
+            }
+            Pattern::Interleave(a, b) => {
+                let a2 = self.extract(a, attrs, optional, ref_depth);
+                let b2 = self.extract(b, attrs, optional, ref_depth);
+                match (&a2, &b2) {
+                    (Pattern::Empty, _) => b2,
+                    (_, Pattern::Empty) => a2,
+                    _ => Pattern::Interleave(Box::new(a2), Box::new(b2)),
+                }
+            }
+            Pattern::Optional(inner) => match self.extract(inner, attrs, true, ref_depth) {
+                Pattern::Empty => Pattern::Empty,
+                inner2 => Pattern::Optional(Box::new(inner2)),
+            },
+            Pattern::Mixed(inner) => {
+                Pattern::Mixed(Box::new(self.extract(inner, attrs, optional, ref_depth)))
+            }
+            Pattern::Ref(name) => {
+                let Some(def) = self.defines.get(name) else {
+                    // Reported as an undefined reference when matched.
+                    return pattern.clone();
+                };
+                if ref_depth >= MAX_REF_CHAIN_DEPTH {
+                    return pattern.clone();
+                }
+                let before = attrs.len();
+                let content = self.extract(def, attrs, optional, ref_depth + 1);
+                if attrs.len() == before {
+                    pattern.clone()
+                } else {
+                    content
+                }
+            }
+            _ => pattern.clone(),
         }
-        _ => pattern.clone(),
     }
 }
 
@@ -3375,5 +3437,136 @@ mod tests {
         assert!(is_valid(&schema, "<root><e0/></root>"));
         assert!(is_valid(&schema, "<root><e4999/></root>"));
         assert!(!is_valid(&schema, "<root><e5000/></root>"));
+    }
+
+    // --- Attributes reached through <ref> (issue #56) ---
+
+    #[test]
+    fn test_validate_attributes_via_ref_in_interleave() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start>
+                   <element name="root">
+                       <interleave><ref name="a"/><ref name="b"/></interleave>
+                   </element>
+               </start>
+               <define name="a"><optional><attribute name="id"><text/></attribute></optional></define>
+               <define name="b"><optional><attribute name="class"><text/></attribute></optional></define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, r#"<root id="x"/>"#));
+        assert!(is_valid(&schema, r#"<root class="c"/>"#));
+        assert!(is_valid(&schema, r#"<root class="c" id="x"/>"#));
+        assert!(is_valid(&schema, "<root/>"));
+        assert!(!is_valid(&schema, r#"<root style="s"/>"#));
+    }
+
+    #[test]
+    fn test_validate_attributes_via_nested_refs() {
+        // `interleave(interleave(ref a, ref b), ref c)`, with the attribute
+        // group itself reached through another define, as in the HTML5
+        // schema's `common.attrs`.
+        let schema = parse_relaxng(&grammar(
+            r#"<start>
+                   <element name="root">
+                       <ref name="common.attrs"/>
+                       <ref name="body"/>
+                   </element>
+               </start>
+               <define name="common.attrs">
+                   <interleave>
+                       <interleave><ref name="a"/><ref name="b"/></interleave>
+                       <ref name="c"/>
+                   </interleave>
+               </define>
+               <define name="a"><optional><attribute name="id"><text/></attribute></optional></define>
+               <define name="b"><optional><attribute name="class"><text/></attribute></optional></define>
+               <define name="c"><attribute name="lang"><text/></attribute></define>
+               <define name="body"><zeroOrMore><element name="p"><text/></element></zeroOrMore></define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(
+            &schema,
+            r#"<root lang="en" id="x"><p>hi</p></root>"#
+        ));
+        assert!(is_valid(&schema, r#"<root class="c" lang="en"/>"#));
+        // `lang` is required.
+        assert!(!is_valid(&schema, r#"<root id="x"/>"#));
+        // Child content is still validated.
+        assert!(!is_valid(&schema, r#"<root lang="en"><q/></root>"#));
+    }
+
+    #[test]
+    fn test_validate_optional_ref_makes_attributes_optional() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start>
+                   <element name="root"><optional><ref name="pair"/></optional></element>
+               </start>
+               <define name="pair">
+                   <attribute name="x"><text/></attribute>
+                   <attribute name="y"><data type="integer"/></attribute>
+               </define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, "<root/>"));
+        assert!(is_valid(&schema, r#"<root x="a" y="1"/>"#));
+        // Value constraints still apply.
+        assert!(!is_valid(&schema, r#"<root x="a" y="one"/>"#));
+    }
+
+    #[test]
+    fn test_validate_ref_with_attributes_and_elements() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start><element name="root"><ref name="content"/></element></start>
+               <define name="content">
+                   <attribute name="id"><text/></attribute>
+                   <element name="child"><empty/></element>
+               </define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, r#"<root id="1"><child/></root>"#));
+        assert!(!is_valid(&schema, r#"<root id="1"/>"#));
+        assert!(!is_valid(&schema, "<root><child/></root>"));
+    }
+
+    #[test]
+    fn test_split_attributes_cyclic_defines_terminates() {
+        // Hand-built schemas bypass the parser's §4.19 check.
+        let mut defines = HashMap::new();
+        defines.insert(
+            "a".to_string(),
+            Pattern::Group(
+                Box::new(Pattern::Attribute {
+                    name: NameClass::AnyName,
+                    pattern: Box::new(Pattern::Text),
+                }),
+                Box::new(Pattern::Ref("a".to_string())),
+            ),
+        );
+        let (attrs, _) = split_attributes(&Pattern::Ref("a".to_string()), &defines);
+        assert!(matches!(attrs.first(), Some(Pattern::Attribute { .. })));
+        assert!(attrs.len() <= MAX_REF_CHAIN_DEPTH + 1);
+    }
+
+    #[test]
+    fn test_split_attributes_exponential_refs_bounded() {
+        // d0 = group(ref d1, ref d1), d1 = group(ref d2, ref d2), ... would
+        // expand to 2^40 attribute patterns without the step budget.
+        let mut defines = HashMap::new();
+        for i in 0..40 {
+            let next = Pattern::Ref(format!("d{}", i + 1));
+            defines.insert(
+                format!("d{i}"),
+                Pattern::Group(Box::new(next.clone()), Box::new(next)),
+            );
+        }
+        defines.insert(
+            "d40".to_string(),
+            Pattern::Attribute {
+                name: NameClass::AnyName,
+                pattern: Box::new(Pattern::Text),
+            },
+        );
+        let (attrs, _) = split_attributes(&Pattern::Ref("d0".to_string()), &defines);
+        assert!(attrs.len() <= MAX_ATTR_SPLIT_STEPS);
     }
 }
