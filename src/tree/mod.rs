@@ -216,6 +216,33 @@ impl Document {
     /// let doc = Document::parse_str("<root><child/></root>").unwrap();
     /// ```
     pub fn parse_str(input: &str) -> Result<Self, ParseError> {
+        Self::parse_str_with_options(input, &crate::parser::ParseOptions::default())
+    }
+
+    /// Parses an XML string into a `Document` with the given parse options.
+    ///
+    /// Like [`Document::parse_str`], this ignores a leading byte order mark
+    /// and rejects encoding declarations that are incompatible with a Rust
+    /// string, then parses with `options`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError` if the input is not well-formed XML and recovery
+    /// mode is not enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::parser::ParseOptions;
+    /// use xmloxide::Document;
+    ///
+    /// let opts = ParseOptions::default().dtd_attributes(false);
+    /// let doc = Document::parse_str_with_options("<root><child/></root>", &opts).unwrap();
+    /// ```
+    pub fn parse_str_with_options(
+        input: &str,
+        options: &crate::parser::ParseOptions,
+    ) -> Result<Self, ParseError> {
         // Strip leading UTF-8 BOM (U+FEFF) if present — per XML 1.0 §4.3.3,
         // the BOM is used for encoding detection and should be ignored.
         let had_bom = input.starts_with('\u{FEFF}');
@@ -263,7 +290,7 @@ impl Document {
             }
         }
 
-        crate::parser::parse_str(input)
+        crate::parser::parse_str_with_options(input, options)
     }
 
     /// Extracts the encoding value from an XML declaration, if present.

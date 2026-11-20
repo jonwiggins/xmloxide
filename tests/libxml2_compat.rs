@@ -16,7 +16,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use xmloxide::parser::{self, ParseOptions};
+use xmloxide::parser::ParseOptions;
 use xmloxide::serial::html::serialize_html;
 use xmloxide::serial::serialize;
 use xmloxide::Document;
@@ -198,9 +198,21 @@ fn try_read_utf8(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// Parse options matching how libxml2's `runtest` parses its XML regression
+/// inputs: no `XML_PARSE_DTDATTR`, so only namespace-declaration defaults from
+/// the DTD appear in the tree.
+fn libxml2_options() -> ParseOptions {
+    ParseOptions::default().dtd_attributes(false)
+}
+
+/// Parses `input` the way libxml2's test runner does.
+fn parse_like_libxml2(input: &str) -> Result<Document, xmloxide::error::ParseError> {
+    Document::parse_str_with_options(input, &libxml2_options())
+}
+
 /// Compares parse+serialize output against an expected result.
 fn compare_parse_output(results: &mut CompatResults, stem: &str, input: &str, expected: &str) {
-    if let Ok(doc) = Document::parse_str(input) {
+    if let Ok(doc) = parse_like_libxml2(input) {
         let output = serialize(&doc);
         if normalize_xml(&output) == normalize_xml(expected) {
             results.pass();
@@ -219,8 +231,8 @@ fn compare_parse_output_recover(
     input: &str,
     expected: &str,
 ) {
-    let opts = ParseOptions::default().recover(true);
-    match parser::parse_str_with_options(input, &opts) {
+    let opts = libxml2_options().recover(true);
+    match Document::parse_str_with_options(input, &opts) {
         Ok(doc) => {
             let output = serialize(&doc);
             if normalize_xml(&output) == normalize_xml(expected) {
@@ -361,7 +373,7 @@ fn run_error_tests() -> CompatResults {
             // successfully (with warnings/recovery). If our strict parser
             // also succeeds, compare output. If it errors, that's also
             // acceptable since it's an error test.
-            match Document::parse_str(&input) {
+            match parse_like_libxml2(&input) {
                 Ok(doc) => {
                     let Some(expected) = try_read_utf8(&result_file) else {
                         results.skip();
@@ -381,7 +393,7 @@ fn run_error_tests() -> CompatResults {
             }
         } else {
             // No result file — expect parsing to fail.
-            if Document::parse_str(&input).is_err() {
+            if parse_like_libxml2(&input).is_err() {
                 results.pass();
             } else {
                 results.fail(&stem);

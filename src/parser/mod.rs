@@ -70,6 +70,11 @@ pub struct ParseOptions {
     pub recover: bool,
     /// If true, strip ignorable whitespace-only text nodes.
     pub no_blanks: bool,
+    /// If true (the default), insert attributes defaulted by DTD `ATTLIST`
+    /// declarations (both plain defaults and `#FIXED` values) into the tree.
+    ///
+    /// See [`ParseOptions::dtd_attributes`] for details.
+    pub dtd_attributes: bool,
 
     // -- Security limits --
     /// Maximum element nesting depth (default: 256).
@@ -97,6 +102,7 @@ impl Clone for ParseOptions {
         Self {
             recover: self.recover,
             no_blanks: self.no_blanks,
+            dtd_attributes: self.dtd_attributes,
             max_depth: self.max_depth,
             max_attributes: self.max_attributes,
             max_attribute_length: self.max_attribute_length,
@@ -113,6 +119,7 @@ impl std::fmt::Debug for ParseOptions {
         f.debug_struct("ParseOptions")
             .field("recover", &self.recover)
             .field("no_blanks", &self.no_blanks)
+            .field("dtd_attributes", &self.dtd_attributes)
             .field("max_depth", &self.max_depth)
             .field("max_attributes", &self.max_attributes)
             .field("max_attribute_length", &self.max_attribute_length)
@@ -132,6 +139,7 @@ impl Default for ParseOptions {
         Self {
             recover: false,
             no_blanks: false,
+            dtd_attributes: true,
             max_depth: DEFAULT_MAX_DEPTH,
             max_attributes: DEFAULT_MAX_ATTRIBUTES,
             max_attribute_length: DEFAULT_MAX_ATTRIBUTE_LENGTH,
@@ -155,6 +163,52 @@ impl ParseOptions {
     #[must_use]
     pub fn no_blanks(mut self, yes: bool) -> Self {
         self.no_blanks = yes;
+        self
+    }
+
+    /// Enables or disables inserting DTD-defaulted attributes into the tree.
+    ///
+    /// When an element omits an attribute that the DTD declares with a
+    /// default value (`<!ATTLIST e a CDATA "v">` or `#FIXED "v"`), XML 1.0
+    /// §3.3.2 lets the processor report the attribute as present with the
+    /// declared value. When enabled (the default), the parser adds such
+    /// attributes to the element, with their values normalized as if they had
+    /// been written in the document. This is what canonicalization (C14N)
+    /// requires.
+    ///
+    /// When disabled, only namespace-declaration defaults (`xmlns` and
+    /// `xmlns:*`) are inserted — they are always applied because namespace
+    /// processing depends on them. All other defaults are left out of the
+    /// tree, so serializing the document reproduces the source attributes.
+    ///
+    /// This corresponds to libxml2's `XML_PARSE_DTDATTR` option
+    /// (`xmllint --dtdattr`): `dtd_attributes(false)` matches libxml2's
+    /// behavior without that flag. Note that libxml2 leaves it off by
+    /// default, whereas xmloxide turns it on by default.
+    ///
+    /// The option applies to the tree-building parsers ([`parse_str_with_options`],
+    /// [`PushParser`], and async parsing). The SAX parser and `XmlReader` do
+    /// not currently report DTD-defaulted attributes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::parser::{parse_str_with_options, ParseOptions};
+    ///
+    /// let xml = r#"<!DOCTYPE a [<!ATTLIST a b CDATA "v">]><a/>"#;
+    ///
+    /// let doc = parse_str_with_options(xml, &ParseOptions::default()).unwrap();
+    /// let root = doc.root_element().unwrap();
+    /// assert_eq!(doc.attribute(root, "b"), Some("v"));
+    ///
+    /// let opts = ParseOptions::default().dtd_attributes(false);
+    /// let doc = parse_str_with_options(xml, &opts).unwrap();
+    /// let root = doc.root_element().unwrap();
+    /// assert_eq!(doc.attribute(root, "b"), None);
+    /// ```
+    #[must_use]
+    pub fn dtd_attributes(mut self, yes: bool) -> Self {
+        self.dtd_attributes = yes;
         self
     }
 

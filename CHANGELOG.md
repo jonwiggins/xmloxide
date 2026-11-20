@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than a stack overflow. `xmllint --relaxng` accepts `.rnc` files, and the
   C API gains `xmloxide_parse_relaxng_compact`.
 
+- **`ParseOptions::dtd_attributes(bool)`** — opt out of inserting
+  DTD-defaulted attributes, mirroring libxml2's `XML_PARSE_DTDATTR`. It stays
+  on by default; with `false`, only `xmlns`/`xmlns:*` defaults are inserted,
+  as in libxml2 without the flag. Also adds
+  `Document::parse_str_with_options`. `xmllint` now matches libxml2's
+  xmllint: defaults are only inserted with the new `--dtdattr` flag or with
+  `--c14n`/`--exc-c14n`. The libxml2 compat suite is back to 119/119.
+
 ### Changed
 
 - **`element_by_id` index is built on demand** (#76). The XML and HTML
