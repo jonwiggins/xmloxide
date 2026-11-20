@@ -34,7 +34,7 @@
 //! assert!(result.is_valid);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::tree::{Document, NodeId, NodeKind};
@@ -347,23 +347,117 @@ fn element_ns_attr(doc: &Document, node: NodeId) -> String {
     rng_attr(doc, node, "ns").unwrap_or("").to_string()
 }
 
+/// Maximum length of a chain of `<ref>`s that are expanded without passing
+/// through an `<element>` (e.g. `a` → `b` → `c` where each define's content
+/// is just a reference to the next).
+///
+/// The validator follows such chains recursively, so this bounds its stack
+/// usage on untrusted schemas. Real-world schemas stay far below it.
+const MAX_REF_CHAIN_DEPTH: usize = 256;
+
 /// Parses a `<grammar>` element containing `<start>` and `<define>` children.
 fn parse_grammar(
     doc: &Document,
     grammar_el: NodeId,
     parent_ns: &str,
 ) -> Result<RelaxNgSchema, SchemaParseError> {
-    let mut start: Option<Pattern> = None;
-    let mut defines: HashMap<String, Pattern> = HashMap::new();
+    let mut start = Combined::default();
+    let mut components: HashMap<String, Combined> = HashMap::new();
 
     let ns = resolve_ns(doc, grammar_el, parent_ns);
-    collect_grammar_content(doc, grammar_el, &ns, &mut start, &mut defines)?;
+    collect_grammar_content(doc, grammar_el, &ns, &mut start, &mut components)?;
 
-    let start = start.ok_or_else(|| SchemaParseError {
-        message: "<grammar> has no <start> element".to_string(),
-    })?;
+    if start.patterns.is_empty() {
+        return Err(SchemaParseError {
+            message: "<grammar> has no <start> element".to_string(),
+        });
+    }
+    let start = start.finish();
+
+    let defines: HashMap<String, Pattern> = components
+        .into_iter()
+        .map(|(name, combined)| (name, combined.finish()))
+        .collect();
+
+    check_ref_recursion(&start, &defines)?;
 
     Ok(RelaxNgSchema { start, defines })
+}
+
+/// How same-named grammar components are merged (`combine` attribute).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CombineMethod {
+    Choice,
+    Interleave,
+}
+
+/// Accumulates every `<start>` or every same-named `<define>` of a grammar,
+/// enforcing the `combine` rules of `RelaxNG` §4.17.
+#[derive(Debug, Default)]
+struct Combined {
+    /// The agreed `combine` method, once any component has specified one.
+    method: Option<CombineMethod>,
+    /// Whether a component without a `combine` attribute has been seen.
+    seen_without_combine: bool,
+    /// Component contents, in document order.
+    patterns: Vec<Pattern>,
+}
+
+impl Combined {
+    /// Adds one component. `what` describes it for error messages.
+    fn add(
+        &mut self,
+        combine: Option<&str>,
+        pattern: Pattern,
+        what: &str,
+    ) -> Result<(), SchemaParseError> {
+        match combine {
+            None => {
+                // §4.17: at most one component per name may omit `combine`.
+                if self.seen_without_combine {
+                    return Err(SchemaParseError {
+                        message: format!(
+                            "multiple {what} without a 'combine' attribute (RELAX NG §4.17)"
+                        ),
+                    });
+                }
+                self.seen_without_combine = true;
+            }
+            Some(value) => {
+                let method = match value.trim() {
+                    "choice" => CombineMethod::Choice,
+                    "interleave" => CombineMethod::Interleave,
+                    other => {
+                        return Err(SchemaParseError {
+                            message: format!("invalid 'combine' value \"{other}\" on {what}"),
+                        });
+                    }
+                };
+                // §4.17: all components of a name must agree on the method.
+                if self.method.is_some_and(|m| m != method) {
+                    return Err(SchemaParseError {
+                        message: format!(
+                            "conflicting 'combine' values (choice and interleave) \
+                             on {what} (RELAX NG §4.17)"
+                        ),
+                    });
+                }
+                self.method = Some(method);
+            }
+        }
+        self.patterns.push(pattern);
+        Ok(())
+    }
+
+    /// Merges the components into one pattern: the `choice` or `interleave`
+    /// (per the agreed method) of all of them. Must only be called after at
+    /// least one component was added.
+    fn finish(self) -> Pattern {
+        match self.method {
+            Some(CombineMethod::Interleave) => combine_interleave(self.patterns),
+            Some(CombineMethod::Choice) | None => combine_choice(self.patterns),
+        }
+    }
 }
 
 /// Collects the `<start>` and `<define>` components of a grammar-content
@@ -378,8 +472,8 @@ fn collect_grammar_content(
     doc: &Document,
     container: NodeId,
     ns: &str,
-    start: &mut Option<Pattern>,
-    defines: &mut HashMap<String, Pattern>,
+    start: &mut Combined,
+    defines: &mut HashMap<String, Combined>,
 ) -> Result<(), SchemaParseError> {
     for child in rng_children(doc, container) {
         let child_name = doc.node_name(child).unwrap_or("");
@@ -388,16 +482,18 @@ fn collect_grammar_content(
         match local {
             "start" => {
                 let inner = parse_pattern_children(doc, child, ns)?;
-                *start = Some(inner);
+                start.add(rng_attr(doc, child, "combine"), inner, "<start> elements")?;
             }
             "define" => {
-                let name = rng_attr(doc, child, "name")
-                    .ok_or_else(|| SchemaParseError {
-                        message: "<define> missing 'name' attribute".to_string(),
-                    })?
-                    .to_string();
+                let name = rng_attr(doc, child, "name").ok_or_else(|| SchemaParseError {
+                    message: "<define> missing 'name' attribute".to_string(),
+                })?;
                 let inner = parse_pattern_children(doc, child, ns)?;
-                defines.insert(name, inner);
+                defines.entry(name.to_string()).or_default().add(
+                    rng_attr(doc, child, "combine"),
+                    inner,
+                    &format!("<define name=\"{name}\">"),
+                )?;
             }
             "div" => {
                 // `ns` on a `<div>` is inherited by its descendants (§4.9).
@@ -410,6 +506,159 @@ fn collect_grammar_content(
             }
         }
     }
+    Ok(())
+}
+
+/// Collects the names of `<ref>`s in `pattern`. With `through_elements`
+/// false, references inside `element` patterns are not included.
+///
+/// Uses an explicit stack, so deeply nested patterns cannot overflow the
+/// call stack.
+fn collect_refs<'p>(pattern: &'p Pattern, through_elements: bool, out: &mut Vec<&'p str>) {
+    let mut stack = vec![pattern];
+    while let Some(p) = stack.pop() {
+        match p {
+            Pattern::Ref(name) => out.push(name),
+            Pattern::Element { pattern: inner, .. } => {
+                if through_elements {
+                    stack.push(inner);
+                }
+            }
+            Pattern::Attribute { pattern: inner, .. }
+            | Pattern::Optional(inner)
+            | Pattern::ZeroOrMore(inner)
+            | Pattern::OneOrMore(inner)
+            | Pattern::List(inner)
+            | Pattern::Mixed(inner) => stack.push(inner),
+            Pattern::Group(a, b) | Pattern::Interleave(a, b) | Pattern::Choice(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Pattern::Empty
+            | Pattern::NotAllowed
+            | Pattern::Text
+            | Pattern::Value(_)
+            | Pattern::Data { .. } => {}
+        }
+    }
+}
+
+/// Rejects illegal recursion through `<ref>`s.
+///
+/// `RelaxNG` §4.19 expands every `ref` to a define whose content is not an
+/// `element`, and requires that "this must not result in a loop": a define
+/// may only refer back to itself through an `element` pattern. Recursion
+/// outside an element (e.g. `<define name="a"><choice><ref name="a"/>…`,
+/// possibly assembled from several `combine`d defines) would never consume
+/// input and so would recurse forever during validation.
+///
+/// Only defines reachable from the start pattern are checked, matching the
+/// spec's removal of unreachable defines. Chains of non-element refs longer
+/// than [`MAX_REF_CHAIN_DEPTH`] are also rejected. The traversal is
+/// iterative, so hostile schemas cannot overflow the stack here.
+fn check_ref_recursion(
+    start: &Pattern,
+    defines: &HashMap<String, Pattern>,
+) -> Result<(), SchemaParseError> {
+    /// Traversal state of a define in the depth-first search.
+    enum Visit {
+        /// On the current DFS path.
+        InProgress,
+        /// Finished; holds the longest non-element ref chain starting here.
+        Done(usize),
+    }
+
+    /// One define on the explicit DFS stack.
+    struct Frame<'a> {
+        name: &'a str,
+        /// Defines referenced without passing through an element.
+        succs: Vec<&'a str>,
+        next: usize,
+        max_depth: usize,
+    }
+
+    // Defines reachable from the start pattern through any reference.
+    let mut reachable: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut work = vec![start];
+    let mut refs = Vec::new();
+    while let Some(p) = work.pop() {
+        refs.clear();
+        collect_refs(p, true, &mut refs);
+        for &name in &refs {
+            if let Some((key, def)) = defines.get_key_value(name) {
+                if seen.insert(key.as_str()) {
+                    reachable.push(key.as_str());
+                    work.push(def);
+                }
+            }
+        }
+    }
+    // Deterministic error reporting.
+    reachable.sort_unstable();
+
+    let frame_for = |name| {
+        let mut succs = Vec::new();
+        if let Some(def) = defines.get(name) {
+            collect_refs(def, false, &mut succs);
+        }
+        Frame {
+            name,
+            succs,
+            next: 0,
+            max_depth: 0,
+        }
+    };
+
+    let mut state: HashMap<&str, Visit> = HashMap::new();
+    for &root in &reachable {
+        if state.contains_key(root) {
+            continue;
+        }
+        state.insert(root, Visit::InProgress);
+        let mut stack = vec![frame_for(root)];
+        while let Some(frame) = stack.last_mut() {
+            if let Some(&succ) = frame.succs.get(frame.next) {
+                frame.next += 1;
+                match state.get(succ) {
+                    Some(Visit::InProgress) => {
+                        return Err(SchemaParseError {
+                            message: format!(
+                                "illegal recursive reference to \"{succ}\": a define may \
+                                 only refer to itself through an <element> (RELAX NG §4.19)"
+                            ),
+                        });
+                    }
+                    Some(Visit::Done(depth)) => frame.max_depth = frame.max_depth.max(*depth),
+                    None => {
+                        // Undefined references are reported during
+                        // validation.
+                        if defines.contains_key(succ) {
+                            state.insert(succ, Visit::InProgress);
+                            stack.push(frame_for(succ));
+                        }
+                    }
+                }
+            } else {
+                let depth = frame.max_depth + 1;
+                let name = frame.name;
+                if depth > MAX_REF_CHAIN_DEPTH {
+                    return Err(SchemaParseError {
+                        message: format!(
+                            "chain of references starting at \"{name}\" is nested more than \
+                             {MAX_REF_CHAIN_DEPTH} levels deep without an <element>"
+                        ),
+                    });
+                }
+                stack.pop();
+                state.insert(name, Visit::Done(depth));
+                if let Some(parent) = stack.last_mut() {
+                    parent.max_depth = parent.max_depth.max(depth);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -474,11 +723,11 @@ fn parse_pattern(doc: &Document, el: NodeId, parent_ns: &str) -> Result<Pattern,
         }
         "interleave" => {
             let children = collect_child_patterns(doc, el, &ns)?;
-            combine_interleave(children)
+            Ok(combine_interleave(children))
         }
         "choice" => {
             let children = collect_child_patterns(doc, el, &ns)?;
-            combine_choice(children)
+            Ok(combine_choice(children))
         }
         "optional" => {
             let inner = parse_pattern_children(doc, el, &ns)?;
@@ -821,29 +1070,43 @@ fn combine_name_classes(classes: Vec<NameClass>) -> Result<NameClass, SchemaPars
 }
 
 /// Combines patterns using `Interleave`.
-fn combine_interleave(patterns: Vec<Pattern>) -> Result<Pattern, SchemaParseError> {
+fn combine_interleave(patterns: Vec<Pattern>) -> Pattern {
     if patterns.is_empty() {
-        return Ok(Pattern::Empty);
+        return Pattern::Empty;
     }
-    let mut iter = patterns.into_iter();
-    let first = iter.next().ok_or_else(|| SchemaParseError {
-        message: "internal error: empty interleave list".to_string(),
-    })?;
-    Ok(iter.fold(first, |acc, p| {
-        Pattern::Interleave(Box::new(acc), Box::new(p))
-    }))
+    fold_balanced(patterns, &|a, b| {
+        Pattern::Interleave(Box::new(a), Box::new(b))
+    })
 }
 
 /// Combines patterns using `Choice`.
-fn combine_choice(patterns: Vec<Pattern>) -> Result<Pattern, SchemaParseError> {
+fn combine_choice(patterns: Vec<Pattern>) -> Pattern {
     if patterns.is_empty() {
-        return Ok(Pattern::NotAllowed);
+        return Pattern::NotAllowed;
     }
-    let mut iter = patterns.into_iter();
-    let first = iter.next().ok_or_else(|| SchemaParseError {
-        message: "internal error: empty choice list".to_string(),
-    })?;
-    Ok(iter.fold(first, |acc, p| Pattern::Choice(Box::new(acc), Box::new(p))))
+    fold_balanced(patterns, &|a, b| Pattern::Choice(Box::new(a), Box::new(b)))
+}
+
+/// Folds a non-empty list of patterns with an associative binary
+/// constructor into a balanced tree.
+///
+/// `choice` and `interleave` are associative, so the shape does not change
+/// their meaning, but a balanced tree keeps the nesting depth logarithmic.
+/// This matters for untrusted schemas: thousands of sibling alternatives or
+/// `combine`d defines would otherwise produce a tree deep enough to overflow
+/// the stack in the recursive validator (and in `Drop`). Lists of up to
+/// three patterns produce the same left-leaning shape as a left fold.
+fn fold_balanced(
+    mut patterns: Vec<Pattern>,
+    join: &dyn Fn(Pattern, Pattern) -> Pattern,
+) -> Pattern {
+    if patterns.len() <= 1 {
+        return patterns.pop().unwrap_or(Pattern::Empty);
+    }
+    let right = patterns.split_off(patterns.len().div_ceil(2));
+    let left = fold_balanced(patterns, join);
+    let right = fold_balanced(right, join);
+    join(left, right)
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,6 +2070,7 @@ fn has_wildcard_attribute(pattern: &Pattern) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     // --- Name class matching tests ---
 
@@ -2898,5 +3162,218 @@ mod tests {
                 "name {name:?} should be rejected"
             );
         }
+    }
+
+    // --- combine attribute (§4.17) and ref recursion (§4.19), issue #55 ---
+
+    fn grammar(body: &str) -> String {
+        format!(r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0">{body}</grammar>"#)
+    }
+
+    fn is_valid(schema: &RelaxNgSchema, xml: &str) -> bool {
+        let doc = Document::parse_str(xml).unwrap();
+        validate(&doc, schema).is_valid
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_choice() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start><ref name="root"/></start>
+               <define name="root"><element name="root"><ref name="item"/></element></define>
+               <define name="item" combine="choice"><element name="a"><empty/></element></define>
+               <define name="item" combine="choice"><element name="b"><empty/></element></define>
+               <div>
+                   <define name="item" combine="choice"><element name="c"><empty/></element></define>
+               </div>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, "<root><a/></root>"));
+        assert!(is_valid(&schema, "<root><b/></root>"));
+        assert!(is_valid(&schema, "<root><c/></root>"));
+        assert!(!is_valid(&schema, "<root><d/></root>"));
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_one_define_without_combine() {
+        // §4.17 allows exactly one define of a name to omit `combine`.
+        let schema = parse_relaxng(&grammar(
+            r#"<start><element name="root"><ref name="item"/></element></start>
+               <define name="item"><element name="a"><empty/></element></define>
+               <define name="item" combine="choice"><element name="b"><empty/></element></define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, "<root><a/></root>"));
+        assert!(is_valid(&schema, "<root><b/></root>"));
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_interleave() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start><element name="root"><ref name="content"/></element></start>
+               <define name="content" combine="interleave"><element name="a"><empty/></element></define>
+               <define name="content" combine="interleave"><element name="b"><empty/></element></define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, "<root><a/><b/></root>"));
+        assert!(is_valid(&schema, "<root><b/><a/></root>"));
+        assert!(!is_valid(&schema, "<root><a/></root>"));
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_start() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start combine="choice"><element name="a"><empty/></element></start>
+               <start combine="choice"><element name="b"><empty/></element></start>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, "<a/>"));
+        assert!(is_valid(&schema, "<b/>"));
+        assert!(!is_valid(&schema, "<c/>"));
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_missing_is_error() {
+        let err = parse_relaxng(&grammar(
+            r#"<start><ref name="item"/></start>
+               <define name="item"><element name="a"><empty/></element></define>
+               <define name="item"><element name="b"><empty/></element></define>"#,
+        ))
+        .unwrap_err();
+        assert!(
+            err.message.contains("without a 'combine'"),
+            "{}",
+            err.message
+        );
+
+        let err = parse_relaxng(&grammar(
+            r#"<start><element name="a"><empty/></element></start>
+               <start><element name="b"><empty/></element></start>"#,
+        ))
+        .unwrap_err();
+        assert!(err.message.contains("<start>"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_mismatch_is_error() {
+        let err = parse_relaxng(&grammar(
+            r#"<start><ref name="item"/></start>
+               <define name="item" combine="choice"><element name="a"><empty/></element></define>
+               <define name="item" combine="interleave"><element name="b"><empty/></element></define>"#,
+        ))
+        .unwrap_err();
+        assert!(
+            err.message.contains("conflicting 'combine'"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_grammar_combine_invalid_value_is_error() {
+        let err = parse_relaxng(&grammar(
+            r#"<start><ref name="item"/></start>
+               <define name="item" combine="group"><element name="a"><empty/></element></define>"#,
+        ))
+        .unwrap_err();
+        assert!(err.message.contains("invalid 'combine'"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_check_ref_recursion_cycle_through_combined_defines_is_error() {
+        // The second fragment makes `item` refer to itself outside any
+        // element, which would recurse forever during validation.
+        let err = parse_relaxng(&grammar(
+            r#"<start><element name="root"><ref name="item"/></element></start>
+               <define name="item" combine="choice"><element name="a"><empty/></element></define>
+               <define name="item" combine="choice"><ref name="other"/></define>
+               <define name="other"><optional><ref name="item"/></optional></define>"#,
+        ))
+        .unwrap_err();
+        assert!(
+            err.message.contains("illegal recursive reference"),
+            "{}",
+            err.message
+        );
+
+        let err = parse_relaxng(&grammar(
+            r#"<start><ref name="self"/></start>
+               <define name="self"><ref name="self"/></define>"#,
+        ))
+        .unwrap_err();
+        assert!(
+            err.message.contains("illegal recursive reference"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_check_ref_recursion_through_element_is_allowed() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start><ref name="node"/></start>
+               <define name="node">
+                   <element name="node"><zeroOrMore><ref name="node"/></zeroOrMore></element>
+               </define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(
+            &schema,
+            "<node><node><node/></node><node/></node>"
+        ));
+        assert!(!is_valid(&schema, "<node><leaf/></node>"));
+    }
+
+    #[test]
+    fn test_check_ref_recursion_ignores_unreachable_defines() {
+        // §4.19 removes unreachable defines before checking for loops.
+        let schema = parse_relaxng(&grammar(
+            r#"<start><element name="root"><empty/></element></start>
+               <define name="unused"><ref name="unused"/></define>"#,
+        ))
+        .unwrap();
+        assert!(is_valid(&schema, "<root/>"));
+    }
+
+    #[test]
+    fn test_check_ref_recursion_chain_depth_limit() {
+        let chain = |len: usize| {
+            let mut body =
+                String::from(r#"<start><element name="root"><ref name="d0"/></element></start>"#);
+            for i in 0..len {
+                write!(
+                    body,
+                    r#"<define name="d{i}"><ref name="d{}"/></define>"#,
+                    i + 1
+                )
+                .unwrap();
+            }
+            write!(body, r#"<define name="d{len}"><text/></define>"#).unwrap();
+            grammar(&body)
+        };
+
+        let schema = parse_relaxng(&chain(MAX_REF_CHAIN_DEPTH - 1)).unwrap();
+        assert!(is_valid(&schema, "<root>text</root>"));
+
+        let err = parse_relaxng(&chain(MAX_REF_CHAIN_DEPTH + 10)).unwrap_err();
+        assert!(err.message.contains("nested more than"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_parse_grammar_many_combined_defines() {
+        // Thousands of combined fragments must not build a degenerate,
+        // stack-overflowing pattern tree.
+        let mut body =
+            String::from(r#"<start><element name="root"><ref name="item"/></element></start>"#);
+        for i in 0..5000 {
+            write!(
+                body,
+                r#"<define name="item" combine="choice"><element name="e{i}"><empty/></element></define>"#
+            )
+            .unwrap();
+        }
+        let schema = parse_relaxng(&grammar(&body)).unwrap();
+        assert!(is_valid(&schema, "<root><e0/></root>"));
+        assert!(is_valid(&schema, "<root><e4999/></root>"));
+        assert!(!is_valid(&schema, "<root><e5000/></root>"));
     }
 }
