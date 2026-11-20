@@ -588,8 +588,9 @@ pub unsafe extern "C" fn xmloxide_insert_before(
 
 /// Returns the element with the given ID attribute, or 0 if not found.
 ///
-/// Note: the document's `id_map` must be populated first, typically by
-/// running DTD validation with `xmloxide_validate_dtd`.
+/// IDs registered by DTD validation (`xmloxide_validate_dtd`) are checked
+/// first; otherwise the element whose unprefixed `id` attribute matches is
+/// returned. See [`Document::element_by_id`].
 ///
 /// # Safety
 ///

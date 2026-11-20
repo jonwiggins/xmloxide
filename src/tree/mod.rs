@@ -22,6 +22,8 @@ pub use node::NodeKind;
 use crate::error::{ParseDiagnostic, ParseError};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// A typed index into the document's node arena.
 ///
@@ -147,12 +149,26 @@ pub struct Document {
     pub standalone: Option<bool>,
     /// Diagnostics collected during parsing (warnings and recovered errors).
     pub diagnostics: Vec<ParseDiagnostic>,
-    /// Mapping from ID attribute values to element nodes.
+    /// Explicitly registered IDs, from [`set_id`](Document::set_id).
     ///
     /// Populated during DTD validation when attributes of type ID are
-    /// validated. Used by [`element_by_id`](Document::element_by_id) and
-    /// the `XPath` `id()` function.
+    /// validated, and by callers. Consulted first by
+    /// [`element_by_id`](Document::element_by_id) and the `XPath` `id()`
+    /// function.
     id_map: HashMap<String, NodeId>,
+    /// Index of unprefixed `id` attribute values to element nodes.
+    ///
+    /// Built on the first [`element_by_id`](Document::element_by_id) lookup
+    /// that misses `id_map`, rather than during parsing, so that callers who
+    /// never look up IDs don't pay for it. Every mutation goes through
+    /// `node_mut`, which discards the index so the next lookup rebuilds it
+    /// from the current tree. `OnceLock` (rather than `OnceCell`) keeps
+    /// `Document` `Sync`.
+    id_attr_index: OnceLock<HashMap<String, NodeId>>,
+    /// Set when `id_attr_index` is built. `node_mut` reads it through
+    /// `AtomicBool::get_mut`, a plain non-atomic load, so the parsers' hot
+    /// mutation path doesn't pay for an acquire load on every node.
+    id_attr_index_built: AtomicBool,
 }
 
 impl Document {
@@ -181,6 +197,8 @@ impl Document {
             standalone: None,
             diagnostics: Vec::new(),
             id_map: HashMap::new(),
+            id_attr_index: OnceLock::new(),
+            id_attr_index_built: AtomicBool::new(false),
         }
     }
 
@@ -370,9 +388,24 @@ impl Document {
     }
 
     /// Returns a mutable reference to the `NodeData` for the given node.
+    ///
+    /// This is the single entry point for tree mutation, so it also discards
+    /// the lazily built `id` attribute index (see
+    /// [`element_by_id`](Self::element_by_id)).
     #[inline]
     pub(crate) fn node_mut(&mut self, id: NodeId) -> &mut NodeData {
+        if *self.id_attr_index_built.get_mut() {
+            self.invalidate_id_attr_index();
+        }
         &mut self.nodes[id.as_index()]
+    }
+
+    /// Discards the lazily built `id` attribute index.
+    #[cold]
+    #[inline(never)]
+    fn invalidate_id_attr_index(&mut self) {
+        self.id_attr_index = OnceLock::new();
+        *self.id_attr_index_built.get_mut() = false;
     }
 
     /// Returns `true` if the node is an element.
@@ -509,19 +542,66 @@ impl Document {
     ///
     /// Called during DTD validation when an attribute of type ID is found.
     /// Subsequent calls to [`element_by_id`](Document::element_by_id) will
-    /// return the associated node.
+    /// return the associated node; registrations made here take precedence
+    /// over plain `id` attributes in the tree.
     pub fn set_id(&mut self, id: &str, node: NodeId) {
         self.id_map.insert(id.to_string(), node);
     }
 
-    /// Looks up an element by its ID attribute value.
+    /// Looks up an element by its ID.
     ///
-    /// Returns the `NodeId` of the element that was registered with
-    /// [`set_id`](Document::set_id) for the given ID string, or `None`
-    /// if no such ID exists.
+    /// IDs registered with [`set_id`](Document::set_id) (for example by DTD
+    /// validation, for attributes declared with type ID) are checked first.
+    /// Otherwise, the element in the document tree whose unprefixed `id`
+    /// attribute equals `id` is returned; if several elements share the
+    /// value, the last one in document order wins. Prefixed attributes such
+    /// as `xml:id` are not matched by this fallback.
+    ///
+    /// The `id` attribute index is built on the first lookup that needs it
+    /// and reflects the current tree, so elements added, removed, or given
+    /// new `id` attributes after parsing are found (or not) accordingly.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::Document;
+    ///
+    /// let doc = Document::parse_str(r#"<r><a id="x"/></r>"#).unwrap();
+    /// let a = doc.element_by_id("x").unwrap();
+    /// assert_eq!(doc.node_name(a), Some("a"));
+    /// assert_eq!(doc.element_by_id("missing"), None);
+    /// ```
     #[must_use]
     pub fn element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.id_map.get(id).copied()
+        if let Some(&node) = self.id_map.get(id) {
+            return Some(node);
+        }
+        self.id_attr_index
+            .get_or_init(|| {
+                // Relaxed suffices: the flag is only read through `&mut self`,
+                // which synchronizes with this `&self` access.
+                self.id_attr_index_built.store(true, Ordering::Relaxed);
+                self.build_id_attr_index()
+            })
+            .get(id)
+            .copied()
+    }
+
+    /// Builds the index of unprefixed `id` attributes for all elements
+    /// reachable from the document root, in document order.
+    fn build_id_attr_index(&self) -> HashMap<String, NodeId> {
+        let mut index = HashMap::new();
+        for node in self.descendants(self.root) {
+            if let NodeKind::Element { attributes, .. } = &self.node(node).kind {
+                if let Some(attr) = attributes
+                    .iter()
+                    .find(|a| a.prefix.is_none() && a.name == "id")
+                {
+                    index.insert(attr.value.clone(), node);
+                }
+            }
+        }
+        index
     }
 
     // --- Navigation ---
@@ -1491,6 +1571,150 @@ mod tests {
         doc.set_id("a", elem);
         assert_eq!(doc.element_by_id("a"), Some(elem));
         assert_eq!(doc.element_by_id("b"), None);
+    }
+
+    // --- Lazy `id` attribute index ---
+
+    /// `Document` must stay `Send + Sync` with the lazily built ID index.
+    #[test]
+    fn test_document_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Document>();
+    }
+
+    #[test]
+    fn test_element_by_id_after_parse() {
+        let doc = Document::parse_str(r#"<r><a id="x"/><b id="y"><c id="z"/></b></r>"#).unwrap();
+        for (id, name) in [("x", "a"), ("y", "b"), ("z", "c")] {
+            let node = doc.element_by_id(id).unwrap();
+            assert_eq!(doc.node_name(node), Some(name));
+        }
+        assert_eq!(doc.element_by_id("w"), None);
+    }
+
+    #[test]
+    fn test_element_by_id_duplicate_last_in_document_order_wins() {
+        let doc = Document::parse_str(r#"<r><a id="x"/><b><c id="x"/></b></r>"#).unwrap();
+        let node = doc.element_by_id("x").unwrap();
+        assert_eq!(doc.node_name(node), Some("c"));
+    }
+
+    #[test]
+    fn test_element_by_id_ignores_prefixed_id_attributes() {
+        let doc =
+            Document::parse_str(r#"<r xmlns:p="urn:p"><a xml:id="x"/><b p:id="y"/></r>"#).unwrap();
+        assert_eq!(doc.element_by_id("x"), None);
+        assert_eq!(doc.element_by_id("y"), None);
+    }
+
+    #[test]
+    fn test_element_by_id_after_remove_node() {
+        let mut doc = Document::parse_str(r#"<r><a id="x"/><b/></r>"#).unwrap();
+        let a = doc.element_by_id("x").unwrap();
+        doc.remove_node(a);
+        assert_eq!(doc.element_by_id("x"), None);
+    }
+
+    #[test]
+    fn test_element_by_id_after_set_attribute() {
+        let mut doc = Document::parse_str(r#"<r><a id="x"/><b/></r>"#).unwrap();
+        // Build the index first so the mutation must invalidate it.
+        assert!(doc.element_by_id("x").is_some());
+        let root = doc.root_element().unwrap();
+        let b = doc.last_child(root).unwrap();
+        doc.set_attribute(b, "id", "y");
+        assert_eq!(doc.element_by_id("y"), Some(b));
+        // Changing an existing id moves the lookup to the new value.
+        let a = doc.first_child(root).unwrap();
+        doc.set_attribute(a, "id", "x2");
+        assert_eq!(doc.element_by_id("x"), None);
+        assert_eq!(doc.element_by_id("x2"), Some(a));
+        doc.remove_attribute(a, "id");
+        assert_eq!(doc.element_by_id("x2"), None);
+    }
+
+    #[test]
+    fn test_element_by_id_after_append_new_element() {
+        let mut doc = Document::parse_str("<r/>").unwrap();
+        assert_eq!(doc.element_by_id("z"), None);
+        let root = doc.root_element().unwrap();
+        let c = doc.create_element("c");
+        doc.set_attribute(c, "id", "z");
+        // Detached elements are not part of the tree, so not found.
+        assert_eq!(doc.element_by_id("z"), None);
+        doc.append_child(root, c);
+        assert_eq!(doc.element_by_id("z"), Some(c));
+    }
+
+    #[test]
+    fn test_element_by_id_in_built_document() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let elem = doc.create_element("item");
+        doc.set_attribute(elem, "id", "a");
+        doc.append_child(root, elem);
+        assert_eq!(doc.element_by_id("a"), Some(elem));
+    }
+
+    #[test]
+    fn test_set_id_takes_precedence_over_id_attribute() {
+        let mut doc = Document::parse_str(r#"<r><a id="x"/><b/></r>"#).unwrap();
+        let root = doc.root_element().unwrap();
+        let b = doc.last_child(root).unwrap();
+        doc.set_id("x", b);
+        assert_eq!(doc.element_by_id("x"), Some(b));
+    }
+
+    #[test]
+    fn test_element_by_id_after_dtd_validation() {
+        use crate::validation::dtd::{parse_dtd, validate};
+        // `key` is declared as the ID attribute; a plain `id` attribute is
+        // still found through the attribute index.
+        let dtd = parse_dtd(
+            "<!ELEMENT r (a, b)>\n<!ELEMENT a EMPTY>\n<!ELEMENT b EMPTY>\n\
+             <!ATTLIST a key ID #REQUIRED>\n<!ATTLIST b id CDATA #IMPLIED>",
+        )
+        .unwrap();
+        let mut doc = Document::parse_str(r#"<r><a key="k1"/><b id="i1"/></r>"#).unwrap();
+        assert_eq!(doc.element_by_id("k1"), None);
+        let result = validate(&mut doc, &dtd);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+        let a = doc.element_by_id("k1").unwrap();
+        assert_eq!(doc.node_name(a), Some("a"));
+        let b = doc.element_by_id("i1").unwrap();
+        assert_eq!(doc.node_name(b), Some("b"));
+    }
+
+    #[test]
+    fn test_xpath_id_uses_id_attribute_index() {
+        use crate::xpath::{evaluate, XPathValue};
+        let mut doc =
+            Document::parse_str(r#"<r><a id="p">1</a><b id="q">2</b><c id="r">3</c></r>"#).unwrap();
+        let root = doc.root_element().unwrap();
+        let XPathValue::NodeSet(ns) = evaluate(&doc, root, "id('p r')").unwrap() else {
+            panic!("expected node-set");
+        };
+        let names: Vec<_> = ns.iter().map(|n| doc.node_name(n.anchor())).collect();
+        assert_eq!(names, [Some("a"), Some("c")]);
+
+        // After mutation, id() follows the current tree.
+        let c = doc.last_child(root).unwrap();
+        doc.remove_node(c);
+        let result = evaluate(&doc, root, "count(id('p r'))").unwrap();
+        assert!(matches!(result, XPathValue::Number(n) if (n - 1.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_element_by_id_html_parsers() {
+        let html = r#"<html><body><div id="main"><p id="para">x</p></div></body></html>"#;
+        let doc = crate::html::parse_html(html).unwrap();
+        assert_eq!(doc.node_name(doc.element_by_id("para").unwrap()), Some("p"));
+        let doc = crate::html5::parse_html5(html).unwrap();
+        assert_eq!(
+            doc.node_name(doc.element_by_id("main").unwrap()),
+            Some("div")
+        );
+        assert_eq!(doc.node_name(doc.element_by_id("para").unwrap()), Some("p"));
     }
 
     #[test]

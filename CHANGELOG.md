@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`element_by_id` index is built on demand** (#76). The XML and HTML
+  parsers no longer copy every `id` attribute into the document's ID map
+  while parsing (about a tenth of parse time on id-heavy documents).
+  Instead, `Document::element_by_id` (and so `XPath` `id()`, CSS `#id`, and
+  `xmloxide_element_by_id`) checks IDs registered with `set_id` (e.g. by DTD
+  validation) first, then an index of unprefixed `id` attributes built on
+  the first lookup and discarded on any tree mutation. Behavior changes:
+  lookups now follow the current tree, so removed elements are no longer
+  returned and elements given an `id` after parsing are found; elements
+  parsed by `parse_html5` and elements inside expanded entity content are
+  now found by their `id` (previously they were not indexed). Duplicate
+  `id`s still resolve to the last element in document order.
+
 ## [0.5.1] - 2026-11-20
 
 ### Security
