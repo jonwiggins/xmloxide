@@ -281,9 +281,7 @@ impl<'a> XmlParser<'a> {
 
             // Extract the internal subset text (between '[' and ']').
             let end = self.input.pos() - 1; // exclude the closing ']'
-            let subset_text = std::str::from_utf8(self.input.slice(start, end))
-                .ok()
-                .map(str::to_string);
+            let subset_text = self.input.str_slice(start, end).map(str::to_string);
 
             if let Some(subset_text) = subset_text {
                 // Detect parameter entity references in the internal subset.
@@ -982,8 +980,10 @@ impl<'a> XmlParser<'a> {
             let safe_len = self.input.scan_char_data();
             if safe_len > 0 {
                 let start = self.input.pos();
-                let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
-                    .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                let chunk = self
+                    .input
+                    .str_slice(start, start + safe_len)
+                    .ok_or_else(|| self.input.fatal("invalid UTF-8 in character data"))?;
                 // Fast byte-level pre-check for invalid XML chars (0x7F,
                 // U+FFFE, U+FFFF). Skips the expensive char-by-char
                 // validation for the 99.9% of chunks that are clean.
@@ -1391,7 +1391,10 @@ impl<'a> XmlParser<'a> {
         let raw_value = if raw_end > raw_start + 2 {
             let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
             if raw_bytes.contains(&b'&') {
-                let raw_str = std::str::from_utf8(raw_bytes).ok().map(str::to_string);
+                let raw_str = self
+                    .input
+                    .str_slice(raw_start + 1, raw_end - 1)
+                    .map(str::to_string);
                 // Only store raw_value if it differs from the expanded value
                 // (i.e., it contained entity references that got expanded) AND
                 // all entity references in the raw value are declared (not
@@ -1493,6 +1496,49 @@ mod tests {
 
     fn parse(input: &str) -> Document {
         Document::parse_str(input).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    #[test]
+    fn test_parse_non_ascii_in_every_construct() {
+        let doc = parse(
+            "<!DOCTYPE café [<!ENTITY e \"é\">]>\
+             <café prix=\"5€\" raw=\"é&amp;ü\">\
+             <!--ça--><![CDATA[ß<>]]><?pï dätä?>naïve &amp; 𝄞</café>",
+        );
+        let doctype = doc
+            .children(doc.root())
+            .find_map(|c| match &doc.node(c).kind {
+                NodeKind::DocumentType {
+                    name,
+                    internal_subset,
+                    ..
+                } => Some((name.clone(), internal_subset.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(doctype.0, "café");
+        assert!(doctype.1.unwrap().contains("\"é\""));
+
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.node_name(root), Some("café"));
+        assert_eq!(doc.attribute(root, "prix"), Some("5€"));
+        assert_eq!(doc.attribute(root, "raw"), Some("é&ü"));
+        let children: Vec<String> = doc
+            .children(root)
+            .map(|c| match &doc.node(c).kind {
+                NodeKind::Comment { content } => format!("comment:{content}"),
+                NodeKind::CData { content } => format!("cdata:{content}"),
+                NodeKind::ProcessingInstruction { target, data } => {
+                    format!("pi:{target}:{}", data.as_deref().unwrap_or(""))
+                }
+                NodeKind::Text { content } => format!("text:{content}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            children,
+            vec!["comment:ça", "cdata:ß<>", "pi:pï:dätä", "text:naïve & 𝄞"]
+        );
     }
 
     #[test]

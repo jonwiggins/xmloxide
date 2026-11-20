@@ -285,6 +285,10 @@ pub(crate) struct ParserInput<'a> {
     /// The input bytes (must be valid UTF-8).
     input: &'a [u8],
 
+    /// The same input as a string. Slicing it (see [`Self::str_slice`])
+    /// yields text without re-validating UTF-8 that is already known good.
+    text: &'a str,
+
     /// Current byte offset in `input`.
     pos: usize,
 
@@ -349,6 +353,7 @@ impl<'a> ParserInput<'a> {
     pub fn new(input: &'a str) -> Self {
         Self {
             input: input.as_bytes(),
+            text: input,
             pos: 0,
             line: 1,
             column: 1,
@@ -462,6 +467,17 @@ impl<'a> ParserInput<'a> {
         &self.input[start..end]
     }
 
+    /// Returns the input from `start` to `end` as a string slice.
+    ///
+    /// The input arrived as a `&str`, so it is already valid UTF-8; this only
+    /// checks that `start` and `end` fall on character boundaries, instead of
+    /// re-validating every byte in between as `std::str::from_utf8` would.
+    /// Returns `None` if either offset is out of range or splits a character.
+    #[inline]
+    pub fn str_slice(&self, start: usize, end: usize) -> Option<&'a str> {
+        self.text.get(start..end)
+    }
+
     /// Returns the remaining input bytes from the current position.
     #[allow(dead_code)]
     #[inline]
@@ -517,20 +533,8 @@ impl<'a> ParserInput<'a> {
         if first < 0x80 {
             return Some(first as char);
         }
-        // Slow path: multi-byte UTF-8 — decode only the needed bytes
-        let len = match first {
-            0xC0..=0xDF => 2,
-            0xE0..=0xEF => 3,
-            0xF0..=0xF7 => 4,
-            _ => return None, // invalid UTF-8 lead byte
-        };
-        let remaining = &self.input[self.pos..];
-        if remaining.len() < len {
-            return None;
-        }
-        std::str::from_utf8(&remaining[..len])
-            .ok()
-            .and_then(|s| s.chars().next())
+        // Slow path: multi-byte UTF-8. `None` if `pos` is mid-character.
+        self.text.get(self.pos..)?.chars().next()
     }
 
     // -- Advance operations --
@@ -867,7 +871,7 @@ impl<'a> ParserInput<'a> {
             }
         }
         // Whitespace bytes are valid ASCII/UTF-8, so this conversion is safe.
-        std::str::from_utf8(&self.input[start..self.pos]).unwrap_or_default()
+        self.str_slice(start, self.pos).unwrap_or_default()
     }
 
     /// Skips whitespace, returning an error if none is found.
@@ -894,9 +898,7 @@ impl<'a> ParserInput<'a> {
         }
         // The predicates used (ascii_digit, ascii_hexdigit) only match ASCII,
         // so the consumed range is always valid UTF-8.
-        std::str::from_utf8(&self.input[start..self.pos])
-            .unwrap_or("")
-            .to_string()
+        self.str_slice(start, self.pos).unwrap_or("").to_string()
     }
 
     // -- Name parsing (XML 1.0 §2.3) --
@@ -936,8 +938,9 @@ impl<'a> ParserInput<'a> {
                     )));
                 }
                 // Input is guaranteed valid UTF-8 and we only consumed ASCII bytes
-                let name = std::str::from_utf8(&self.input[start..self.pos])
-                    .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                let name = self
+                    .str_slice(start, self.pos)
+                    .ok_or_else(|| self.fatal("invalid UTF-8 in name"))?;
                 return Ok(name.to_string());
             }
             // Fall through: hit a non-ASCII continuation byte, continue
@@ -971,8 +974,9 @@ impl<'a> ParserInput<'a> {
             )));
         }
 
-        let name = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+        let name = self
+            .str_slice(start, self.pos)
+            .ok_or_else(|| self.fatal("invalid UTF-8 in name"))?;
         Ok(name.to_string())
     }
 
@@ -1011,8 +1015,9 @@ impl<'a> ParserInput<'a> {
                 if len == expected.len() && &self.input[start..self.pos] == expected.as_bytes() {
                     return Ok(None); // match — no allocation
                 }
-                let name = std::str::from_utf8(&self.input[start..self.pos])
-                    .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                let name = self
+                    .str_slice(start, self.pos)
+                    .ok_or_else(|| self.fatal("invalid UTF-8 in name"))?;
                 return Ok(Some(name.to_string()));
             }
             // Fall through to slow path for non-ASCII
@@ -1046,8 +1051,9 @@ impl<'a> ParserInput<'a> {
         if len == expected.len() && &self.input[start..self.pos] == expected.as_bytes() {
             return Ok(None);
         }
-        let name = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+        let name = self
+            .str_slice(start, self.pos)
+            .ok_or_else(|| self.fatal("invalid UTF-8 in name"))?;
         Ok(Some(name.to_string()))
     }
 
@@ -1099,8 +1105,9 @@ impl<'a> ParserInput<'a> {
                 if matches {
                     return Ok(None);
                 }
-                let name =
-                    std::str::from_utf8(parsed).map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+                let name = self
+                    .str_slice(start, self.pos)
+                    .ok_or_else(|| self.fatal("invalid UTF-8 in name"))?;
                 return Ok(Some(name.to_string()));
             }
             // Fall through to slow path for non-ASCII
@@ -1145,7 +1152,9 @@ impl<'a> ParserInput<'a> {
         if matches {
             return Ok(None);
         }
-        let name = std::str::from_utf8(parsed).map_err(|_| self.fatal("invalid UTF-8 in name"))?;
+        let name = self
+            .str_slice(start, self.pos)
+            .ok_or_else(|| self.fatal("invalid UTF-8 in name"))?;
         Ok(Some(name.to_string()))
     }
 
@@ -1505,8 +1514,9 @@ impl<'a> ParserInput<'a> {
             let safe_len = self.scan_attr_value(quote);
             if safe_len > 0 {
                 let start = self.pos;
-                let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
-                    .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
+                let chunk = self
+                    .str_slice(start, start + safe_len)
+                    .ok_or_else(|| self.fatal("invalid UTF-8 in attribute value"))?;
                 // Fast byte-level pre-check: only validate when bytes suggest
                 // possible invalid chars (0x7F or U+FFFE/U+FFFF sequences).
                 if let Some(bad) = may_contain_invalid_xml_chars(chunk.as_bytes())
@@ -1596,8 +1606,9 @@ impl<'a> ParserInput<'a> {
         while !self.at_end() && self.peek() != Some(quote) {
             self.advance(1);
         }
-        let value = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|_| self.fatal("invalid UTF-8 in quoted value"))?
+        let value = self
+            .str_slice(start, self.pos)
+            .ok_or_else(|| self.fatal("invalid UTF-8 in quoted value"))?
             .to_string();
         self.expect_byte(quote)?;
         Ok(value)
@@ -1750,8 +1761,9 @@ pub(crate) fn parse_comment_content(input: &mut ParserInput<'_>) -> Result<Strin
                     // Validate XML chars using byte-level pre-check
                     let has_bad =
                         may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
-                    let chunk = std::str::from_utf8(input.slice(start, start + safe_len))
-                        .map_err(|_| input.fatal("invalid UTF-8 in comment"))?
+                    let chunk = input
+                        .str_slice(start, start + safe_len)
+                        .ok_or_else(|| input.fatal("invalid UTF-8 in comment"))?
                         .to_string();
                     if has_bad {
                         if let Some(bad) = find_invalid_xml_char(&chunk) {
@@ -1810,8 +1822,9 @@ pub(crate) fn parse_cdata_content(input: &mut ParserInput<'_>) -> Result<String,
         Some(safe_len) => {
             let start = input.pos();
             let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
-            let content = std::str::from_utf8(input.slice(start, start + safe_len))
-                .map_err(|_| input.fatal("invalid UTF-8 in CDATA section"))?
+            let content = input
+                .str_slice(start, start + safe_len)
+                .ok_or_else(|| input.fatal("invalid UTF-8 in CDATA section"))?
                 .to_string();
             if has_bad {
                 if let Some(bad) = find_invalid_xml_char(&content) {
@@ -1862,8 +1875,9 @@ pub(crate) fn parse_pi_content(
             Some(data_len) => {
                 let start = input.pos();
                 let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + data_len));
-                let data = std::str::from_utf8(input.slice(start, start + data_len))
-                    .map_err(|_| input.fatal("invalid UTF-8 in processing instruction"))?
+                let data = input
+                    .str_slice(start, start + data_len)
+                    .ok_or_else(|| input.fatal("invalid UTF-8 in processing instruction"))?
                     .to_string();
                 if has_bad {
                     if let Some(bad) = find_invalid_xml_char(&data) {
@@ -2018,6 +2032,29 @@ fn is_valid_encoding_name(s: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_str_slice_respects_char_boundaries() {
+        let input = ParserInput::new("aé b");
+        assert_eq!(input.str_slice(0, 3), Some("aé"));
+        assert_eq!(input.str_slice(3, 5), Some(" b"));
+        // Byte 2 is inside 'é'.
+        assert_eq!(input.str_slice(0, 2), None);
+        assert_eq!(input.str_slice(3, 99), None);
+    }
+
+    #[test]
+    fn test_peek_char_multibyte() {
+        let mut input = ParserInput::new("é€𝄞");
+        assert_eq!(input.peek_char(), Some('é'));
+        input.advance(2);
+        assert_eq!(input.peek_char(), Some('€'));
+        input.advance(3);
+        assert_eq!(input.peek_char(), Some('𝄞'));
+        // Inside '𝄞'.
+        input.advance(1);
+        assert_eq!(input.peek_char(), None);
+    }
 
     #[test]
     fn test_peek_and_advance() {
