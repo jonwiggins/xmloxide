@@ -72,7 +72,7 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     dtdvalid: Option<String>,
 
-    /// Validate against a RelaxNG schema file.
+    /// Validate against a RelaxNG schema file (compact syntax if it ends in .rnc).
     #[allow(clippy::doc_markdown)]
     #[arg(long, value_name = "FILE")]
     relaxng: Option<String>,
@@ -345,6 +345,9 @@ fn validate_dtd_external(filename: &str, doc: &mut Document, dtd_file: &str) -> 
 }
 
 /// Validates a document against a `RelaxNG` schema file (--relaxng).
+///
+/// Files with an `.rnc` extension are parsed as RELAX NG Compact Syntax;
+/// anything else as the XML syntax.
 fn validate_relaxng_file(filename: &str, doc: &Document, rng_file: &str) -> u8 {
     let schema_content = match fs::read_to_string(rng_file) {
         Ok(content) => content,
@@ -354,7 +357,16 @@ fn validate_relaxng_file(filename: &str, doc: &Document, rng_file: &str) -> u8 {
         }
     };
 
-    match xmloxide::validation::relaxng::parse_relaxng(&schema_content) {
+    let is_compact = std::path::Path::new(rng_file)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rnc"));
+    let parsed = if is_compact {
+        xmloxide::validation::relaxng_compact::parse_relaxng_compact(&schema_content)
+    } else {
+        xmloxide::validation::relaxng::parse_relaxng(&schema_content)
+    };
+
+    match parsed {
         Ok(schema) => {
             let result = xmloxide::validation::relaxng::validate(doc, &schema);
             print_validation_result(filename, &result)

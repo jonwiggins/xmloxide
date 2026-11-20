@@ -10,12 +10,14 @@
 //! The validation module is organized into:
 //! - Common types (`ValidationResult`, `ValidationError`) used across all validators
 //! - DTD validation (`dtd` submodule) for XML 1.0 DTD processing
-//! - `RelaxNG` validation (`relaxng` submodule) for `RelaxNG` schema validation
+//! - `RelaxNG` validation (`relaxng` submodule) for `RelaxNG` schema validation,
+//!   with a compact-syntax front end (`relaxng_compact` submodule)
 //! - XML Schema validation (`xsd` submodule) for XSD 1.0 validation
 //! - Schematron validation (`schematron` submodule) for ISO Schematron rule-based validation
 
 pub mod dtd;
 pub mod relaxng;
+pub mod relaxng_compact;
 pub mod schematron;
 pub mod xsd;
 

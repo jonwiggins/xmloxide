@@ -476,6 +476,14 @@ xmloxide_validation_result *xmloxide_validate_dtd(xmloxide_document *doc,
  */
 xmloxide_relaxng_schema *xmloxide_parse_relaxng(const char *input);
 
+/**
+ * Parses a RelaxNG schema written in the compact syntax (.rnc) from a
+ * null-terminated UTF-8 string.
+ * Returns a schema pointer on success, or NULL on failure.
+ * The returned schema must be freed with xmloxide_free_relaxng().
+ */
+xmloxide_relaxng_schema *xmloxide_parse_relaxng_compact(const char *input);
+
 /** Frees a RelaxNG schema. Passing NULL is safe and does nothing. */
 void xmloxide_free_relaxng(xmloxide_relaxng_schema *schema);
 

@@ -1322,6 +1322,40 @@ fn test_validate_dtd_null_args() {
 // ---------- RelaxNG validation tests ----------
 
 #[test]
+fn test_relaxng_compact_parse_and_validate() {
+    let schema_str = CString::new("element root { attribute id { xsd:integer }, text }").unwrap();
+    let good = CString::new(r#"<root id="1">hello</root>"#).unwrap();
+    let bad = CString::new(r#"<root id="x">hello</root>"#).unwrap();
+    unsafe {
+        let schema = xmloxide_parse_relaxng_compact(schema_str.as_ptr());
+        assert!(!schema.is_null(), "compact RelaxNG parse should succeed");
+
+        for (xml, expected) in [(&good, 1), (&bad, 0)] {
+            let doc = xmloxide_parse_str(xml.as_ptr());
+            assert!(!doc.is_null());
+            let result = xmloxide_validate_relaxng(doc, schema);
+            assert!(!result.is_null());
+            assert_eq!(xmloxide_validation_is_valid(result), expected);
+            xmloxide_free_validation_result(result);
+            xmloxide_free_doc(doc);
+        }
+        xmloxide_free_relaxng(schema);
+    }
+}
+
+#[test]
+fn test_relaxng_compact_parse_error() {
+    let schema_str = CString::new("element root { text").unwrap();
+    unsafe {
+        let schema = xmloxide_parse_relaxng_compact(schema_str.as_ptr());
+        assert!(schema.is_null());
+        let err = last_error().unwrap();
+        assert!(err.contains("compact syntax error"), "{err}");
+        assert!(xmloxide_parse_relaxng_compact(std::ptr::null()).is_null());
+    }
+}
+
+#[test]
 fn test_relaxng_validate_valid() {
     let schema_str = CString::new(
         r#"<element name="root" xmlns="http://relaxng.org/ns/structure/1.0">
