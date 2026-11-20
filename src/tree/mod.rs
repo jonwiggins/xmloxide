@@ -1141,7 +1141,7 @@ mod tests {
     fn test_children_iterator_empty() {
         let doc = Document::new();
         let children: Vec<NodeId> = doc.children(doc.root()).collect();
-        assert!(children.is_empty());
+        assert_eq!(children, [] as [NodeId; 0]);
     }
 
     #[test]

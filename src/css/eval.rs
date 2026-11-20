@@ -415,7 +415,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "table");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, ".nonexistent");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "#nonexistent");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -536,7 +536,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "[title]");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -553,7 +553,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "[data-type=\"internal\"]");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -570,7 +570,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "[href^=\"ftp\"]");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -587,7 +587,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "[src$=\".jpg\"]");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -604,7 +604,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "[href*=\"missing\"]");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -632,7 +632,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "[lang|=\"de\"]");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     // ---------------------------------------------------------------
@@ -797,7 +797,7 @@ mod tests {
         let root = doc.root_element().unwrap();
         // li is NOT a direct child of div — it's a child of ul
         let result = eval(&doc, root, "div > li");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -816,7 +816,7 @@ mod tests {
         let root = doc.root_element().unwrap();
         // h1 is not immediately preceded by a <p>
         let result = eval(&doc, root, "p + h1");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -834,7 +834,7 @@ mod tests {
         let root = doc.root_element().unwrap();
         // h1 has no preceding sibling <a>
         let result = eval(&doc, root, "a ~ h1");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -937,7 +937,7 @@ mod tests {
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         let result = select(&doc, root, &group);
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -959,7 +959,7 @@ mod tests {
         let doc = Document::parse_str("<root/>").unwrap();
         let root = doc.root_element().unwrap();
         let result = eval(&doc, root, "div");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]
@@ -971,7 +971,7 @@ mod tests {
         let sidebar_nodes = eval(&doc, root, "#sidebar");
         let sidebar = sidebar_nodes[0];
         let result = eval(&doc, sidebar, "#main");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [NodeId; 0]);
     }
 
     #[test]

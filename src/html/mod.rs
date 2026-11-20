@@ -1317,7 +1317,7 @@ mod tests {
 
         // Should have body child (empty head is removed)
         let children: Vec<_> = doc.children(html).collect();
-        assert!(!children.is_empty());
+        assert_ne!(children, [] as [crate::tree::NodeId; 0]);
         // Body should contain the <p>
         let body = children.last().unwrap();
         assert_eq!(doc.node_name(*body), Some("body"));

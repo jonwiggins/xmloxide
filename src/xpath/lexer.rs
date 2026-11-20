@@ -986,13 +986,13 @@ mod tests {
     #[test]
     fn test_tokenize_empty_input() {
         let tokens = tokenize("");
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, [] as [Token; 0]);
     }
 
     #[test]
     fn test_tokenize_whitespace_only() {
         let tokens = tokenize("   \t\n  ");
-        assert!(tokens.is_empty());
+        assert_eq!(tokens, [] as [Token; 0]);
     }
 
     #[test]

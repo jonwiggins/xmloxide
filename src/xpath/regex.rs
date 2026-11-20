@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn test_tokenize_empty() {
         let result: Vec<String> = tokenize("", ",");
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [String; 0]);
     }
 
     #[test]
