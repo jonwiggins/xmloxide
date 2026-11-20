@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-20
+
+This release contains a breaking change: `ParseOptions` gained a public
+field (`dtd_attributes`), so code that constructs `ParseOptions` with a
+struct literal must add `..ParseOptions::default()` or switch to the
+builder methods.
 
 ### Security
 
@@ -23,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under a work budget linear in the document and schema sizes; a
   schema/document pair that exceeds it is reported as invalid with a
   "work limit" error instead of running unbounded.
+
+- **RelaxNG: self-referencing defines no longer overflow the stack**
+  (#55). A `<define>` that referred back to itself without passing through
+  an `<element>` (e.g. `<define name="a"><ref name="a"/></define>`) made
+  validation recurse until the stack overflowed, aborting the process.
+  Such grammars are now rejected as schema errors per RELAX NG §4.19, and
+  ref chains and combined defines are depth-bounded.
 
 ### Added
 
@@ -65,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now found by their `id` (previously they were not indexed). Duplicate
   `id`s still resolve to the last element in document order.
 
+- **Parser: slice input text instead of re-validating UTF-8** (#75, thanks
+  @dkam). Names, attribute values, comments, CDATA, and PIs are sliced
+  straight from the already-validated input; roughly 4–10% faster parsing
+  on attribute- and namespace-heavy documents, with no behavior change.
+
 ### Fixed
 
 - **RelaxNG: wrong verdicts from the old matcher.** The derivative-based
@@ -90,6 +107,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implicit group) with tens of thousands of children built a left-leaning
   pattern chain that crashed the recursive validator; groups are now folded
   into a balanced tree like `choice` and `interleave`.
+
+- **RelaxNG schema parsing** (#52–#56, thanks @casoon): `<define>`s and
+  `<start>`s inside `<div>` are now collected; foreign-namespace annotation
+  elements and attributes (e.g. `a:documentation`) are ignored; QNames in
+  `name` attributes (e.g. `xml:lang`) are resolved against in-scope
+  namespaces; same-named defines are merged per `combine="choice"` /
+  `"interleave"` instead of the last one silently winning; and attribute
+  patterns reached through a `<ref>` inside `<interleave>` now match.
+- **Attribute whitespace round-trip** (#50). Serializing an attribute that
+  contained a literal tab/CR/LF alongside an entity reference wrote the
+  whitespace back as a character reference, so re-parsing restored a
+  character that normalization had turned into a space. A literal CRLF in
+  an attribute value now normalizes to one space (not two), and DTD
+  default attribute values are entity-expanded and whitespace-normalized.
+- **HTML parser** (refs #70): semicolon-less character references are only
+  decoded for the HTML5 legacy names (and never in an attribute value when
+  followed by `=`, so `href="?a=1&lang=de"` survives); bogus `<!…>`
+  constructs are skipped; text in `<head>` implies `<body>`; and
+  `<script>`/`<style>` after `</body>` are no longer moved into `<head>`.
 
 ## [0.5.1] - 2026-11-20
 
