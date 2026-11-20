@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trusted schema, was a denial-of-service risk. Validation now uses James
   Clark's derivative algorithm over hash-consed, memoized patterns and
   runs in roughly linear time (`comps` validates in ~15 ms). It also runs
-  under a work budget proportional to the document size; a
+  under a work budget linear in the document and schema sizes; a
   schema/document pair that exceeds it is reported as invalid with a
   "work limit" error instead of running unbounded.
 

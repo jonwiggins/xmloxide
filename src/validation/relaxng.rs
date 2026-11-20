@@ -1116,7 +1116,8 @@ fn fold_balanced(
 // patterns small and the work per input event roughly constant. Because
 // `interleave` can still produce a number of states exponential in the
 // schema size in contrived cases, every validation also runs under a work
-// budget proportional to the document size (see `BASE_VALIDATION_STEPS`):
+// budget linear in the document and schema sizes (see
+// `BASE_VALIDATION_STEPS`):
 // once it is exhausted, validation stops with an error instead of running
 // unbounded.
 
@@ -1135,6 +1136,16 @@ const BASE_VALIDATION_STEPS: u64 = 1_000_000;
 /// attribute and text node of the validated document.
 const VALIDATION_STEPS_PER_NODE: u64 = 1_000;
 
+/// Additional work budget, in derivative steps, granted per pattern node in
+/// the schema (its start pattern and all defines).
+///
+/// Compiling the schema interns one pattern per node, and a derivative over
+/// a large content model touches each of its particles, so the budget must
+/// grow with the schema as well as the document: otherwise a valid document
+/// could exhaust it against a large (but legitimate) schema. This keeps the
+/// bound linear in the combined input size.
+const VALIDATION_STEPS_PER_SCHEMA_PATTERN: u64 = 16;
+
 /// Maximum number of validation errors reported by one [`validate`] call.
 const MAX_VALIDATION_ERRORS: usize = 100;
 
@@ -1146,7 +1157,8 @@ const MAX_VALIDATION_ERRORS: usize = 100;
 ///
 /// Validation uses the derivative algorithm, which runs in time roughly
 /// linear in the document size. It is additionally bounded by a work budget
-/// proportional to the document size; a schema/document pair that exceeds it
+/// linear in the document and schema sizes; a schema/document pair that
+/// exceeds it
 /// is reported as invalid with a "work limit" error rather than validating
 /// unbounded.
 ///
@@ -1179,7 +1191,49 @@ pub fn validate(doc: &Document, schema: &RelaxNgSchema) -> ValidationResult {
     let per_node = u64::try_from(nodes)
         .unwrap_or(u64::MAX)
         .saturating_mul(VALIDATION_STEPS_PER_NODE);
-    validate_with_budget(doc, schema, BASE_VALIDATION_STEPS.saturating_add(per_node))
+    let patterns = std::iter::once(&schema.start)
+        .chain(schema.defines.values())
+        .map(pattern_size)
+        .fold(0usize, usize::saturating_add);
+    let per_pattern = u64::try_from(patterns)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(VALIDATION_STEPS_PER_SCHEMA_PATTERN);
+    let budget = BASE_VALIDATION_STEPS
+        .saturating_add(per_node)
+        .saturating_add(per_pattern);
+    validate_with_budget(doc, schema, budget)
+}
+
+/// Counts the nodes of a pattern tree (without following `ref`s).
+///
+/// Iterative, so a deep pattern (e.g. a hand-built schema) cannot overflow
+/// the stack.
+fn pattern_size(pattern: &Pattern) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![pattern];
+    while let Some(p) = stack.pop() {
+        count = count.saturating_add(1);
+        match p {
+            Pattern::Element { pattern, .. }
+            | Pattern::Attribute { pattern, .. }
+            | Pattern::Optional(pattern)
+            | Pattern::ZeroOrMore(pattern)
+            | Pattern::OneOrMore(pattern)
+            | Pattern::List(pattern)
+            | Pattern::Mixed(pattern) => stack.push(pattern),
+            Pattern::Group(a, b) | Pattern::Interleave(a, b) | Pattern::Choice(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Pattern::Empty
+            | Pattern::NotAllowed
+            | Pattern::Text
+            | Pattern::Ref(_)
+            | Pattern::Value(_)
+            | Pattern::Data { .. } => {}
+        }
+    }
+    count
 }
 
 /// Validates `doc` against `schema` with an explicit work budget.
