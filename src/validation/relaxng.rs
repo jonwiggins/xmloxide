@@ -313,8 +313,31 @@ fn parse_grammar(
     let mut defines: HashMap<String, Pattern> = HashMap::new();
 
     let ns = resolve_ns(doc, grammar_el, parent_ns);
+    collect_grammar_content(doc, grammar_el, &ns, &mut start, &mut defines)?;
 
-    for child in doc.children(grammar_el) {
+    let start = start.ok_or_else(|| SchemaParseError {
+        message: "<grammar> has no <start> element".to_string(),
+    })?;
+
+    Ok(RelaxNgSchema { start, defines })
+}
+
+/// Collects the `<start>` and `<define>` components of a grammar-content
+/// container (`<grammar>` or `<div>`).
+///
+/// `<div>` is purely organizational: per `RelaxNG` §4.11 ("Each `div`
+/// element is replaced by its children"), components nested in any number
+/// of `<div>` levels belong to the enclosing grammar's single symbol table.
+/// Recursion is bounded by the schema document's element depth, which the
+/// XML parser limits.
+fn collect_grammar_content(
+    doc: &Document,
+    container: NodeId,
+    ns: &str,
+    start: &mut Option<Pattern>,
+    defines: &mut HashMap<String, Pattern>,
+) -> Result<(), SchemaParseError> {
+    for child in doc.children(container) {
         if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
             continue;
         }
@@ -323,8 +346,8 @@ fn parse_grammar(
 
         match local {
             "start" => {
-                let inner = parse_pattern_children(doc, child, &ns)?;
-                start = Some(inner);
+                let inner = parse_pattern_children(doc, child, ns)?;
+                *start = Some(inner);
             }
             "define" => {
                 let name = doc
@@ -333,21 +356,21 @@ fn parse_grammar(
                         message: "<define> missing 'name' attribute".to_string(),
                     })?
                     .to_string();
-                let inner = parse_pattern_children(doc, child, &ns)?;
+                let inner = parse_pattern_children(doc, child, ns)?;
                 defines.insert(name, inner);
             }
+            "div" => {
+                // `ns` on a `<div>` is inherited by its descendants (§4.9).
+                let div_ns = resolve_ns(doc, child, ns);
+                collect_grammar_content(doc, child, &div_ns, start, defines)?;
+            }
             _ => {
-                // Ignore unknown elements (includes, divs, etc. — not yet
+                // Ignore unknown elements (`<include>` is not yet
                 // implemented).
             }
         }
     }
-
-    let start = start.ok_or_else(|| SchemaParseError {
-        message: "<grammar> has no <start> element".to_string(),
-    })?;
-
-    Ok(RelaxNgSchema { start, defines })
+    Ok(())
 }
 
 /// Resolves the effective namespace for pattern children. Uses the `ns`
@@ -2475,5 +2498,85 @@ mod tests {
         let doc = Document::parse_str("<p>Hello <b>world</b> and more</p>").unwrap();
         let result = validate(&doc, &schema);
         assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    // --- <div> grammar content (§4.11, issue #52) ---
+
+    #[test]
+    fn test_parse_grammar_define_inside_div() {
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0">
+                <start><ref name="root"/></start>
+                <div>
+                    <define name="root"><element name="root"><empty/></element></define>
+                </div>
+            </grammar>"#,
+        )
+        .unwrap();
+        assert!(schema.defines.contains_key("root"));
+
+        let doc = Document::parse_str("<root/>").unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_parse_grammar_nested_divs() {
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0">
+                <div>
+                    <start><ref name="root"/></start>
+                    <div>
+                        <div>
+                            <define name="root">
+                                <element name="root"><ref name="child"/></element>
+                            </define>
+                        </div>
+                        <define name="child"><element name="child"><text/></element></define>
+                    </div>
+                </div>
+            </grammar>"#,
+        )
+        .unwrap();
+        assert!(schema.defines.contains_key("root"));
+        assert!(schema.defines.contains_key("child"));
+
+        let doc = Document::parse_str("<root><child>x</child></root>").unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        let doc = Document::parse_str("<root><other/></root>").unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_grammar_div_inherits_ns() {
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0">
+                <start><ref name="root"/></start>
+                <div ns="urn:example">
+                    <define name="root"><element name="root"><empty/></element></define>
+                </div>
+            </grammar>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(r#"<root xmlns="urn:example"/>"#).unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        let doc = Document::parse_str("<root/>").unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_grammar_empty_div_without_start_is_error() {
+        let err = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0">
+                <div/>
+            </grammar>"#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("no <start>"), "{}", err.message);
     }
 }
