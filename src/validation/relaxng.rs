@@ -534,7 +534,7 @@ fn parse_element_pattern(
     el: NodeId,
     ns: &str,
 ) -> Result<Pattern, SchemaParseError> {
-    let name_class = parse_name_class_from_element(doc, el, ns)?;
+    let name_class = parse_name_class_from_element(doc, el, ns, false)?;
     let el_ns = resolve_ns(doc, el, ns);
 
     // Collect content patterns (everything except <name>, <anyName>, <nsName>,
@@ -565,7 +565,7 @@ fn parse_attribute_pattern(
     el: NodeId,
     ns: &str,
 ) -> Result<Pattern, SchemaParseError> {
-    let name_class = parse_name_class_from_element(doc, el, ns)?;
+    let name_class = parse_name_class_from_element(doc, el, ns, true)?;
     let attr_ns = resolve_ns(doc, el, ns);
 
     let mut content_patterns = Vec::new();
@@ -600,18 +600,25 @@ fn is_name_class_element(local: &str) -> bool {
 ///
 /// If the element has a `name` attribute, uses that directly. Otherwise,
 /// looks for a child `<name>`, `<anyName>`, or `<nsName>` element.
+///
+/// For the `name` attribute shorthand, `RelaxNG` §4.8 says an `<attribute>`
+/// without its own `ns` attribute names an attribute in no namespace (the
+/// inherited `ns` applies only to elements), and §4.10 resolves a prefixed
+/// value as a `QName`.
 fn parse_name_class_from_element(
     doc: &Document,
     el: NodeId,
     ns: &str,
+    is_attribute: bool,
 ) -> Result<NameClass, SchemaParseError> {
     // Check for `name` attribute shorthand.
     if let Some(name_attr) = rng_attr(doc, el, "name") {
-        let el_ns = resolve_ns(doc, el, ns);
-        return Ok(NameClass::Name {
-            ns: el_ns,
-            local: name_attr.to_string(),
-        });
+        let default_ns = if is_attribute {
+            rng_attr(doc, el, "ns").unwrap_or("").to_string()
+        } else {
+            resolve_ns(doc, el, ns)
+        };
+        return resolve_qname(doc, el, name_attr, default_ns);
     }
 
     // Look for a name-class child element.
@@ -620,12 +627,7 @@ fn parse_name_class_from_element(
         let child_local = strip_rng_prefix(child_name);
         match child_local {
             "name" => {
-                let local_name = doc.text_content(child);
-                let child_ns = resolve_ns(doc, child, ns);
-                return Ok(NameClass::Name {
-                    ns: child_ns,
-                    local: local_name.trim().to_string(),
-                });
+                return parse_name_element(doc, child, ns);
             }
             "anyName" => {
                 return parse_any_name_class(doc, child, ns);
@@ -643,6 +645,79 @@ fn parse_name_class_from_element(
     Err(SchemaParseError {
         message: "element/attribute pattern has no name or name class".to_string(),
     })
+}
+
+/// The namespace URI permanently bound to the `xml` prefix (Namespaces in
+/// XML 1.0 §3).
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// Looks up the namespace URI bound to `prefix` in the scope of `el` in the
+/// schema document. The `xml` prefix is always bound, even without an
+/// explicit declaration.
+fn lookup_ns_prefix<'a>(doc: &'a Document, el: NodeId, prefix: &str) -> Option<&'a str> {
+    if prefix == "xml" {
+        return Some(XML_NS);
+    }
+    let mut cur = Some(el);
+    while let Some(node) = cur {
+        if let Some(decl) = doc
+            .attributes(node)
+            .iter()
+            .find(|a| a.prefix.as_deref() == Some("xmlns") && a.name == prefix)
+        {
+            return Some(decl.value.as_str());
+        }
+        cur = doc.parent(node);
+    }
+    None
+}
+
+/// Resolves a `QName` used as an element or attribute name into a
+/// [`NameClass::Name`].
+///
+/// Per `RelaxNG` §4.10, a prefix is replaced by the namespace URI it is
+/// bound to in the context of `ctx` (the element carrying the name), and
+/// the context must have a mapping for the prefix. An unprefixed name uses
+/// `default_ns`.
+fn resolve_qname(
+    doc: &Document,
+    ctx: NodeId,
+    raw: &str,
+    default_ns: String,
+) -> Result<NameClass, SchemaParseError> {
+    let qname = raw.trim();
+    let Some((prefix, local)) = qname.split_once(':') else {
+        if qname.is_empty() {
+            return Err(SchemaParseError {
+                message: "empty element/attribute name".to_string(),
+            });
+        }
+        return Ok(NameClass::Name {
+            ns: default_ns,
+            local: qname.to_string(),
+        });
+    };
+    if prefix.is_empty() || local.is_empty() || local.contains(':') {
+        return Err(SchemaParseError {
+            message: format!("invalid QName '{qname}'"),
+        });
+    }
+    match lookup_ns_prefix(doc, ctx, prefix) {
+        Some(uri) if !uri.is_empty() => Ok(NameClass::Name {
+            ns: uri.to_string(),
+            local: local.to_string(),
+        }),
+        _ => Err(SchemaParseError {
+            message: format!("undeclared namespace prefix '{prefix}' in name '{qname}'"),
+        }),
+    }
+}
+
+/// Parses a `<name>` name-class element. Its text is a `QName` (§4.10);
+/// an unprefixed name takes the inherited `ns` (§4.9).
+fn parse_name_element(doc: &Document, el: NodeId, ns: &str) -> Result<NameClass, SchemaParseError> {
+    let text = doc.text_content(el);
+    resolve_qname(doc, el, &text, resolve_ns(doc, el, ns))
 }
 
 /// Parses an `<anyName>` name class, possibly with `<except>`.
@@ -692,14 +767,7 @@ fn parse_name_class_choice(
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
         let nc = match child_local {
-            "name" => {
-                let local_name = doc.text_content(child).trim().to_string();
-                let child_ns = resolve_ns(doc, child, ns);
-                NameClass::Name {
-                    ns: child_ns,
-                    local: local_name,
-                }
-            }
+            "name" => parse_name_element(doc, child, ns)?,
             "anyName" => parse_any_name_class(doc, child, ns)?,
             "nsName" => parse_ns_name_class(doc, child, ns)?,
             "choice" => parse_name_class_choice(doc, child, ns)?,
@@ -723,14 +791,7 @@ fn parse_name_class_children(
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
         let nc = match child_local {
-            "name" => {
-                let local_name = doc.text_content(child).trim().to_string();
-                let child_ns = resolve_ns(doc, child, ns);
-                NameClass::Name {
-                    ns: child_ns,
-                    local: local_name,
-                }
-            }
+            "name" => parse_name_element(doc, child, ns)?,
             "anyName" => parse_any_name_class(doc, child, ns)?,
             "nsName" => parse_ns_name_class(doc, child, ns)?,
             "choice" => parse_name_class_choice(doc, child, ns)?,
@@ -2698,5 +2759,144 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    // --- QName resolution in names (§4.8, §4.10, issue #54) ---
+
+    #[test]
+    fn test_parse_name_class_from_element_xml_prefix_shorthand() {
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0">
+                <start>
+                    <element name="root">
+                        <attribute name="xml:lang"><text/></attribute>
+                    </element>
+                </start>
+            </grammar>"#,
+        )
+        .unwrap();
+        let Pattern::Element { pattern, .. } = &schema.start else {
+            panic!("expected element pattern, got {:?}", schema.start);
+        };
+        let Pattern::Attribute { name, .. } = pattern.as_ref() else {
+            panic!("expected attribute pattern, got {pattern:?}");
+        };
+        assert_eq!(
+            name,
+            &NameClass::Name {
+                ns: XML_NS.to_string(),
+                local: "lang".to_string(),
+            }
+        );
+
+        let doc = Document::parse_str(r#"<root xml:lang="en"/>"#).unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        // An unqualified `lang` attribute is not `xml:lang`.
+        let doc = Document::parse_str(r#"<root lang="en"/>"#).unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_name_class_from_element_declared_prefix() {
+        // The schema and instance use different prefixes for the same URI.
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0" xmlns:x="urn:example">
+                <start>
+                    <element name="x:root">
+                        <attribute name="x:id"><text/></attribute>
+                    </element>
+                </start>
+            </grammar>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(r#"<e:root xmlns:e="urn:example" e:id="1"/>"#).unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        let doc = Document::parse_str(r#"<root id="1"/>"#).unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_name_element_qname_and_choice() {
+        let schema = parse_relaxng(
+            r#"<element xmlns="http://relaxng.org/ns/structure/1.0"
+                        xmlns:x="urn:example">
+                <name>x:root</name>
+                <attribute>
+                    <choice>
+                        <name>xml:space</name>
+                        <name>xml:base</name>
+                    </choice>
+                </attribute>
+            </element>"#,
+        )
+        .unwrap();
+
+        for attr in ["xml:space", "xml:base"] {
+            let doc =
+                Document::parse_str(&format!(r#"<root xmlns="urn:example" {attr}="v"/>"#)).unwrap();
+            let result = validate(&doc, &schema);
+            assert!(result.is_valid, "{attr}: errors: {:?}", result.errors);
+        }
+
+        let doc = Document::parse_str(r#"<root xmlns="urn:example" space="v"/>"#).unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_name_class_from_element_attribute_does_not_inherit_ns() {
+        // §4.8: the `name` shorthand on `<attribute>` without its own `ns`
+        // names an unqualified attribute; elements do inherit `ns`.
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0" ns="urn:example">
+                <start>
+                    <element name="root">
+                        <attribute name="id"><text/></attribute>
+                        <attribute name="ref" ns="urn:other"><text/></attribute>
+                    </element>
+                </start>
+            </grammar>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(
+            r#"<root xmlns="urn:example" xmlns:o="urn:other" id="1" o:ref="2"/>"#,
+        )
+        .unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_resolve_qname_undeclared_prefix_is_error() {
+        let err = parse_relaxng(
+            r#"<element name="nope:root" xmlns="http://relaxng.org/ns/structure/1.0">
+                <empty/>
+            </element>"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("undeclared namespace prefix 'nope'"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_resolve_qname_malformed_is_error() {
+        for name in [":root", "root:", "a:b:c", " "] {
+            let schema = format!(
+                r#"<element name="{name}" xmlns="http://relaxng.org/ns/structure/1.0"
+                            xmlns:a="urn:a"><empty/></element>"#
+            );
+            assert!(
+                parse_relaxng(&schema).is_err(),
+                "name {name:?} should be rejected"
+            );
+        }
     }
 }
