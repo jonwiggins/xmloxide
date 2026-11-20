@@ -11,6 +11,21 @@ mechanism — pass counts should only go up.
 cargo test --test libxml2_compat -- --nocapture
 ```
 
+The baseline below is for the pinned release (2.13.6). To run the harness
+against another libxml2 release, point `XMLOXIDE_LIBXML2_DIR` at a directory
+containing that release's `test/` and `result/` trees:
+
+```sh
+XMLOXIDE_LIBXML2_DIR=/path/to/libxml2-2.14.6 cargo test --test libxml2_compat -- --nocapture
+```
+
+libxml2 2.14 replaced its HTML tokenizer with an HTML5-conformant one, so
+several of its `test/HTML` expectations (RCDATA `<title>`/`<textarea>`,
+raw-text `<iframe>`/`<noframes>`/`<xmp>`, bogus comments for `<?...>` and
+`<![...]>`, the full HTML5 entity table) intentionally differ from the
+`xmloxide::html` parser, which follows the 2.13 model. Use `xmloxide::html5`
+for WHATWG-conformant parsing (see issue #70).
+
 ## Current baseline
 
 | Category | Passed | Total | Pass Rate | Notes |

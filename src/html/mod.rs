@@ -473,12 +473,16 @@ impl<'a> HtmlParser<'a> {
             {
                 self.parse_start_tag();
             } else if self.input.peek() == Some(b'<') && self.input.peek_at(1) == Some(b'!') {
-                // Could be <![if ...]> (IE conditional comment) or other malformed markup
+                // `<!` not followed by `--` or `DOCTYPE`: either an IE
+                // conditional comment marker (`<![if ...]>`) or other bogus
+                // markup such as `<!– ... –>` with typographic dashes. Like
+                // libxml2's `htmlSkipBogusComment`, skip it up to the next
+                // `>` instead of leaking it into the text content.
                 if self.input.peek_at(2) == Some(b'[') {
                     self.skip_conditional_comment();
                 } else {
-                    self.push_warning("malformed markup".to_string());
-                    self.input.advance(1);
+                    self.push_warning("bogus comment skipped".to_string());
+                    self.skip_to_gt();
                 }
             } else if self.input.peek() == Some(b'<') && self.input.peek_at(1) == Some(b'?') {
                 self.parse_processing_instruction();
@@ -639,8 +643,14 @@ impl<'a> HtmlParser<'a> {
                 // directly under <html>, not inside <body>
                 self.close_head_if_open();
                 self.ensure_html();
-            } else if is_head_content_element(&lower_tag) && !self.is_in_body() {
-                // Head-content elements go under <head>
+            } else if is_head_content_element(&lower_tag)
+                && !self.is_in_body()
+                && !self.html_has_child("body")
+            {
+                // Head-content elements go under <head>, but only before
+                // <body> has been created: after </body> they stay at the
+                // current insertion point rather than jumping back into
+                // <head>.
                 let head_id = self.ensure_head();
                 if !self.open_elements.iter().any(|(_, t)| t == "head") {
                     self.open_elements.push((head_id, "head".to_string()));
@@ -892,7 +902,7 @@ impl<'a> HtmlParser<'a> {
                     break;
                 }
                 if ch == Some(b'&') {
-                    let resolved = self.parse_html_reference();
+                    let resolved = self.parse_html_reference(true);
                     value.push_str(&resolved);
                 } else {
                     let c = self.next_char_html();
@@ -929,7 +939,7 @@ impl<'a> HtmlParser<'a> {
                     break;
                 }
                 if b == b'&' {
-                    let resolved = self.parse_html_reference();
+                    let resolved = self.parse_html_reference(true);
                     value.push_str(&resolved);
                 } else {
                     let c = self.next_char_html();
@@ -951,7 +961,7 @@ impl<'a> HtmlParser<'a> {
             }
 
             if self.input.peek() == Some(b'&') {
-                let resolved = self.parse_html_reference();
+                let resolved = self.parse_html_reference(false);
                 text.push_str(&resolved);
             } else {
                 let ch = self.next_char_html();
@@ -972,11 +982,64 @@ impl<'a> HtmlParser<'a> {
                     return;
                 }
                 self.ensure_body();
+            } else if self.text_belongs_in_body(&text) {
+                // Character data cannot live in <head> (or directly in
+                // <html> before <body>): leading whitespace stays where it
+                // is, and the rest implies </head><body>. This matches the
+                // WHATWG "in head" / "after head" insertion modes and
+                // libxml2 2.14 (libxml2 2.13 also moves the text into the
+                // body, wrapped in an implied <p>).
+                let ws_len = text.len()
+                    - text
+                        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                        .len();
+                let rest = text.split_off(ws_len);
+                if !text.is_empty() {
+                    let parent = self.current_parent();
+                    let ws_id = self.doc.create_node(NodeKind::Text { content: text });
+                    self.doc.append_child(parent, ws_id);
+                }
+                self.close_head_if_open();
+                self.ensure_body();
+                text = rest;
             }
             let parent = self.current_parent();
             let text_id = self.doc.create_node(NodeKind::Text { content: text });
             self.doc.append_child(parent, text_id);
         }
+    }
+
+    /// Returns true if `text`, about to be inserted at the current position,
+    /// must instead go into an implied `<body>`: the insertion point is
+    /// `<head>` or `<html>`, no `<body>` or `<frameset>` has been created
+    /// yet, and the text is not whitespace-only.
+    fn text_belongs_in_body(&self, text: &str) -> bool {
+        if self.options.no_implied
+            || !self
+                .open_elements
+                .last()
+                .is_some_and(|(_, t)| t == "head" || t == "html")
+            || text.chars().all(|c| c.is_ascii_whitespace())
+        {
+            return false;
+        }
+        !self.html_has_child("body") && !self.html_has_child("frameset")
+    }
+
+    /// Returns true if the root `<html>` element has a child element named
+    /// `name` (whether or not it is still open).
+    fn html_has_child(&self, name: &str) -> bool {
+        let root = self.doc.root();
+        self.doc
+            .children(root)
+            .filter(|&id| {
+                matches!(&self.doc.node(id).kind, NodeKind::Element { name: n, .. } if n == "html")
+            })
+            .any(|html_id| {
+                self.doc.children(html_id).any(|id| {
+                    matches!(&self.doc.node(id).kind, NodeKind::Element { name: n, .. } if n == name)
+                })
+            })
     }
 
     // --- Raw text (script/style) ---
@@ -1106,7 +1169,16 @@ impl<'a> HtmlParser<'a> {
 
     /// Parses an HTML character or entity reference, or returns a bare `&`
     /// if it doesn't look like a valid reference (error-tolerant).
-    fn parse_html_reference(&mut self) -> String {
+    ///
+    /// A named reference without a trailing `;` is only decoded when its
+    /// name is one of the legacy references that the WHATWG HTML standard
+    /// allows without a semicolon (`amp`, `lt`, `copy`, ...; see HTML
+    /// §13.2.5.73 Named character reference state). In attribute values
+    /// (`in_attribute`), such a reference is additionally left undecoded
+    /// when it is followed by `=`, so query strings like `?a=1&lang=de` or
+    /// `&copy=2` survive intact. libxml2 2.13 decodes no semicolon-less
+    /// references at all; libxml2 2.14 follows the WHATWG rules.
+    fn parse_html_reference(&mut self, in_attribute: bool) -> String {
         // Save position for backtracking
         let saved = self.input.save_position();
 
@@ -1161,10 +1233,16 @@ impl<'a> HtmlParser<'a> {
                 self.push_warning(format!("unknown entity reference: &{name};"));
                 return format!("&{name};");
             }
-            // Try without semicolon (error-tolerant: some HTML uses &amp without ;)
-            if let Some(value) = entities::lookup_entity(&name) {
-                self.push_warning(format!("entity reference &{name} missing semicolon"));
-                return value.to_string();
+            // Without a semicolon, only legacy references are recognized,
+            // and never in an attribute value when followed by '='.
+            let followed_by_equals = self.input.peek() == Some(b'=');
+            if crate::html5::entities::is_legacy_named_entity(&name)
+                && !(in_attribute && followed_by_equals)
+            {
+                if let Some(value) = entities::lookup_entity(&name) {
+                    self.push_warning(format!("entity reference &{name} missing semicolon"));
+                    return value.to_string();
+                }
             }
         }
 
@@ -1635,5 +1713,113 @@ mod tests {
         let root = doc.root();
         let a = doc.first_child(root).unwrap();
         assert_eq!(doc.attribute(a, "href"), Some("page?a=1&b=2"));
+    }
+
+    /// Parses `input` and returns the serialized content of `<body>`.
+    fn body_html(input: &str) -> String {
+        let out = crate::serial::html::serialize_html(&parse(input));
+        let Some((_, after)) = out.split_once("<body>") else {
+            panic!("expected <body> in output, got {out:?}");
+        };
+        let Some((inner, _)) = after.split_once("</body>") else {
+            panic!("expected </body> in output, got {out:?}");
+        };
+        inner.trim_matches('\n').to_string()
+    }
+
+    /// Returns the names of the element children of the root `<html>`.
+    fn html_child_names(doc: &Document) -> Vec<String> {
+        let html = doc.root_element().unwrap();
+        doc.children(html)
+            .filter_map(|id| doc.node_name(id).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_html_reference_no_semicolon_non_legacy_text() {
+        // `lang` is not a legacy reference, so `&lang` without `;` is text.
+        let doc = parse_no_implied("<p>t &lang x &langle y</p>");
+        let p = doc.first_child(doc.root()).unwrap();
+        assert_eq!(doc.text_content(p), "t &lang x &langle y");
+    }
+
+    #[test]
+    fn test_parse_html_reference_no_semicolon_legacy_text() {
+        // Legacy references are still decoded without `;` in text.
+        let doc = parse_no_implied("<p>&copy y &amp z &lt</p>");
+        let p = doc.first_child(doc.root()).unwrap();
+        assert_eq!(doc.text_content(p), "\u{a9} y & z <");
+    }
+
+    #[test]
+    fn test_parse_html_reference_attribute_followed_by_equals() {
+        let doc = parse_no_implied(r#"<a href="/?x=1&lang=de&copy=2&amp;y=3&not=4">t</a>"#);
+        let a = doc.first_child(doc.root()).unwrap();
+        assert_eq!(
+            doc.attribute(a, "href"),
+            Some("/?x=1&lang=de&copy=2&y=3&not=4")
+        );
+    }
+
+    #[test]
+    fn test_parse_html_reference_attribute_legacy_not_followed_by_equals() {
+        // From libxml2's attr-ents test: `&lt=` stays literal, `&lta` is not
+        // a reference, and `&lt&gt` decodes both.
+        let doc = parse_no_implied(
+            r#"<a href="a&lt=1&gt=2"></a><a href="a&lta&gta"></a><a href="a&lt&gt"></a><a href=a&copy=1></a>"#,
+        );
+        let values: Vec<_> = doc
+            .children(doc.root())
+            .map(|a| doc.attribute(a, "href").unwrap().to_string())
+            .collect();
+        assert_eq!(values, ["a&lt=1&gt=2", "a&lta&gta", "a<>", "a&copy=1"]);
+    }
+
+    #[test]
+    fn test_parse_bogus_comment_skipped() {
+        // `<!` followed by neither `--` nor `DOCTYPE` (here U+2013 dashes, as
+        // some CMSs emit) is skipped up to the next `>`.
+        assert_eq!(
+            body_html("<body><div>a<!\u{2013} google_ad_section_start \u{2013}>b</div></body>"),
+            "<div>ab</div>"
+        );
+        assert_eq!(body_html("<p>a<!x>b<!>c<!-x->d"), "<p>abcd</p>");
+    }
+
+    #[test]
+    fn test_parse_text_in_head_implies_body() {
+        // libxml2 2.14 test/HTML/implied1.html
+        let out = crate::serial::html::serialize_html(&parse("<head>   x\n"));
+        assert!(
+            out.contains("<html>\n<head>   </head>\n<body>x\n</body>\n</html>"),
+            "unexpected output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_text_after_title_implies_body() {
+        let input = "<title>a</title>b<p>c</p>";
+        assert_eq!(html_child_names(&parse(input)), ["head", "body"]);
+        assert_eq!(body_html(input), "b<p>c</p>");
+    }
+
+    #[test]
+    fn test_parse_text_directly_in_html_implies_body() {
+        assert_eq!(body_html("<html>x<p>y</p>"), "x<p>y</p>");
+    }
+
+    #[test]
+    fn test_parse_whitespace_in_head_stays_in_head() {
+        let doc = parse("<head> <title>a</title> </head><body>b</body>");
+        let html = doc.root_element().unwrap();
+        let head = doc.first_child(html).unwrap();
+        assert_eq!(doc.node_name(head), Some("head"));
+        assert_eq!(doc.children(head).count(), 3);
+    }
+
+    #[test]
+    fn test_parse_script_after_body_not_moved_into_head() {
+        let doc = parse("<html><head></head><body><p>a</p></body><script>x</script></html>");
+        assert_eq!(html_child_names(&doc), ["body", "script"]);
     }
 }

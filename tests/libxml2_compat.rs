@@ -22,8 +22,15 @@ use xmloxide::serial::serialize;
 use xmloxide::Document;
 
 /// Root directory containing the downloaded libxml2 test data.
+///
+/// Defaults to `tests/libxml2-compat/libxml2` (populated by the download
+/// script). Set `XMLOXIDE_LIBXML2_DIR` to a directory containing libxml2's
+/// `test/` and `result/` trees to run the suite against another release.
 fn libxml2_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/libxml2-compat/libxml2")
+    std::env::var_os("XMLOXIDE_LIBXML2_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/libxml2-compat/libxml2"),
+        PathBuf::from,
+    )
 }
 
 /// Returns true if the libxml2 test data has been downloaded.
