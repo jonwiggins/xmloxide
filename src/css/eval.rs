@@ -11,57 +11,9 @@ use super::types::{
 ///
 /// Returns all descendant nodes of `scope` that match any selector in the group.
 pub fn select(doc: &Document, scope: NodeId, group: &SelectorGroup) -> Vec<NodeId> {
-    // Fast path: if every selector in the group is a simple `#id` selector,
-    // use element_by_id for O(1) lookup instead of walking the tree.
-    if let Some(results) = try_fast_id_select(doc, scope, group) {
-        return results;
-    }
-
     let mut results = Vec::new();
     collect_descendants(doc, scope, group, &mut results);
     results
-}
-
-/// Attempts to use the fast `id_map` for pure `#id` selectors.
-/// Returns `None` if any selector is not a simple ID selector.
-fn try_fast_id_select(doc: &Document, scope: NodeId, group: &SelectorGroup) -> Option<Vec<NodeId>> {
-    let mut results = Vec::new();
-    for sel in &group.selectors {
-        // Must be a single compound with only an ID
-        if sel.compounds.len() != 1 {
-            return None;
-        }
-        let compound = &sel.compounds[0].compound;
-        let id = compound.id.as_ref()?;
-        if compound.tag.is_some()
-            || !compound.classes.is_empty()
-            || !compound.attrs.is_empty()
-            || !compound.pseudos.is_empty()
-        {
-            return None;
-        }
-
-        // Look up via id_map
-        if let Some(node) = doc.element_by_id(id) {
-            // Verify the node is a descendant of scope
-            if is_descendant_of(doc, node, scope) && !results.contains(&node) {
-                results.push(node);
-            }
-        }
-    }
-    Some(results)
-}
-
-/// Returns true if `node` is a descendant of `ancestor`.
-fn is_descendant_of(doc: &Document, node: NodeId, ancestor: NodeId) -> bool {
-    let mut current = doc.parent(node);
-    while let Some(id) = current {
-        if id == ancestor {
-            return true;
-        }
-        current = doc.parent(id);
-    }
-    false
 }
 
 /// Recursively collect matching descendants.
@@ -182,20 +134,14 @@ fn matches_compound(doc: &Document, node: NodeId, compound: &CompoundSelector) -
         }
     }
 
-    // ID — use element_by_id for O(1) lookup when the id_map is populated,
-    // falling back to attribute scan when it's not.
+    // ID — compare the element's own `id` attribute. `element_by_id` is not
+    // usable here: it returns a single element, but `#x` must match every
+    // element whose `id` is `x` (duplicate IDs are common in real-world
+    // HTML), and it also honours IDs declared on other attributes via the
+    // DTD, which CSS does not. See Selectors Level 4 §7.6.
     if let Some(ref id) = compound.id {
-        if let Some(target) = doc.element_by_id(id) {
-            if target != node {
-                return false;
-            }
-        } else {
-            // id_map doesn't have this ID — either the element doesn't exist
-            // or the id_map wasn't populated. Fall back to attribute scan.
-            let node_id_attr = doc.attribute(node, "id").unwrap_or("");
-            if node_id_attr != id {
-                return false;
-            }
+        if doc.attribute(node, "id") != Some(id.as_str()) {
+            return false;
         }
     }
 
@@ -963,8 +909,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_id_path_descendant_check() {
-        // The fast #id path should verify the node is a descendant of scope
+    fn test_id_scoped_to_descendants() {
+        // `#id` only matches descendants of the scope node
         let doc = test_doc();
         let root = doc.root_element().unwrap();
         // Get #sidebar, then search for #main from within it — should not find it
@@ -983,5 +929,45 @@ mod tests {
         assert_eq!(doc.text_content(result[0]), "One");
         assert_eq!(doc.text_content(result[1]), "Two");
         assert_eq!(doc.text_content(result[2]), "Three");
+    }
+
+    #[test]
+    fn test_id_duplicate_ids_all_match() {
+        // `#x` matches every element whose id is `x`, not just one.
+        let doc =
+            Document::parse_str(r#"<r><p id="x">1</p><q id="x">2</q><p id="y">3</p></r>"#).unwrap();
+        let root = doc.root_element().unwrap();
+        let texts = |css: &str| -> Vec<String> {
+            eval(&doc, root, css)
+                .into_iter()
+                .map(|n| doc.text_content(n))
+                .collect()
+        };
+        assert_eq!(texts("#x"), ["1", "2"]);
+        assert_eq!(texts("p#x"), ["1"]);
+        assert_eq!(texts("#x, #y"), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn test_id_duplicate_ids_html5() {
+        let doc = crate::html5::parse_html5("<p id=x>1</p><div id=x>2</div>").unwrap();
+        let root = doc.root();
+        assert_eq!(eval(&doc, root, "#x").len(), 2);
+        assert_eq!(eval(&doc, root, "div#x").len(), 1);
+    }
+
+    #[test]
+    fn test_id_ignores_dtd_declared_id_attribute() {
+        // A DTD can declare an ID-typed attribute with another name; CSS `#`
+        // still only matches the `id` attribute.
+        let mut doc = Document::parse_str(r#"<r><e code="foo"/></r>"#).unwrap();
+        let dtd = crate::validation::dtd::parse_dtd(
+            "<!ELEMENT r (e*)><!ELEMENT e EMPTY><!ATTLIST e code ID #IMPLIED>",
+        )
+        .unwrap();
+        let _ = crate::validation::dtd::validate(&mut doc, &dtd);
+        let root = doc.root_element().unwrap();
+        assert!(doc.element_by_id("foo").is_some());
+        assert_eq!(eval(&doc, root, "#foo"), [] as [NodeId; 0]);
     }
 }

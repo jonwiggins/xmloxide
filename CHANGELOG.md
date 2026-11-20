@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`element_by_id` index is built on demand** (#76). The XML and HTML
   parsers no longer copy every `id` attribute into the document's ID map
   while parsing (about a tenth of parse time on id-heavy documents).
-  Instead, `Document::element_by_id` (and so `XPath` `id()`, CSS `#id`, and
+  Instead, `Document::element_by_id` (and so `XPath` `id()` and
   `xmloxide_element_by_id`) checks IDs registered with `set_id` (e.g. by DTD
   validation) first, then an index of unprefixed `id` attributes built on
   the first lookup and discarded on any tree mutation. Behavior changes:
@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed by `parse_html5` and elements inside expanded entity content are
   now found by their `id` (previously they were not indexed). Duplicate
   `id`s still resolve to the last element in document order.
+
+### Fixed
+
+- **CSS `#id` matches every element with that id.** `select()` resolved
+  `#id` through `element_by_id`, which returns a single element, so with
+  duplicate ids (common in real-world HTML) only one element matched `#x`
+  or `div#x`. It also matched elements whose DTD-declared ID attribute had a
+  different name. `#id` now compares each element's own `id` attribute, per
+  Selectors Level 4.
 
 ## [0.5.1] - 2026-11-20
 
