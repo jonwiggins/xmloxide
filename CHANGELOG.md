@@ -24,6 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema/document pair that exceeds it is reported as invalid with a
   "work limit" error instead of running unbounded.
 
+### Added
+
+- **RELAX NG Compact Syntax** (#57). New
+  `validation::relaxng_compact::parse_relaxng_compact` parses `.rnc`
+  schemas (OASIS RELAX NG Compact Syntax, ISO/IEC 19757-2 Annex C) into the
+  same `RelaxNgSchema` the XML-syntax parser produces, by translating them
+  to XML syntax (`compact_to_xml`, also public) and reusing its
+  simplification and checks. Supports namespace / default namespace /
+  datatypes declarations, `start` and definitions with `=`, `|=`, `&=`,
+  `div`, all patterns and operators, name classes with `-` exceptions,
+  datatype values, parameters and exceptions, `~`-concatenated and
+  triple-quoted literals, `\x{...}` escapes, keyword escaping, and
+  annotations / `##` documentation (parsed and ignored). `include`,
+  `external`, nested `grammar`, and `parent` are rejected with a clear
+  error. Nesting depth is bounded, so hostile schemas yield an error rather
+  than a stack overflow. `xmllint --relaxng` accepts `.rnc` files, and the
+  C API gains `xmloxide_parse_relaxng_compact`.
+
 ### Changed
 
 - **`element_by_id` index is built on demand** (#76). The XML and HTML
@@ -55,6 +73,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `div#x`. It also matched elements whose DTD-declared ID attribute had a
   different name. `#id` now compares each element's own `id` attribute, per
   Selectors Level 4.
+
+- **RelaxNG: `<choice>` content after a name-class child was dropped.**
+  For an `<element>` or `<attribute>` without a `name` attribute, every
+  `<choice>` child was treated as part of the name class; only the first
+  child is the name class (RELAX NG §3).
+- **RelaxNG: long sequences no longer overflow the stack.** A `<group>` (or
+  implicit group) with tens of thousands of children built a left-leaning
+  pattern chain that crashed the recursive validator; groups are now folded
+  into a balanced tree like `choice` and `interleave`.
 
 ## [0.5.1] - 2026-11-20
 

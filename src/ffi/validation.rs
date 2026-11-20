@@ -7,6 +7,7 @@ use std::os::raw::c_char;
 use crate::tree::Document;
 use crate::validation::dtd::{self, Dtd};
 use crate::validation::relaxng::{self, RelaxNgSchema};
+use crate::validation::relaxng_compact;
 use crate::validation::schematron::{self, SchematronSchema};
 use crate::validation::xsd::{self, XsdSchema};
 use crate::validation::ValidationResult;
@@ -111,6 +112,42 @@ pub unsafe extern "C" fn xmloxide_parse_relaxng(input: *const c_char) -> *mut Re
         return std::ptr::null_mut();
     };
     match relaxng::parse_relaxng(s) {
+        Ok(schema) => Box::into_raw(Box::new(schema)),
+        Err(e) => {
+            set_last_error(&e.message);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Parses a `RelaxNG` schema written in the compact syntax (`.rnc`) from a
+/// null-terminated UTF-8 string.
+///
+/// Returns a pointer to the schema on success, or null on failure (see
+/// `xmloxide_last_error`). The returned schema is the same type as from
+/// [`xmloxide_parse_relaxng`] and must be freed with
+/// [`xmloxide_free_relaxng`].
+///
+/// # Safety
+///
+/// `input` must be a valid null-terminated UTF-8 string containing a
+/// compact-syntax `RelaxNG` schema.
+#[no_mangle]
+pub unsafe extern "C" fn xmloxide_parse_relaxng_compact(
+    input: *const c_char,
+) -> *mut RelaxNgSchema {
+    clear_last_error();
+    if input.is_null() {
+        set_last_error("null input pointer");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: Null check above. Caller guarantees valid null-terminated string.
+    let c_str = unsafe { CStr::from_ptr(input) };
+    let Ok(s) = c_str.to_str() else {
+        set_last_error("invalid UTF-8");
+        return std::ptr::null_mut();
+    };
+    match relaxng_compact::parse_relaxng_compact(s) {
         Ok(schema) => Box::into_raw(Box::new(schema)),
         Err(e) => {
             set_last_error(&e.message);

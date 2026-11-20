@@ -8,6 +8,9 @@ fuzz_target!(|data: &[u8]| {
         // Fuzz DTD parsing directly — should never panic
         let _ = parse_dtd(s);
 
+        // Fuzz the RelaxNG compact-syntax front end — should never panic
+        let _ = xmloxide::validation::relaxng_compact::parse_relaxng_compact(s);
+
         // Parse as XML (recovery mode) then validate against any internal DTD
         let opts = ParseOptions::default().recover(true);
         if let Ok(mut doc) = parse_str_with_options(s, &opts) {

@@ -21,7 +21,7 @@ libxml2 became officially unmaintained in December 2025 with known security issu
 - **HTML5 streaming** — SAX-like callback API for HTML5 (`html5::sax`) that wraps the tokenizer without building a DOM tree
 - **CSS selectors** — query elements with familiar CSS syntax (`css::select`) including combinators, pseudo-classes, and fast `#id` lookup
 - **XPath 1.0+** — full expression parser and evaluator with all XPath 1.0 core functions plus key XPath 2.0 functions (`matches()`, `replace()`, `tokenize()`, `upper-case()`, `lower-case()`, `abs()`, `min()`, `max()`, and more)
-- **Validation** — DTD, RelaxNG, XML Schema (XSD), and ISO Schematron (ISO/IEC 19757-3) validation
+- **Validation** — DTD, RelaxNG (XML and compact syntax), XML Schema (XSD), and ISO Schematron (ISO/IEC 19757-3) validation
 - **Serde integration** — optional `serde` feature for XML (de)serialization to/from Rust types
 - **Async parsing** — optional `async` feature for parsing from `tokio::io::AsyncRead` sources
 - **Canonical XML** — C14N 1.0 and Exclusive C14N serialization
@@ -171,6 +171,7 @@ xmllint --format document.xml
 # Validate against a schema
 xmllint --schema schema.xsd document.xml
 xmllint --relaxng schema.rng document.xml
+xmllint --relaxng schema.rnc document.xml   # compact syntax, by extension
 xmllint --schematron schema.sch document.xml
 xmllint --dtdvalid schema.dtd document.xml
 
@@ -201,6 +202,7 @@ xmllint --html page.html
 | `xpath` | XPath 1.0+ expression parser and evaluator |
 | `validation::dtd` | DTD parsing and validation |
 | `validation::relaxng` | RelaxNG schema validation |
+| `validation::relaxng_compact` | RelaxNG Compact Syntax (`.rnc`) front end |
 | `validation::xsd` | XML Schema (XSD) validation |
 | `validation::schematron` | ISO Schematron rule-based validation |
 | `serde_xml` | Serde XML (de)serialization (optional `serde` feature) |
