@@ -440,12 +440,12 @@ impl<'a> XmlParser<'a> {
 
         // --- Apply DTD ATTLIST default attributes (#FIXED and #DEFAULT) ---
         // Per XML 1.0 §3.3.2, when an attribute declared in an ATTLIST is not
-        // present on the element, the parser must add it with the declared
+        // present on the element, the processor reports it with the declared
         // default value. This applies to both `#FIXED "v"` and bare `"v"`
-        // (so-called #DEFAULT) declarations. libxml2 applies both during
-        // normal parsing — verifiable via `xmllint --c14n` on a document
-        // with an ATTLIST default, which emits the default attribute in the
-        // canonical form.
+        // (so-called #DEFAULT) declarations. Inserting them is controlled by
+        // `ParseOptions::dtd_attributes` (libxml2's XML_PARSE_DTDATTR);
+        // namespace-declaration defaults are always inserted, as libxml2
+        // does, because namespace processing depends on them.
         // Namespace declarations (xmlns, xmlns:prefix) are inserted before
         // other attributes to match libxml2's attribute ordering.
         if let Some(defaults) = if self.attr_defaults.is_empty() {
@@ -455,12 +455,10 @@ impl<'a> XmlParser<'a> {
         } {
             let mut insert_pos = 0; // insertion point for namespace declarations
             for attr_decl in &defaults {
-                let (default_value, is_fixed) = match &attr_decl.default {
-                    crate::validation::dtd::AttributeDefault::Fixed(v) => (Some(v.clone()), true),
-                    crate::validation::dtd::AttributeDefault::Default(v) => {
-                        (Some(v.clone()), false)
-                    }
-                    _ => (None, false),
+                let default_value = match &attr_decl.default {
+                    crate::validation::dtd::AttributeDefault::Fixed(v)
+                    | crate::validation::dtd::AttributeDefault::Default(v) => Some(v),
+                    _ => None,
                 };
                 if let Some(value) = default_value {
                     // Check if the attribute is already present by comparing
@@ -472,24 +470,21 @@ impl<'a> XmlParser<'a> {
                         .any(|a| a.name == decl_local && a.prefix.as_deref() == decl_pfx);
                     if !already_present {
                         // Track expansion for amplification factor check
-                        // (both #FIXED and #DEFAULT contribute to expansion).
+                        // (both #FIXED and #DEFAULT contribute to expansion,
+                        // whether or not they are inserted).
                         self.expansion_size += attr_name.len() + value.len();
 
-                        // Insert both #FIXED and #DEFAULT defaults into the
-                        // tree. The `is_fixed` flag is no longer used to gate
-                        // insertion; it would only matter if we additionally
-                        // validated source attributes against #FIXED values,
-                        // which is a separate validation step.
-                        let _ = is_fixed;
-                        let (decl_prefix, decl_local) = split_name(attr_name);
+                        let is_ns_decl = attr_name == "xmlns" || attr_name.starts_with("xmlns:");
+                        if !is_ns_decl && !self.options.dtd_attributes {
+                            continue;
+                        }
                         let attr = Attribute {
                             name: decl_local.to_string(),
-                            value,
-                            prefix: decl_prefix.map(String::from),
+                            value: value.clone(),
+                            prefix: decl_pfx.map(String::from),
                             namespace: None,
                             raw_value: None,
                         };
-                        let is_ns_decl = attr_name == "xmlns" || attr_name.starts_with("xmlns:");
                         if is_ns_decl {
                             attributes.insert(insert_pos, attr);
                             insert_pos += 1;
@@ -2267,5 +2262,109 @@ mod tests {
             .unwrap();
         let root = doc.root_element().unwrap();
         assert_eq!(doc.attribute(root, "b"), Some("x y"));
+    }
+
+    // -- ParseOptions::dtd_attributes (libxml2 XML_PARSE_DTDATTR) ---------
+
+    const DTD_DEFAULTS_DOC: &str = "<!DOCTYPE p:doc [\
+         <!ATTLIST p:doc \
+           plain CDATA 'd' \
+           fixed CDATA #FIXED 'f' \
+           xmlns:p CDATA #FIXED 'urn:p' \
+           p:pre CDATA 'pv' \
+           given CDATA 'default'>\
+         ]><p:doc given='source'/>";
+
+    fn parse_dtd_attrs(input: &str, dtd_attributes: bool) -> Document {
+        let opts = ParseOptions::default().dtd_attributes(dtd_attributes);
+        Document::parse_str_with_options(input, &opts)
+            .unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    fn attr_names(doc: &Document) -> Vec<String> {
+        let root = doc.root_element().unwrap();
+        doc.attributes(root)
+            .iter()
+            .map(|a| match &a.prefix {
+                Some(p) => format!("{p}:{}", a.name),
+                None => a.name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_options_dtd_attributes_defaults_to_true() {
+        assert!(ParseOptions::default().dtd_attributes);
+    }
+
+    #[test]
+    fn test_parse_dtd_attributes_enabled_inserts_all_defaults() {
+        let doc = parse_dtd_attrs(DTD_DEFAULTS_DOC, true);
+        let root = doc.root_element().unwrap();
+        assert_eq!(
+            attr_names(&doc),
+            ["xmlns:p", "given", "plain", "fixed", "p:pre"]
+        );
+        assert_eq!(doc.attribute(root, "plain"), Some("d"));
+        assert_eq!(doc.attribute(root, "fixed"), Some("f"));
+        assert_eq!(doc.attribute(root, "given"), Some("source"));
+        assert_eq!(doc.node_namespace(root), Some("urn:p"));
+        let pre = doc
+            .attributes(root)
+            .iter()
+            .find(|a| a.name == "pre")
+            .unwrap();
+        assert_eq!(pre.value, "pv");
+        assert_eq!(pre.namespace.as_deref(), Some("urn:p"));
+    }
+
+    #[test]
+    fn test_parse_dtd_attributes_disabled_inserts_only_ns_defaults() {
+        let doc = parse_dtd_attrs(DTD_DEFAULTS_DOC, false);
+        let root = doc.root_element().unwrap();
+        assert_eq!(attr_names(&doc), ["xmlns:p", "given"]);
+        assert_eq!(doc.attribute(root, "plain"), None);
+        assert_eq!(doc.attribute(root, "fixed"), None);
+        assert_eq!(doc.attribute(root, "given"), Some("source"));
+        // The defaulted namespace declaration still binds the prefix.
+        assert_eq!(doc.node_namespace(root), Some("urn:p"));
+    }
+
+    #[test]
+    fn test_parse_dtd_attributes_disabled_default_xmlns() {
+        let doc = parse_dtd_attrs(
+            "<!DOCTYPE doc [<!ATTLIST doc xmlns CDATA #FIXED 'urn:d' a CDATA 'x'>]><doc/>",
+            false,
+        );
+        let root = doc.root_element().unwrap();
+        assert_eq!(attr_names(&doc), ["xmlns"]);
+        assert_eq!(doc.node_namespace(root), Some("urn:d"));
+    }
+
+    #[test]
+    fn test_parse_dtd_attributes_disabled_roundtrip_preserves_source() {
+        let input = "<!DOCTYPE doc [<!ATTLIST doc a CDATA 'x' b CDATA #FIXED 'y'>]>\
+                     <doc b='y'/>";
+        let doc = parse_dtd_attrs(input, false);
+        assert_eq!(attr_names(&doc), ["b"]);
+        let reparsed = parse_dtd_attrs(&crate::serial::serialize(&doc), false);
+        assert_eq!(attr_names(&reparsed), ["b"]);
+    }
+
+    #[test]
+    fn test_parse_dtd_attributes_c14n_includes_defaults() {
+        use crate::serial::c14n::{canonicalize, C14nOptions};
+        let input = "<!DOCTYPE doc [<!ATTLIST doc b CDATA 'v' c CDATA #FIXED 'w'>]>\
+                     <doc a='1'/>";
+        let doc = parse(input);
+        assert_eq!(
+            canonicalize(&doc, &C14nOptions::default()),
+            r#"<doc a="1" b="v" c="w"></doc>"#
+        );
+        let doc = parse_dtd_attrs(input, false);
+        assert_eq!(
+            canonicalize(&doc, &C14nOptions::default()),
+            r#"<doc a="1"></doc>"#
+        );
     }
 }

@@ -365,6 +365,19 @@ mod tests {
     }
 
     #[test]
+    fn test_push_parser_with_options_dtd_attributes() {
+        let xml = b"<!DOCTYPE r [<!ATTLIST r a CDATA 'x'>]><r/>";
+        for (enabled, expected) in [(true, Some("x")), (false, None)] {
+            let opts = ParseOptions::default().dtd_attributes(enabled);
+            let mut parser = PushParser::with_options(opts);
+            parser.push(xml);
+            let doc = parser.finish().unwrap();
+            let root = doc.root_element().unwrap();
+            assert_eq!(doc.attribute(root, "a"), expected);
+        }
+    }
+
+    #[test]
     fn test_push_parser_error_malformed() {
         let mut parser = PushParser::new();
         parser.push(b"<a></b>");

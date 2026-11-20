@@ -55,6 +55,14 @@ struct Cli {
     #[arg(long)]
     noblanks: bool,
 
+    /// Insert attributes defaulted by the DTD into the tree.
+    ///
+    /// As in libxml2's xmllint, DTD-defaulted attributes (other than
+    /// namespace declarations) are left out of the tree unless this flag,
+    /// `--c14n`, or `--exc-c14n` is given.
+    #[arg(long)]
+    dtdattr: bool,
+
     /// Do not output the result tree.
     #[arg(long)]
     noout: bool,
@@ -279,9 +287,14 @@ fn read_input(filename: &str) -> io::Result<String> {
 
 /// Parses input as XML with the configured options.
 fn parse_as_xml(cli: &Cli, input: &str) -> Result<Document, String> {
+    // libxml2's xmllint parses without XML_PARSE_DTDATTR unless --dtdattr
+    // is given; the C14N output modes turn it on because canonical XML
+    // includes defaulted attributes.
+    let dtd_attributes = cli.dtdattr || cli.c14n || cli.exc_c14n;
     let opts = ParseOptions::default()
         .recover(cli.recover)
-        .no_blanks(cli.noblanks);
+        .no_blanks(cli.noblanks)
+        .dtd_attributes(dtd_attributes);
     parser::parse_str_with_options(input, &opts).map_err(|e| e.to_string())
 }
 
