@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **RelaxNG: validation no longer takes exponential time.** The validator
+  matched child sequences by backtracking: it tried every split point for
+  each `group`/`zeroOrMore`/`oneOrMore` (re-validating whole subtrees at
+  each attempt) and every one of the 2^n ways to divide an element's n
+  children between the operands of an `interleave`. A small schema and
+  document could therefore keep validation running effectively forever —
+  libxml2's own `comps` test (a 3.7 KB schema, 622 KB document) did not
+  finish in 20 s — so validating untrusted documents, even against a
+  trusted schema, was a denial-of-service risk. Validation now uses James
+  Clark's derivative algorithm over hash-consed, memoized patterns and
+  runs in roughly linear time (`comps` validates in ~15 ms). It also runs
+  under a work budget proportional to the document size; a
+  schema/document pair that exceeds it is reported as invalid with a
+  "work limit" error instead of running unbounded.
+
 ### Changed
 
 - **`element_by_id` index is built on demand** (#76). The XML and HTML
@@ -23,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `id`s still resolve to the last element in document order.
 
 ### Fixed
+
+- **RelaxNG: wrong verdicts from the old matcher.** The derivative-based
+  validator also fixes attributes inside `<choice>` (alternative attribute
+  sets were reported as unexpected — e.g. libvirt's `<graphics
+  type="vnc">`), `interleave` with more than 20 children (which fell back
+  to an incorrect greedy split), and several other mis-validations. On
+  libxml2's `test/relaxng` corpus, verdicts matching libxml2 go from 123 to
+  140 of 158 instances, with no regressions.
 
 - **CSS `#id` matches every element with that id.** `select()` resolved
   `#id` through `element_by_id`, which returns a single element, so with

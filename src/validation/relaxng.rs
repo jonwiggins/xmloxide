@@ -14,7 +14,8 @@
 //! 2. **Schema parser** ([`parse_relaxng`]) — reads a `RelaxNG` XML schema
 //!    document and produces a `RelaxNgSchema`.
 //! 3. **Validator** ([`validate`]) — checks an XML document tree against a
-//!    compiled schema using a recursive pattern-matching approach.
+//!    compiled schema using James Clark's derivative algorithm, which
+//!    runs in roughly linear time and under a work budget (see [`validate`]).
 //!
 //! # Examples
 //!
@@ -1112,12 +1113,55 @@ fn fold_balanced(
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+//
+// The validator implements James Clark's derivative algorithm
+// (<https://relaxng.org/jclark/derivative.html>). Instead of searching for a
+// way to split an element's children between the parts of a pattern (which
+// backtracks, and is exponential for `interleave`), it walks the document
+// once and computes, for each start tag, attribute, text node and end tag,
+// the *derivative* of the current pattern: the pattern that the rest of the
+// input must match. The input is valid when the final pattern is nullable
+// (matches the empty sequence).
+//
+// Patterns are compiled into an arena of hash-consed nodes, so structurally
+// equal patterns share one `PatId`, choices are normalized to sorted sets,
+// and derivatives are memoized per `PatId`. This keeps the number of distinct
+// patterns small and the work per input event roughly constant. Because
+// `interleave` can still produce a number of states exponential in the
+// schema size in contrived cases, every validation also runs under a work
+// budget proportional to the document size (see `BASE_VALIDATION_STEPS`):
+// once it is exhausted, validation stops with an error instead of running
+// unbounded.
+
+/// Work budget, in derivative steps, available to every [`validate`] call
+/// regardless of document size.
+///
+/// A step is one memo-missing derivative computation or one newly interned
+/// pattern, so the budget bounds both time and memory. Together with
+/// [`VALIDATION_STEPS_PER_NODE`] it caps validation at work linear in the
+/// document size, so a hostile document (or schema) cannot make validation
+/// run unbounded; real-world schemas and documents use a small fraction of
+/// it.
+const BASE_VALIDATION_STEPS: u64 = 1_000_000;
+
+/// Additional work budget, in derivative steps, granted per element,
+/// attribute and text node of the validated document.
+const VALIDATION_STEPS_PER_NODE: u64 = 1_000;
+
+/// Maximum number of validation errors reported by one [`validate`] call.
+const MAX_VALIDATION_ERRORS: usize = 100;
 
 /// Validates an XML document against a compiled [`RelaxNgSchema`].
 ///
 /// The validator checks that the document's root element matches the
 /// schema's start pattern, recursively verifying element names, attributes,
 /// text content, and structural constraints.
+///
+/// Validation uses the derivative algorithm, which runs in time roughly
+/// linear in the document size. It is additionally bounded by a work budget
+/// proportional to the document size; a schema/document pair that exceeds it
+/// is reported as invalid with a "work limit" error rather than validating
+/// unbounded.
 ///
 /// # Examples
 ///
@@ -1137,793 +1181,1080 @@ fn fold_balanced(
 /// ```
 #[must_use]
 pub fn validate(doc: &Document, schema: &RelaxNgSchema) -> ValidationResult {
-    let mut errors = Vec::new();
+    let nodes = doc.root_element().map_or(0, |root| {
+        doc.descendants(root)
+            .map(|id| match &doc.node(id).kind {
+                NodeKind::Element { attributes, .. } => 1 + attributes.len(),
+                _ => 1,
+            })
+            .sum::<usize>()
+    });
+    let per_node = u64::try_from(nodes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(VALIDATION_STEPS_PER_NODE);
+    validate_with_budget(doc, schema, BASE_VALIDATION_STEPS.saturating_add(per_node))
+}
 
+/// Validates `doc` against `schema` with an explicit work budget.
+fn validate_with_budget(doc: &Document, schema: &RelaxNgSchema, budget: u64) -> ValidationResult {
     let Some(root_el) = doc.root_element() else {
         return ValidationResult {
             is_valid: false,
-            errors: vec![ValidationError {
-                message: "document has no root element".to_string(),
-                line: None,
-                column: None,
-            }],
+            errors: vec![validation_error("document has no root element".to_string())],
             warnings: Vec::new(),
         };
     };
 
-    let ctx = ValidationContext {
-        doc,
-        defines: &schema.defines,
-    };
+    let mut v = Validator::new(doc, &schema.defines, budget);
+    let start = v.compile(&schema.start, 0);
+    let rest = v.element_deriv(start, root_el);
+    let ok = !v.exhausted && v.errors.is_empty() && v.nullable(rest);
 
-    let ok = ctx.validate_node(root_el, &schema.start, &mut errors);
+    let mut errors = std::mem::take(&mut v.errors);
+    if v.exhausted {
+        errors.push(validation_error(format!(
+            "RelaxNG validation aborted: exceeded the work limit of {budget} steps"
+        )));
+    } else if !ok && errors.is_empty() {
+        errors.push(validation_error(
+            "document does not match the schema's start pattern".to_string(),
+        ));
+    }
+    if !ok {
+        errors.extend(
+            std::mem::take(&mut v.undefined_refs)
+                .into_iter()
+                .map(|name| validation_error(format!("undefined reference: {name}"))),
+        );
+    }
 
     ValidationResult {
-        is_valid: ok && errors.is_empty(),
+        is_valid: ok,
         errors,
         warnings: Vec::new(),
     }
 }
 
-/// Internal validation context — carries references to the document and schema.
-struct ValidationContext<'a> {
-    doc: &'a Document,
-    defines: &'a HashMap<String, Pattern>,
+/// Builds a [`ValidationError`] without location information.
+fn validation_error(message: String) -> ValidationError {
+    ValidationError {
+        message,
+        line: None,
+        column: None,
+    }
 }
 
-impl ValidationContext<'_> {
-    /// Validates a node against a pattern. Returns `true` if the node matches.
-    fn validate_node(
-        &self,
-        node: NodeId,
-        pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        match pattern {
-            Pattern::Element {
-                name,
-                pattern: inner,
-            } => self.validate_element(node, name, inner, errors),
-            Pattern::Choice(a, b) => {
-                // Try the first alternative silently; if it fails, try the second.
-                let mut a_errors = Vec::new();
-                if self.validate_node(node, a, &mut a_errors) {
-                    return true;
+/// Index of an interned pattern in the [`Validator`] arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PatId(u32);
+
+/// The interned `empty` pattern.
+const EMPTY: PatId = PatId(0);
+/// The interned `notAllowed` pattern.
+const NOT_ALLOWED: PatId = PatId(1);
+/// The interned `text` pattern.
+const TEXT: PatId = PatId(2);
+
+/// A hash-consed pattern node, in the normal form used by the derivative
+/// algorithm. `optional`, `zeroOrMore`, `mixed` and `ref` are compiled
+/// away; `After` is the algorithm's internal "match the first pattern, then
+/// continue with the second after the end tag" pattern.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PatNode {
+    Empty,
+    NotAllowed,
+    Text,
+    /// A sorted, deduplicated set of at least two alternatives, none of
+    /// which is itself a choice or `notAllowed`.
+    Choice(Box<[PatId]>),
+    Group(PatId, PatId),
+    Interleave(PatId, PatId),
+    OneOrMore(PatId),
+    List(PatId),
+    /// An expected value (see `Validator::value_equals`).
+    Value(Box<str>),
+    Data(Box<str>),
+    /// Attribute name class index and value pattern.
+    Attribute(u32, PatId),
+    /// Element name class index and content slot index; the content is
+    /// compiled lazily, which is what lets element patterns be recursive.
+    Element(u32, u32),
+    After(PatId, PatId),
+}
+
+/// Properties of an interned pattern, computed bottom-up when it is interned.
+#[derive(Debug, Clone, Copy)]
+struct PatInfo {
+    /// The pattern matches the empty sequence.
+    nullable: bool,
+    /// The pattern's text derivative depends on the text (it contains a
+    /// `value`, `data` or `list` reachable without entering an element).
+    text_sensitive: bool,
+    /// The pattern contains an attribute pattern reachable without
+    /// entering an element.
+    has_attr: bool,
+}
+
+/// The pattern applied by `apply_after` to the continuation of every
+/// `After` in a start-tag derivative (the `f` of Clark's `applyAfter`).
+#[derive(Debug, Clone, Copy)]
+enum AfterOp {
+    /// `\p -> interleave(p, x)`.
+    InterleaveWith(PatId),
+    /// `\p -> interleave(x, p)`.
+    InterleaveAfter(PatId),
+    /// `\p -> group(p, x)`.
+    GroupWith(PatId),
+    /// `\p -> after(p, x)`.
+    AfterWith(PatId),
+}
+
+/// A significant child of an element, with adjacent text coalesced.
+enum ChildItem<'a> {
+    Element(NodeId),
+    Text(std::borrow::Cow<'a, str>),
+}
+
+/// Derivative-based `RelaxNG` validator state for one [`validate`] call.
+struct Validator<'a> {
+    doc: &'a Document,
+    defines: &'a HashMap<String, Pattern>,
+
+    nodes: Vec<PatNode>,
+    info: Vec<PatInfo>,
+    interned: HashMap<PatNode, PatId>,
+
+    name_classes: Vec<&'a NameClass>,
+    name_class_ids: HashMap<*const NameClass, u32>,
+    /// Lazily compiled element contents: source pattern and compiled id.
+    slots: Vec<(&'a Pattern, Option<PatId>)>,
+    slot_ids: HashMap<*const Pattern, u32>,
+    /// Compiled defines; `None` while a define is being compiled.
+    compiled_defines: HashMap<&'a str, Option<PatId>>,
+    undefined_refs: Vec<&'a str>,
+
+    /// Interned `(namespace, local name)` pairs of document names.
+    qnames: HashMap<(&'a str, &'a str), u32>,
+    start_tag_memo: HashMap<(PatId, u32), PatId>,
+    start_tag_close_memo: HashMap<(PatId, bool), PatId>,
+    end_tag_memo: HashMap<(PatId, bool), PatId>,
+    /// Text derivatives of patterns that are not `text_sensitive`.
+    text_memo: HashMap<PatId, PatId>,
+
+    /// Set while matching an attribute value (see `value_equals`).
+    in_attribute_value: bool,
+
+    steps_left: u64,
+    exhausted: bool,
+    errors: Vec<ValidationError>,
+}
+
+impl<'a> Validator<'a> {
+    fn new(doc: &'a Document, defines: &'a HashMap<String, Pattern>, budget: u64) -> Self {
+        let mut v = Self {
+            doc,
+            defines,
+            nodes: Vec::new(),
+            info: Vec::new(),
+            interned: HashMap::new(),
+            name_classes: Vec::new(),
+            name_class_ids: HashMap::new(),
+            slots: Vec::new(),
+            slot_ids: HashMap::new(),
+            compiled_defines: HashMap::new(),
+            undefined_refs: Vec::new(),
+            qnames: HashMap::new(),
+            start_tag_memo: HashMap::new(),
+            start_tag_close_memo: HashMap::new(),
+            end_tag_memo: HashMap::new(),
+            text_memo: HashMap::new(),
+            in_attribute_value: false,
+            steps_left: budget,
+            exhausted: false,
+            errors: Vec::new(),
+        };
+        // Pre-intern the constants in `PatId` order.
+        for node in [PatNode::Empty, PatNode::NotAllowed, PatNode::Text] {
+            v.steps_left += 1;
+            v.intern(node);
+        }
+        v
+    }
+
+    // --- Budget and error bookkeeping ---
+
+    /// Consumes one unit of the work budget. Returns `false` (and marks the
+    /// validation as exhausted) when the budget is used up.
+    fn step(&mut self) -> bool {
+        if self.steps_left == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.steps_left -= 1;
+        true
+    }
+
+    fn error(&mut self, message: String) {
+        if self.errors.len() < MAX_VALIDATION_ERRORS {
+            self.errors.push(validation_error(message));
+        }
+    }
+
+    // --- Interning and smart constructors ---
+
+    fn node(&self, p: PatId) -> &PatNode {
+        &self.nodes[p.0 as usize]
+    }
+
+    fn nullable(&self, p: PatId) -> bool {
+        self.info[p.0 as usize].nullable
+    }
+
+    fn intern(&mut self, node: PatNode) -> PatId {
+        if let Some(&id) = self.interned.get(&node) {
+            return id;
+        }
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        let info_of = |v: &Self, p: PatId| v.info[p.0 as usize];
+        let info = match &node {
+            PatNode::Empty | PatNode::Text => PatInfo {
+                nullable: true,
+                text_sensitive: false,
+                has_attr: false,
+            },
+            PatNode::NotAllowed | PatNode::Element(..) => PatInfo {
+                nullable: false,
+                text_sensitive: false,
+                has_attr: false,
+            },
+            PatNode::Value(_) | PatNode::Data(_) | PatNode::List(_) => PatInfo {
+                nullable: false,
+                text_sensitive: true,
+                has_attr: false,
+            },
+            PatNode::Attribute(..) => PatInfo {
+                nullable: false,
+                text_sensitive: false,
+                has_attr: true,
+            },
+            PatNode::Choice(items) => items.iter().fold(info_of(self, NOT_ALLOWED), |acc, &p| {
+                let i = info_of(self, p);
+                PatInfo {
+                    nullable: acc.nullable || i.nullable,
+                    text_sensitive: acc.text_sensitive || i.text_sensitive,
+                    has_attr: acc.has_attr || i.has_attr,
                 }
-                let mut b_errors = Vec::new();
-                if self.validate_node(node, b, &mut b_errors) {
-                    return true;
+            }),
+            PatNode::Group(a, b) | PatNode::Interleave(a, b) => {
+                let (a, b) = (info_of(self, *a), info_of(self, *b));
+                PatInfo {
+                    nullable: a.nullable && b.nullable,
+                    text_sensitive: a.text_sensitive || b.text_sensitive,
+                    has_attr: a.has_attr || b.has_attr,
                 }
-                // Both failed — report the second branch errors (usually more
-                // informative for the "expected" case).
-                errors.extend(b_errors);
-                false
             }
-            Pattern::Ref(ref_name) => {
-                if let Some(def) = self.defines.get(ref_name) {
-                    self.validate_node(node, def, errors)
+            PatNode::OneOrMore(p) => info_of(self, *p),
+            // Derivatives never look into the continuation of an `After`.
+            PatNode::After(a, _) => PatInfo {
+                nullable: false,
+                ..info_of(self, *a)
+            },
+        };
+        let id = PatId(u32::try_from(self.nodes.len()).unwrap_or(u32::MAX));
+        self.nodes.push(node.clone());
+        self.info.push(info);
+        self.interned.insert(node, id);
+        id
+    }
+
+    fn choice(&mut self, a: PatId, b: PatId) -> PatId {
+        if a == NOT_ALLOWED || a == b {
+            return b;
+        }
+        if b == NOT_ALLOWED {
+            return a;
+        }
+        self.choice_of(vec![a, b])
+    }
+
+    /// Builds the choice of all `items`, flattening nested choices and
+    /// dropping duplicates and `notAllowed`.
+    fn choice_of(&mut self, items: Vec<PatId>) -> PatId {
+        let mut flat = Vec::with_capacity(items.len());
+        for p in items {
+            match self.node(p) {
+                PatNode::NotAllowed => {}
+                PatNode::Choice(inner) => flat.extend_from_slice(inner),
+                _ => flat.push(p),
+            }
+        }
+        flat.sort_unstable();
+        flat.dedup();
+        match flat.len() {
+            0 => NOT_ALLOWED,
+            1 => flat[0],
+            _ => self.intern(PatNode::Choice(flat.into_boxed_slice())),
+        }
+    }
+
+    fn group(&mut self, a: PatId, b: PatId) -> PatId {
+        if a == NOT_ALLOWED || b == NOT_ALLOWED {
+            NOT_ALLOWED
+        } else if a == EMPTY {
+            b
+        } else if b == EMPTY {
+            a
+        } else {
+            self.intern(PatNode::Group(a, b))
+        }
+    }
+
+    fn interleave(&mut self, a: PatId, b: PatId) -> PatId {
+        if a == NOT_ALLOWED || b == NOT_ALLOWED {
+            NOT_ALLOWED
+        } else if a == EMPTY {
+            b
+        } else if b == EMPTY {
+            a
+        } else {
+            self.intern(PatNode::Interleave(a, b))
+        }
+    }
+
+    fn after(&mut self, a: PatId, b: PatId) -> PatId {
+        if a == NOT_ALLOWED || b == NOT_ALLOWED {
+            NOT_ALLOWED
+        } else {
+            self.intern(PatNode::After(a, b))
+        }
+    }
+
+    fn one_or_more(&mut self, p: PatId) -> PatId {
+        if p == NOT_ALLOWED || p == EMPTY {
+            p
+        } else {
+            self.intern(PatNode::OneOrMore(p))
+        }
+    }
+
+    // --- Compilation of schema patterns ---
+
+    /// Compiles a schema pattern into the arena. `ref_depth` counts the
+    /// `Ref`s being expanded; it guards hand-built schemas, which bypass the
+    /// parser's §4.19 recursion checks.
+    fn compile(&mut self, pattern: &'a Pattern, ref_depth: usize) -> PatId {
+        match pattern {
+            Pattern::Empty => EMPTY,
+            Pattern::NotAllowed => NOT_ALLOWED,
+            Pattern::Text => TEXT,
+            Pattern::Element { name, pattern } => {
+                let nc = self.name_class_id(name);
+                let key: *const Pattern = &**pattern;
+                let slot = if let Some(&slot) = self.slot_ids.get(&key) {
+                    slot
                 } else {
-                    errors.push(ValidationError {
-                        message: format!("undefined reference: {ref_name}"),
-                        line: None,
-                        column: None,
-                    });
-                    false
+                    let slot = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+                    self.slots.push((&**pattern, None));
+                    self.slot_ids.insert(key, slot);
+                    slot
+                };
+                self.intern(PatNode::Element(nc, slot))
+            }
+            Pattern::Attribute { name, pattern } => {
+                let nc = self.name_class_id(name);
+                let value = self.compile(pattern, ref_depth);
+                self.intern(PatNode::Attribute(nc, value))
+            }
+            Pattern::Group(a, b) => {
+                let (a, b) = (self.compile(a, ref_depth), self.compile(b, ref_depth));
+                self.group(a, b)
+            }
+            Pattern::Interleave(a, b) => {
+                let (a, b) = (self.compile(a, ref_depth), self.compile(b, ref_depth));
+                self.interleave(a, b)
+            }
+            Pattern::Choice(a, b) => {
+                let (a, b) = (self.compile(a, ref_depth), self.compile(b, ref_depth));
+                self.choice(a, b)
+            }
+            Pattern::Optional(p) => {
+                let p = self.compile(p, ref_depth);
+                self.choice(p, EMPTY)
+            }
+            Pattern::ZeroOrMore(p) => {
+                let p = self.compile(p, ref_depth);
+                let p = self.one_or_more(p);
+                self.choice(p, EMPTY)
+            }
+            Pattern::OneOrMore(p) => {
+                let p = self.compile(p, ref_depth);
+                self.one_or_more(p)
+            }
+            Pattern::Mixed(p) => {
+                let p = self.compile(p, ref_depth);
+                self.interleave(TEXT, p)
+            }
+            Pattern::List(p) => {
+                let p = self.compile(p, ref_depth);
+                if p == NOT_ALLOWED {
+                    NOT_ALLOWED
+                } else {
+                    self.intern(PatNode::List(p))
+                }
+            }
+            Pattern::Value(v) => self.intern(PatNode::Value(v.as_str().into())),
+            Pattern::Data { datatype, .. } => self.intern(PatNode::Data(datatype.as_str().into())),
+            Pattern::Ref(name) => self.compile_ref(name, ref_depth),
+        }
+    }
+
+    fn compile_ref(&mut self, name: &'a str, ref_depth: usize) -> PatId {
+        match self.compiled_defines.get(name) {
+            Some(Some(id)) => return *id,
+            // A reference cycle that does not pass through an element.
+            Some(None) => return NOT_ALLOWED,
+            None => {}
+        }
+        let Some((key, def)) = self.defines.get_key_value(name) else {
+            if !self.undefined_refs.contains(&name) {
+                self.undefined_refs.push(name);
+            }
+            return NOT_ALLOWED;
+        };
+        if ref_depth >= MAX_REF_CHAIN_DEPTH {
+            return NOT_ALLOWED;
+        }
+        self.compiled_defines.insert(key, None);
+        let id = self.compile(def, ref_depth + 1);
+        self.compiled_defines.insert(key, Some(id));
+        id
+    }
+
+    fn name_class_id(&mut self, nc: &'a NameClass) -> u32 {
+        let key: *const NameClass = nc;
+        if let Some(&id) = self.name_class_ids.get(&key) {
+            return id;
+        }
+        let id = u32::try_from(self.name_classes.len()).unwrap_or(u32::MAX);
+        self.name_classes.push(nc);
+        self.name_class_ids.insert(key, id);
+        id
+    }
+
+    /// Returns the compiled content pattern of an element slot.
+    fn element_content(&mut self, slot: u32) -> PatId {
+        let (pattern, compiled) = self.slots[slot as usize];
+        if let Some(id) = compiled {
+            return id;
+        }
+        let id = self.compile(pattern, 0);
+        self.slots[slot as usize].1 = Some(id);
+        id
+    }
+
+    // --- Derivatives ---
+
+    /// Clark's `startTagOpenDeriv`.
+    fn start_tag_open_deriv(&mut self, p: PatId, qname: u32, ns: &str, local: &str) -> PatId {
+        if let Some(&r) = self.start_tag_memo.get(&(p, qname)) {
+            return r;
+        }
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        let r = match self.node(p).clone() {
+            PatNode::Choice(items) => {
+                let derivs = items
+                    .iter()
+                    .map(|&q| self.start_tag_open_deriv(q, qname, ns, local))
+                    .collect();
+                self.choice_of(derivs)
+            }
+            PatNode::Element(nc, slot) => {
+                if self.name_classes[nc as usize].matches(ns, local) {
+                    let content = self.element_content(slot);
+                    self.after(content, EMPTY)
+                } else {
+                    NOT_ALLOWED
+                }
+            }
+            PatNode::Interleave(a, b) => {
+                let da = self.start_tag_open_deriv(a, qname, ns, local);
+                let left = self.apply_after(AfterOp::InterleaveWith(b), da);
+                let db = self.start_tag_open_deriv(b, qname, ns, local);
+                let right = self.apply_after(AfterOp::InterleaveAfter(a), db);
+                self.choice(left, right)
+            }
+            PatNode::OneOrMore(q) => {
+                let dq = self.start_tag_open_deriv(q, qname, ns, local);
+                let rest = self.choice(p, EMPTY);
+                self.apply_after(AfterOp::GroupWith(rest), dq)
+            }
+            PatNode::Group(a, b) => {
+                let da = self.start_tag_open_deriv(a, qname, ns, local);
+                let left = self.apply_after(AfterOp::GroupWith(b), da);
+                if self.nullable(a) {
+                    let db = self.start_tag_open_deriv(b, qname, ns, local);
+                    self.choice(left, db)
+                } else {
+                    left
+                }
+            }
+            PatNode::After(a, b) => {
+                let da = self.start_tag_open_deriv(a, qname, ns, local);
+                self.apply_after(AfterOp::AfterWith(b), da)
+            }
+            _ => NOT_ALLOWED,
+        };
+        self.start_tag_memo.insert((p, qname), r);
+        r
+    }
+
+    /// Clark's `applyAfter`: applies `op` to the continuation of every
+    /// `After` in `p`, which is a choice of `After`s (or `notAllowed`).
+    fn apply_after(&mut self, op: AfterOp, p: PatId) -> PatId {
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        match self.node(p).clone() {
+            PatNode::After(a, b) => {
+                let b = match op {
+                    AfterOp::InterleaveWith(x) => self.interleave(b, x),
+                    AfterOp::InterleaveAfter(x) => self.interleave(x, b),
+                    AfterOp::GroupWith(x) => self.group(b, x),
+                    AfterOp::AfterWith(x) => self.after(b, x),
+                };
+                self.after(a, b)
+            }
+            PatNode::Choice(items) => {
+                let mapped = items.iter().map(|&q| self.apply_after(op, q)).collect();
+                self.choice_of(mapped)
+            }
+            _ => NOT_ALLOWED,
+        }
+    }
+
+    /// Clark's `attDeriv` for one attribute. `memo` is per attribute.
+    fn att_deriv(
+        &mut self,
+        p: PatId,
+        ns: &str,
+        local: &str,
+        value: &str,
+        memo: &mut HashMap<PatId, PatId>,
+    ) -> PatId {
+        if !self.info[p.0 as usize].has_attr {
+            return NOT_ALLOWED;
+        }
+        if let Some(&r) = memo.get(&p) {
+            return r;
+        }
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        let r = match self.node(p).clone() {
+            PatNode::After(a, b) => {
+                let da = self.att_deriv(a, ns, local, value, memo);
+                self.after(da, b)
+            }
+            PatNode::Choice(items) => {
+                let derivs = items
+                    .iter()
+                    .map(|&q| self.att_deriv(q, ns, local, value, memo))
+                    .collect();
+                self.choice_of(derivs)
+            }
+            PatNode::Group(a, b) => {
+                let da = self.att_deriv(a, ns, local, value, memo);
+                let left = self.group(da, b);
+                let db = self.att_deriv(b, ns, local, value, memo);
+                let right = self.group(a, db);
+                self.choice(left, right)
+            }
+            PatNode::Interleave(a, b) => {
+                let da = self.att_deriv(a, ns, local, value, memo);
+                let left = self.interleave(da, b);
+                let db = self.att_deriv(b, ns, local, value, memo);
+                let right = self.interleave(a, db);
+                self.choice(left, right)
+            }
+            PatNode::OneOrMore(q) => {
+                let dq = self.att_deriv(q, ns, local, value, memo);
+                let rest = self.choice(p, EMPTY);
+                self.group(dq, rest)
+            }
+            PatNode::Attribute(nc, value_pattern) => {
+                if self.name_classes[nc as usize].matches(ns, local)
+                    && self.value_matches(value_pattern, value)
+                {
+                    EMPTY
+                } else {
+                    NOT_ALLOWED
+                }
+            }
+            _ => NOT_ALLOWED,
+        };
+        memo.insert(p, r);
+        r
+    }
+
+    /// Clark's `valueMatch`: whether an attribute value (or the text of a
+    /// text-only element) matches pattern `p`.
+    fn value_matches(&mut self, p: PatId, value: &str) -> bool {
+        if self.nullable(p) && is_xml_whitespace(value) {
+            return true;
+        }
+        let outer = std::mem::replace(&mut self.in_attribute_value, true);
+        let d = self.text_deriv(p, value);
+        self.in_attribute_value = outer;
+        self.nullable(d)
+    }
+
+    /// Compares text against a `<value>`.
+    ///
+    /// The schema parser does not record a value's datatype, so this cannot
+    /// apply the datatype's equality (whitespace-collapsing for the default
+    /// `token`, exact for `string`). It keeps the long-standing behavior:
+    /// attribute values must match exactly, element text up to leading and
+    /// trailing whitespace.
+    fn value_equals(&self, text: &str, expected: &str) -> bool {
+        if self.in_attribute_value {
+            text == expected
+        } else {
+            text.trim() == expected.trim()
+        }
+    }
+
+    /// Clark's `startTagCloseDeriv`. With `recover`, attribute patterns that
+    /// are still pending are dropped instead of making the pattern
+    /// `notAllowed`, so validation can continue after a missing attribute.
+    fn start_tag_close_deriv(&mut self, p: PatId, recover: bool) -> PatId {
+        if !self.info[p.0 as usize].has_attr {
+            return p;
+        }
+        if let Some(&r) = self.start_tag_close_memo.get(&(p, recover)) {
+            return r;
+        }
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        let r = match self.node(p).clone() {
+            PatNode::After(a, b) => {
+                let da = self.start_tag_close_deriv(a, recover);
+                self.after(da, b)
+            }
+            PatNode::Choice(items) => {
+                let derivs = items
+                    .iter()
+                    .map(|&q| self.start_tag_close_deriv(q, recover))
+                    .collect();
+                self.choice_of(derivs)
+            }
+            PatNode::Group(a, b) => {
+                let (a, b) = (
+                    self.start_tag_close_deriv(a, recover),
+                    self.start_tag_close_deriv(b, recover),
+                );
+                self.group(a, b)
+            }
+            PatNode::Interleave(a, b) => {
+                let (a, b) = (
+                    self.start_tag_close_deriv(a, recover),
+                    self.start_tag_close_deriv(b, recover),
+                );
+                self.interleave(a, b)
+            }
+            PatNode::OneOrMore(q) => {
+                let dq = self.start_tag_close_deriv(q, recover);
+                self.one_or_more(dq)
+            }
+            PatNode::Attribute(..) if recover => EMPTY,
+            PatNode::Attribute(..) => NOT_ALLOWED,
+            _ => p,
+        };
+        self.start_tag_close_memo.insert((p, recover), r);
+        r
+    }
+
+    /// Clark's `textDeriv`.
+    fn text_deriv(&mut self, p: PatId, text: &str) -> PatId {
+        let mut memo = HashMap::new();
+        self.text_deriv_memo(p, text, &mut memo)
+    }
+
+    /// `text_deriv` with a memo for the text-dependent derivatives of
+    /// this one text; text-independent ones are memoized globally.
+    fn text_deriv_memo(&mut self, p: PatId, text: &str, memo: &mut HashMap<PatId, PatId>) -> PatId {
+        let sensitive = self.info[p.0 as usize].text_sensitive;
+        let cached = if sensitive {
+            memo.get(&p)
+        } else {
+            self.text_memo.get(&p)
+        };
+        if let Some(&r) = cached {
+            return r;
+        }
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        let r = match self.node(p).clone() {
+            PatNode::Choice(items) => {
+                let derivs = items
+                    .iter()
+                    .map(|&q| self.text_deriv_memo(q, text, memo))
+                    .collect();
+                self.choice_of(derivs)
+            }
+            PatNode::Interleave(a, b) => {
+                let da = self.text_deriv_memo(a, text, memo);
+                let left = self.interleave(da, b);
+                let db = self.text_deriv_memo(b, text, memo);
+                let right = self.interleave(a, db);
+                self.choice(left, right)
+            }
+            PatNode::Group(a, b) => {
+                let da = self.text_deriv_memo(a, text, memo);
+                let left = self.group(da, b);
+                if self.nullable(a) {
+                    let db = self.text_deriv_memo(b, text, memo);
+                    self.choice(left, db)
+                } else {
+                    left
+                }
+            }
+            PatNode::After(a, b) => {
+                let da = self.text_deriv_memo(a, text, memo);
+                self.after(da, b)
+            }
+            PatNode::OneOrMore(q) => {
+                let dq = self.text_deriv_memo(q, text, memo);
+                let rest = self.choice(p, EMPTY);
+                self.group(dq, rest)
+            }
+            PatNode::Text => TEXT,
+            PatNode::Value(expected) => {
+                if self.value_equals(text, &expected) {
+                    EMPTY
+                } else {
+                    NOT_ALLOWED
+                }
+            }
+            PatNode::Data(datatype) => {
+                if validate_datatype(text, "<text>", &datatype, "", &mut Vec::new()) {
+                    EMPTY
+                } else {
+                    NOT_ALLOWED
+                }
+            }
+            PatNode::List(q) => {
+                let mut d = q;
+                for token in text.split_ascii_whitespace() {
+                    d = self.text_deriv(d, token);
+                    if d == NOT_ALLOWED {
+                        break;
+                    }
+                }
+                if self.nullable(d) {
+                    EMPTY
+                } else {
+                    NOT_ALLOWED
+                }
+            }
+            _ => NOT_ALLOWED,
+        };
+        if sensitive {
+            memo.insert(p, r);
+        } else {
+            self.text_memo.insert(p, r);
+        }
+        r
+    }
+
+    /// Clark's `endTagDeriv`. With `recover`, the continuation is returned
+    /// even if the element's content is incomplete.
+    fn end_tag_deriv(&mut self, p: PatId, recover: bool) -> PatId {
+        if let Some(&r) = self.end_tag_memo.get(&(p, recover)) {
+            return r;
+        }
+        if !self.step() {
+            return NOT_ALLOWED;
+        }
+        let r = match self.node(p).clone() {
+            PatNode::Choice(items) => {
+                let derivs = items
+                    .iter()
+                    .map(|&q| self.end_tag_deriv(q, recover))
+                    .collect();
+                self.choice_of(derivs)
+            }
+            PatNode::After(a, b) if recover || self.nullable(a) => b,
+            _ => NOT_ALLOWED,
+        };
+        self.end_tag_memo.insert((p, recover), r);
+        r
+    }
+
+    // --- Document traversal ---
+
+    /// Computes the derivative of `p` with respect to a whole element
+    /// (Clark's `childDeriv` for an element node), recording errors and
+    /// recovering where possible so that later siblings are still checked.
+    fn element_deriv(&mut self, p: PatId, el: NodeId) -> PatId {
+        let doc = self.doc;
+        let NodeKind::Element {
+            name,
+            namespace,
+            attributes,
+            ..
+        } = &doc.node(el).kind
+        else {
+            return p;
+        };
+        let ns = namespace.as_deref().unwrap_or("");
+        let qname = self.qname_id(ns, name);
+
+        let open = self.start_tag_open_deriv(p, qname, ns, name);
+        if self.exhausted {
+            return NOT_ALLOWED;
+        }
+        if open == NOT_ALLOWED {
+            let expected = self.describe_expected(p);
+            self.error(format!(
+                "element <{name}> is not allowed here; expected {expected}"
+            ));
+            // Skip the element and its content.
+            return p;
+        }
+
+        let mut current = open;
+        for attr in attributes.iter().filter(|a| !is_xmlns_attribute(a)) {
+            let attr_ns = attr.namespace.as_deref().unwrap_or("");
+            let next = self.att_deriv(
+                current,
+                attr_ns,
+                &attr.name,
+                &attr.value,
+                &mut HashMap::new(),
+            );
+            if self.exhausted {
+                return NOT_ALLOWED;
+            }
+            if next == NOT_ALLOWED {
+                if self.attribute_name_allowed(current, attr_ns, &attr.name) {
+                    self.error(format!(
+                        "attribute '{}' on element '{name}' has invalid value \"{}\"",
+                        attr.name, attr.value
+                    ));
+                } else {
+                    self.error(format!(
+                        "unexpected attribute '{}' on element '{name}'",
+                        attr.name
+                    ));
+                }
+            } else {
+                current = next;
+            }
+        }
+
+        let mut content = self.start_tag_close_deriv(current, false);
+        if content == NOT_ALLOWED && !self.exhausted {
+            self.error(format!("element '{name}' is missing a required attribute"));
+            content = self.start_tag_close_deriv(current, true);
+            if content == NOT_ALLOWED {
+                return p;
+            }
+        }
+
+        let content = self.children_deriv(content, el, name);
+        if self.exhausted {
+            return NOT_ALLOWED;
+        }
+        let rest = self.end_tag_deriv(content, false);
+        if rest != NOT_ALLOWED || self.exhausted {
+            return rest;
+        }
+        let expected = self.describe_expected(content);
+        self.error(format!(
+            "element <{name}> has incomplete content: missing {expected}"
+        ));
+        match self.end_tag_deriv(content, true) {
+            NOT_ALLOWED => p,
+            rest => rest,
+        }
+    }
+
+    /// Clark's `childrenDeriv`: the derivative of `p` with respect to the
+    /// content of element `el`.
+    fn children_deriv(&mut self, p: PatId, el: NodeId, el_name: &str) -> PatId {
+        let mut items = Vec::new();
+        collect_child_items(self.doc, el, &mut items);
+
+        match items.as_slice() {
+            [] => {
+                let d = self.text_deriv(p, "");
+                self.choice(p, d)
+            }
+            [ChildItem::Text(text)] => {
+                let d = self.text_deriv(p, text);
+                if is_xml_whitespace(text) {
+                    self.choice(p, d)
+                } else if d == NOT_ALLOWED {
+                    self.text_error(p, text, el_name);
+                    p
+                } else {
+                    d
                 }
             }
             _ => {
-                // For top-level validation, only Element patterns make sense
-                // as the start. If a non-element pattern appears at the root,
-                // it means the schema is unusual.
-                errors.push(ValidationError {
-                    message: format!(
-                        "expected document root to match {pattern}, \
-                         but root validation requires an element pattern"
-                    ),
-                    line: None,
-                    column: None,
-                });
-                false
-            }
-        }
-    }
-
-    /// Validates an element node against an element pattern.
-    fn validate_element(
-        &self,
-        node: NodeId,
-        name_class: &NameClass,
-        content_pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        let node_kind = &self.doc.node(node).kind;
-
-        // Ensure the node is actually an element.
-        let (el_name, el_ns) = if let NodeKind::Element {
-            name, namespace, ..
-        } = node_kind
-        {
-            (name.as_str(), namespace.as_deref().unwrap_or(""))
-        } else {
-            errors.push(ValidationError {
-                message: "expected element node".to_string(),
-                line: None,
-                column: None,
-            });
-            return false;
-        };
-
-        // Check name.
-        if !name_class.matches(el_ns, el_name) {
-            errors.push(ValidationError {
-                message: format!(
-                    "element name mismatch: found <{el_name}>, \
-                     expected {name_class}"
-                ),
-                line: None,
-                column: None,
-            });
-            return false;
-        }
-
-        // Validate content (attributes + children).
-        self.validate_content(node, content_pattern, errors)
-    }
-
-    /// Validates the content of an element (attributes and child nodes)
-    /// against a content pattern.
-    fn validate_content(
-        &self,
-        element: NodeId,
-        pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        let attrs = self.doc.attributes(element);
-        let children: Vec<NodeId> = self.doc.children(element).collect();
-
-        // Separate attribute patterns from child-content patterns.
-        let (attr_patterns, content_pattern) = split_attributes(pattern, self.defines);
-
-        // Validate attributes.
-        let mut attr_ok = true;
-        let mut matched_attrs: Vec<bool> = vec![false; attrs.len()];
-
-        for ap in &attr_patterns {
-            if let Pattern::Attribute {
-                name: name_class,
-                pattern: value_pattern,
-            } = ap
-            {
-                let found = self.validate_attribute(
-                    attrs,
-                    &mut matched_attrs,
-                    name_class,
-                    value_pattern,
-                    errors,
-                );
-                if !found {
-                    attr_ok = false;
-                }
-            } else if let Pattern::Optional(inner) = ap {
-                if let Pattern::Attribute {
-                    name: name_class,
-                    pattern: value_pattern,
-                } = inner.as_ref()
-                {
-                    // Optional attribute: try to match but don't report error
-                    // if missing.
-                    let mut tmp_errors = Vec::new();
-                    let _ = self.validate_attribute(
-                        attrs,
-                        &mut matched_attrs,
-                        name_class,
-                        value_pattern,
-                        &mut tmp_errors,
-                    );
-                    // Ignore "missing" errors for optional attributes but
-                    // keep value-mismatch errors.
-                    for err in tmp_errors {
-                        if !err.message.contains("missing required") {
-                            errors.push(err);
-                            attr_ok = false;
+                let mut current = p;
+                for item in &items {
+                    if self.exhausted {
+                        return NOT_ALLOWED;
+                    }
+                    match item {
+                        ChildItem::Element(child) => current = self.element_deriv(current, *child),
+                        ChildItem::Text(text) if is_xml_whitespace(text) => {}
+                        ChildItem::Text(text) => {
+                            let d = self.text_deriv(current, text);
+                            if d == NOT_ALLOWED {
+                                self.text_error(current, text, el_name);
+                            } else {
+                                current = d;
+                            }
                         }
                     }
                 }
+                current
             }
         }
-
-        // Check for unmatched (unexpected) attributes — but only if we had
-        // attribute patterns. If the content pattern is AnyName-style, we
-        // skip this check.
-        if !attr_patterns.is_empty() || !has_wildcard_attribute(pattern) {
-            for (i, attr) in attrs.iter().enumerate() {
-                if !matched_attrs[i] && !is_xmlns_attribute(attr) {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "unexpected attribute '{}' on element '{}'",
-                            attr.name,
-                            self.doc.node_name(element).unwrap_or("<unknown>")
-                        ),
-                        line: None,
-                        column: None,
-                    });
-                    attr_ok = false;
-                }
-            }
-        }
-
-        // Validate child content.
-        let content_ok = self.validate_children(&children, &content_pattern, 0, errors);
-
-        attr_ok && content_ok
     }
 
-    /// Checks if a specific attribute is present and its value matches.
-    fn validate_attribute(
-        &self,
-        attrs: &[crate::tree::Attribute],
-        matched: &mut [bool],
-        name_class: &NameClass,
-        value_pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        for (i, attr) in attrs.iter().enumerate() {
-            if matched[i] {
+    fn text_error(&mut self, p: PatId, text: &str, el_name: &str) {
+        if self.exhausted {
+            return;
+        }
+        let expected = self.describe_expected(p);
+        let shown: String = text.trim().chars().take(30).collect();
+        self.error(format!(
+            "text \"{shown}\" is not allowed in element <{el_name}>; expected {expected}"
+        ));
+    }
+
+    fn qname_id(&mut self, ns: &'a str, local: &'a str) -> u32 {
+        let next = u32::try_from(self.qnames.len()).unwrap_or(u32::MAX);
+        *self.qnames.entry((ns, local)).or_insert(next)
+    }
+
+    // --- Error diagnostics ---
+
+    /// Whether some attribute pattern in `p` accepts the attribute name.
+    fn attribute_name_allowed(&self, p: PatId, ns: &str, local: &str) -> bool {
+        let mut stack = vec![p];
+        let mut seen = HashSet::new();
+        while let Some(q) = stack.pop() {
+            if !self.info[q.0 as usize].has_attr || !seen.insert(q) {
                 continue;
             }
-            let attr_ns = attr.namespace.as_deref().unwrap_or("");
-            if name_class.matches(attr_ns, &attr.name) {
-                matched[i] = true;
-                return self.validate_attribute_value(
-                    &attr.value,
-                    &attr.name,
-                    value_pattern,
-                    errors,
-                );
-            }
-        }
-
-        // Attribute not found.
-        errors.push(ValidationError {
-            message: format!("missing required attribute {name_class}"),
-            line: None,
-            column: None,
-        });
-        false
-    }
-
-    /// Validates an attribute value against a pattern.
-    fn validate_attribute_value(
-        &self,
-        value: &str,
-        attr_name: &str,
-        pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        match pattern {
-            Pattern::Value(expected) => {
-                if value == expected {
-                    true
-                } else {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "attribute '{attr_name}' has value \"{value}\", \
-                             expected \"{expected}\""
-                        ),
-                        line: None,
-                        column: None,
-                    });
-                    false
+            match self.node(q) {
+                PatNode::Attribute(nc, _) => {
+                    if self.name_classes[*nc as usize].matches(ns, local) {
+                        return true;
+                    }
                 }
-            }
-            Pattern::Choice(a, b) => {
-                let mut tmp = Vec::new();
-                if self.validate_attribute_value(value, attr_name, a, &mut tmp) {
-                    return true;
-                }
-                self.validate_attribute_value(value, attr_name, b, errors)
-            }
-            Pattern::Data { datatype, library } => {
-                validate_datatype(value, attr_name, datatype, library, errors)
-            }
-            Pattern::List(inner) => {
-                let tokens: Vec<&str> = value.split_whitespace().collect();
-                self.validate_list_tokens(&tokens, attr_name, inner, errors)
-            }
-            Pattern::Ref(ref_name) => {
-                if let Some(def) = self.defines.get(ref_name) {
-                    self.validate_attribute_value(value, attr_name, def, errors)
-                } else {
-                    errors.push(ValidationError {
-                        message: format!("undefined reference: {ref_name}"),
-                        line: None,
-                        column: None,
-                    });
-                    false
-                }
-            }
-            _ => true, // Be permissive for patterns we don't specifically handle.
-        }
-    }
-
-    /// Validates a list of whitespace-separated tokens against a pattern.
-    fn validate_list_tokens(
-        &self,
-        tokens: &[&str],
-        attr_name: &str,
-        pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        match pattern {
-            Pattern::OneOrMore(inner) => {
-                if tokens.is_empty() {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "attribute '{attr_name}' list must have \
-                             at least one token"
-                        ),
-                        line: None,
-                        column: None,
-                    });
-                    return false;
-                }
-                tokens
-                    .iter()
-                    .all(|t| self.validate_attribute_value(t, attr_name, inner, errors))
-            }
-            Pattern::ZeroOrMore(inner) => tokens
-                .iter()
-                .all(|t| self.validate_attribute_value(t, attr_name, inner, errors)),
-            _ => {
-                // Single-token list: validate the first token.
-                if let Some(t) = tokens.first() {
-                    self.validate_attribute_value(t, attr_name, pattern, errors)
-                } else {
-                    true
-                }
-            }
-        }
-    }
-
-    /// Validates child nodes against a content pattern.
-    ///
-    /// Returns `true` if the children from `start` onwards match the pattern.
-    fn validate_children(
-        &self,
-        children: &[NodeId],
-        pattern: &Pattern,
-        start: usize,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        // Filter to significant children (elements and non-whitespace text).
-        let significant: Vec<(usize, NodeId)> = children[start..]
-            .iter()
-            .enumerate()
-            .filter(|(_, &id)| match &self.doc.node(id).kind {
-                NodeKind::Text { content } => !content.trim().is_empty(),
-                NodeKind::Element { .. } | NodeKind::CData { .. } => true,
-                _ => false, // Skip comments, PIs
-            })
-            .map(|(i, &id)| (start + i, id))
-            .collect();
-
-        self.match_children(&significant, 0, pattern, errors)
-    }
-
-    /// Recursive child-pattern matcher. Returns `true` if the significant
-    /// children from `pos` onwards match the given pattern.
-    #[allow(clippy::too_many_lines)]
-    fn match_children(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        pattern: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        match pattern {
-            Pattern::Empty => self.match_empty(children, pos, errors),
-            Pattern::NotAllowed => {
-                errors.push(ValidationError {
-                    message: "content is not allowed here".to_string(),
-                    line: None,
-                    column: None,
-                });
-                false
-            }
-            Pattern::Text => self.match_text(children, pos, errors),
-            Pattern::Element {
-                name,
-                pattern: inner,
-            } => self.match_element_child(children, pos, name, inner, errors),
-            Pattern::Group(a, b) => self.match_group(children, pos, a, b, errors),
-            Pattern::Choice(a, b) => {
-                let mut a_errors = Vec::new();
-                if self.match_children(children, pos, a, &mut a_errors) {
-                    return true;
-                }
-                let mut b_errors = Vec::new();
-                if self.match_children(children, pos, b, &mut b_errors) {
-                    return true;
-                }
-                errors.extend(b_errors);
-                false
-            }
-            Pattern::Optional(inner) => {
-                let mut tmp = Vec::new();
-                if self.match_children(children, pos, inner, &mut tmp) {
-                    return true;
-                }
-                // Optional: also allow zero matches.
-                self.match_children(children, pos, &Pattern::Empty, errors)
-            }
-            Pattern::ZeroOrMore(inner) => self.match_zero_or_more(children, pos, inner, errors),
-            Pattern::OneOrMore(inner) => self.match_one_or_more(children, pos, inner, errors),
-            Pattern::Interleave(a, b) => self.match_interleave(children, pos, a, b, errors),
-            Pattern::Mixed(inner) => {
-                let elements: Vec<(usize, NodeId)> = children[pos..]
-                    .iter()
-                    .filter(|(_, id)| matches!(self.doc.node(*id).kind, NodeKind::Element { .. }))
-                    .copied()
-                    .collect();
-                self.match_children(&elements, 0, inner, errors)
-            }
-            Pattern::Value(expected) => {
-                let text = self.collect_children_text(children, pos);
-                if text.trim() == expected.trim() {
-                    true
-                } else {
-                    errors.push(ValidationError {
-                        message: format!("expected value \"{expected}\", found \"{text}\""),
-                        line: None,
-                        column: None,
-                    });
-                    false
-                }
-            }
-            Pattern::Data { datatype, library } => {
-                let text = self.collect_children_text(children, pos);
-                validate_datatype(text.trim(), "<text>", datatype, library, errors)
-            }
-            Pattern::List(inner) => {
-                let text = self.collect_children_text(children, pos);
-                let tokens: Vec<&str> = text.split_whitespace().collect();
-                self.validate_list_tokens(&tokens, "<text>", inner, errors)
-            }
-            Pattern::Ref(ref_name) => {
-                if let Some(def) = self.defines.get(ref_name) {
-                    self.match_children(children, pos, def, errors)
-                } else {
-                    errors.push(ValidationError {
-                        message: format!("undefined reference: {ref_name}"),
-                        line: None,
-                        column: None,
-                    });
-                    false
-                }
-            }
-            Pattern::Attribute { .. } => {
-                // Attribute patterns in content position are already handled
-                // by the attribute validation pass. They match empty content.
-                pos >= children.len()
-            }
-        }
-    }
-
-    /// Matches an `Empty` pattern against remaining children.
-    fn match_empty(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        if pos >= children.len() {
-            return true;
-        }
-        for &(_, id) in &children[pos..] {
-            if let NodeKind::Text { content } = &self.doc.node(id).kind {
-                if content.trim().is_empty() {
-                    continue;
-                }
-            }
-            let desc = self.node_description(id);
-            errors.push(ValidationError {
-                message: format!("unexpected content: {desc} (expected empty)"),
-                line: None,
-                column: None,
-            });
-            return false;
-        }
-        true
-    }
-
-    /// Matches a `Text` pattern against remaining children.
-    fn match_text(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        for &(_, id) in &children[pos..] {
-            match &self.doc.node(id).kind {
-                NodeKind::Text { .. } | NodeKind::CData { .. } => {}
-                _ => {
-                    let desc = self.node_description(id);
-                    errors.push(ValidationError {
-                        message: format!("unexpected {desc} (expected text)"),
-                        line: None,
-                        column: None,
-                    });
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Matches an element child pattern at a given position.
-    fn match_element_child(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        name: &NameClass,
-        inner: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        if pos >= children.len() {
-            errors.push(ValidationError {
-                message: format!("missing required element {name}"),
-                line: None,
-                column: None,
-            });
-            return false;
-        }
-        let (_, child_id) = children[pos];
-        if !self.validate_element(child_id, name, inner, errors) {
-            return false;
-        }
-        // Ensure no more children after this element.
-        if pos + 1 < children.len() {
-            for &(_, id) in &children[pos + 1..] {
-                let desc = self.node_description(id);
-                errors.push(ValidationError {
-                    message: format!("unexpected content after element: {desc}"),
-                    line: None,
-                    column: None,
-                });
-            }
-            return false;
-        }
-        true
-    }
-
-    /// Matches a group pattern (sequential). Tries to find a split point
-    /// where the first pattern matches `children[pos..split]` and the second
-    /// matches `children[split..]`.
-    fn match_group(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        a: &Pattern,
-        b: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        // Try all possible split points.
-        for split in pos..=children.len() {
-            let slice_a = &children[..split];
-            let mut a_errors = Vec::new();
-            if self.match_children(slice_a, pos, a, &mut a_errors) {
-                let mut b_errors = Vec::new();
-                if self.match_children(children, split, b, &mut b_errors) {
-                    return true;
-                }
-            }
-        }
-
-        // None of the split points worked. Generate an error.
-        let mut a_errors = Vec::new();
-        if self.match_children(children, pos, a, &mut a_errors) {
-            // `a` matched some prefix but `b` couldn't match the rest.
-            let mut b_errors = Vec::new();
-            let _ = self.match_children(children, children.len(), b, &mut b_errors);
-            errors.extend(b_errors);
-        } else {
-            errors.extend(a_errors);
-        }
-        false
-    }
-
-    /// Matches zero or more occurrences of a pattern.
-    fn match_zero_or_more(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        inner: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        // Base case: all children consumed.
-        if pos >= children.len() {
-            return true;
-        }
-
-        // Try to match one occurrence, then recurse for more.
-        for split in (pos + 1)..=children.len() {
-            let slice = &children[..split];
-            let mut tmp = Vec::new();
-            if self.match_children(slice, pos, inner, &mut tmp) {
-                let mut rest_errors = Vec::new();
-                if self.match_zero_or_more(children, split, inner, &mut rest_errors) {
-                    return true;
-                }
-            }
-        }
-
-        // No match at all — check if remaining is empty (whitespace text).
-        self.match_children(children, pos, &Pattern::Empty, errors)
-    }
-
-    /// Matches one or more occurrences of a pattern.
-    fn match_one_or_more(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        inner: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        // Must match at least once.
-        for split in (pos + 1)..=children.len() {
-            let slice = &children[..split];
-            let mut tmp = Vec::new();
-            if self.match_children(slice, pos, inner, &mut tmp) {
-                let mut rest_errors = Vec::new();
-                if self.match_zero_or_more(children, split, inner, &mut rest_errors) {
-                    return true;
-                }
-            }
-        }
-
-        // Failed to match even once.
-        let _ = self.match_children(children, pos, inner, errors);
-        false
-    }
-
-    /// Matches an interleave pattern — both sub-patterns must match but
-    /// in any order. Uses a subset-matching approach.
-    fn match_interleave(
-        &self,
-        children: &[(usize, NodeId)],
-        pos: usize,
-        a: &Pattern,
-        b: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        let remaining = &children[pos..];
-        if remaining.is_empty() {
-            // Both patterns must accept empty.
-            let mut tmp = Vec::new();
-            let a_ok = self.match_children(&[], 0, a, &mut tmp);
-            let b_ok = self.match_children(&[], 0, b, &mut tmp);
-            if !a_ok || !b_ok {
-                errors.extend(tmp);
-            }
-            return a_ok && b_ok;
-        }
-
-        // Try each possible partitioning of remaining children into
-        // two subsequences (maintaining order within each) that match
-        // a and b respectively.
-        //
-        // For small numbers of children, we use a bitmask approach where
-        // each bit indicates whether the child goes to partition A or B.
-        let n = remaining.len();
-        if n > 20 {
-            // For very large child lists, fall back to a simpler heuristic:
-            // try matching a first, giving it greedy first pick, then b on rest.
-            return self.match_interleave_greedy(remaining, a, b, errors);
-        }
-
-        let total = 1u32 << n;
-        for mask in 0..total {
-            let mut a_children: Vec<(usize, NodeId)> = Vec::new();
-            let mut b_children: Vec<(usize, NodeId)> = Vec::new();
-            for (i, &child) in remaining.iter().enumerate() {
-                if mask & (1 << i) != 0 {
-                    a_children.push(child);
-                } else {
-                    b_children.push(child);
-                }
-            }
-            let mut tmp = Vec::new();
-            if self.match_children(&a_children, 0, a, &mut tmp)
-                && self.match_children(&b_children, 0, b, &mut tmp)
-            {
-                return true;
-            }
-        }
-
-        errors.push(ValidationError {
-            message: "content does not match interleave pattern".to_string(),
-            line: None,
-            column: None,
-        });
-        false
-    }
-
-    /// Greedy interleave matching for large child lists.
-    fn match_interleave_greedy(
-        &self,
-        children: &[(usize, NodeId)],
-        a: &Pattern,
-        b: &Pattern,
-        errors: &mut Vec<ValidationError>,
-    ) -> bool {
-        let mut a_children: Vec<(usize, NodeId)> = Vec::new();
-        let mut b_children: Vec<(usize, NodeId)> = Vec::new();
-
-        for &child in children {
-            let single = &[child];
-            let mut tmp = Vec::new();
-            if self.match_children(single, 0, a, &mut tmp) {
-                a_children.push(child);
-            } else {
-                b_children.push(child);
-            }
-        }
-
-        let mut a_err = Vec::new();
-        let mut b_err = Vec::new();
-        let a_ok = self.match_children(&a_children, 0, a, &mut a_err);
-        let b_ok = self.match_children(&b_children, 0, b, &mut b_err);
-
-        if !a_ok {
-            errors.extend(a_err);
-        }
-        if !b_ok {
-            errors.extend(b_err);
-        }
-        a_ok && b_ok
-    }
-
-    /// Collects the text content of remaining children as a single string.
-    fn collect_children_text(&self, children: &[(usize, NodeId)], pos: usize) -> String {
-        let mut result = String::new();
-        for &(_, id) in &children[pos..] {
-            match &self.doc.node(id).kind {
-                NodeKind::Text { content } | NodeKind::CData { content } => {
-                    result.push_str(content);
-                }
+                PatNode::Choice(items) => stack.extend_from_slice(items),
+                PatNode::Group(a, b) | PatNode::Interleave(a, b) => stack.extend([*a, *b]),
+                PatNode::OneOrMore(a) | PatNode::After(a, _) => stack.push(*a),
                 _ => {}
             }
         }
-        result
+        false
     }
 
-    /// Returns a human-readable description of a node (for error messages).
-    fn node_description(&self, id: NodeId) -> String {
-        match &self.doc.node(id).kind {
-            NodeKind::Element { name, .. } => format!("element <{name}>"),
-            NodeKind::Text { content } => {
-                let truncated = if content.len() > 30 {
-                    format!("\"{}...\"", &content[..30])
+    /// Describes what `p` accepts next (element names, text), for error
+    /// messages.
+    fn describe_expected(&self, p: PatId) -> String {
+        const MAX_SHOWN: usize = 8;
+        let mut names: Vec<String> = Vec::new();
+        let mut stack = vec![p];
+        let mut seen = HashSet::new();
+        let mut more = false;
+        while let Some(q) = stack.pop() {
+            if !seen.insert(q) {
+                continue;
+            }
+            let item = match self.node(q) {
+                PatNode::Element(nc, _) => format!("element {}", self.name_classes[*nc as usize]),
+                PatNode::Text => "text".to_string(),
+                PatNode::Value(v) => format!("value \"{v}\""),
+                PatNode::Data(dt) => format!("data ({dt})"),
+                PatNode::List(_) => "a list of values".to_string(),
+                PatNode::Choice(items) => {
+                    stack.extend(items.iter().rev());
+                    continue;
+                }
+                PatNode::Group(a, b) => {
+                    if self.nullable(*a) {
+                        stack.push(*b);
+                    }
+                    stack.push(*a);
+                    continue;
+                }
+                PatNode::Interleave(a, b) => {
+                    stack.extend([*b, *a]);
+                    continue;
+                }
+                PatNode::OneOrMore(a) | PatNode::After(a, _) => {
+                    stack.push(*a);
+                    continue;
+                }
+                PatNode::Empty | PatNode::NotAllowed | PatNode::Attribute(..) => continue,
+            };
+            if names.contains(&item) {
+                continue;
+            }
+            if names.len() == MAX_SHOWN {
+                more = true;
+                break;
+            }
+            names.push(item);
+        }
+        if names.is_empty() {
+            return "end of content".to_string();
+        }
+        let mut out = names.join(", ");
+        if more {
+            out.push_str(", ...");
+        }
+        out
+    }
+}
+
+/// Collects the significant children of `el`: elements, and runs of
+/// adjacent text and CDATA coalesced into one text item. Comments and
+/// processing instructions are ignored; entity references are looked
+/// through.
+fn collect_child_items<'d>(doc: &'d Document, el: NodeId, items: &mut Vec<ChildItem<'d>>) {
+    for child in doc.children(el) {
+        match &doc.node(child).kind {
+            NodeKind::Element { .. } => items.push(ChildItem::Element(child)),
+            NodeKind::Text { content } | NodeKind::CData { content } => {
+                if let Some(ChildItem::Text(text)) = items.last_mut() {
+                    text.to_mut().push_str(content);
                 } else {
-                    format!("\"{content}\"")
-                };
-                format!("text {truncated}")
+                    items.push(ChildItem::Text(std::borrow::Cow::Borrowed(content)));
+                }
             }
-            NodeKind::CData { content } => {
-                let truncated = if content.len() > 30 {
-                    format!("\"{}...\"", &content[..30])
-                } else {
-                    format!("\"{content}\"")
-                };
-                format!("CDATA {truncated}")
-            }
-            NodeKind::Comment { .. } => "comment".to_string(),
-            NodeKind::ProcessingInstruction { target, .. } => {
-                format!("PI <?{target}?>")
-            }
-            _ => "node".to_string(),
+            NodeKind::EntityRef { .. } => collect_child_items(doc, child, items),
+            _ => {}
         }
     }
+}
+
+/// Whether `s` consists only of XML whitespace (including being empty).
+fn is_xml_whitespace(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 /// Very basic datatype validation (token, string, integer).
@@ -1990,138 +2321,6 @@ fn is_xmlns_attribute(attr: &crate::tree::Attribute) -> bool {
     attr.name == "xmlns"
         || attr.prefix.as_deref() == Some("xmlns")
         || attr.namespace.as_deref() == Some("http://www.w3.org/2000/xmlns/")
-}
-
-/// Upper bound on the pattern nodes visited by one [`split_attributes`]
-/// call. Bounds the work an adversarial schema (e.g. defines that each
-/// reference the next one twice) can cause per validated element; when it
-/// is exhausted, the remaining attribute patterns stay unextracted and the
-/// element's attributes are reported as unexpected (fail closed).
-const MAX_ATTR_SPLIT_STEPS: usize = 100_000;
-
-/// Splits a pattern into attribute patterns and the remaining content pattern.
-///
-/// This walks the pattern tree and extracts all `Attribute` patterns,
-/// returning them separately from the content pattern (which has the
-/// attribute patterns replaced with `Empty`). Attributes inside an
-/// `Optional` are returned wrapped in `Optional`.
-///
-/// `Ref`s are looked through: in `RelaxNG`, a `ref` is equivalent to the
-/// content of the define it names (§4.19 expands every `ref` that does not
-/// refer to an `element`), so attributes factored out into a shared define
-/// belong to the element exactly as if written inline. A `Ref` whose
-/// definition contains no attributes is kept as-is in the content pattern.
-fn split_attributes(
-    pattern: &Pattern,
-    defines: &HashMap<String, Pattern>,
-) -> (Vec<Pattern>, Pattern) {
-    let mut splitter = AttrSplitter {
-        defines,
-        steps_left: MAX_ATTR_SPLIT_STEPS,
-    };
-    let mut attrs = Vec::new();
-    let content = splitter.extract(pattern, &mut attrs, false, 0);
-    (attrs, content)
-}
-
-/// State for [`split_attributes`].
-struct AttrSplitter<'a> {
-    defines: &'a HashMap<String, Pattern>,
-    steps_left: usize,
-}
-
-impl AttrSplitter<'_> {
-    /// Recursively extracts attribute patterns from a pattern tree.
-    ///
-    /// `optional` is set below an `Optional`, so extracted attributes are
-    /// not required. `ref_depth` counts the `Ref`s being looked through;
-    /// schemas from [`parse_relaxng`] have no ref cycles outside elements
-    /// and bounded ref chains (§4.19), but [`RelaxNgSchema`] can also be
-    /// built by hand, so both the depth and the total work are capped.
-    fn extract(
-        &mut self,
-        pattern: &Pattern,
-        attrs: &mut Vec<Pattern>,
-        optional: bool,
-        ref_depth: usize,
-    ) -> Pattern {
-        if self.steps_left == 0 {
-            return pattern.clone();
-        }
-        self.steps_left -= 1;
-
-        match pattern {
-            Pattern::Attribute { .. } => {
-                attrs.push(if optional {
-                    Pattern::Optional(Box::new(pattern.clone()))
-                } else {
-                    pattern.clone()
-                });
-                Pattern::Empty
-            }
-            Pattern::Group(a, b) => {
-                let a2 = self.extract(a, attrs, optional, ref_depth);
-                let b2 = self.extract(b, attrs, optional, ref_depth);
-                match (&a2, &b2) {
-                    (Pattern::Empty, _) => b2,
-                    (_, Pattern::Empty) => a2,
-                    _ => Pattern::Group(Box::new(a2), Box::new(b2)),
-                }
-            }
-            Pattern::Interleave(a, b) => {
-                let a2 = self.extract(a, attrs, optional, ref_depth);
-                let b2 = self.extract(b, attrs, optional, ref_depth);
-                match (&a2, &b2) {
-                    (Pattern::Empty, _) => b2,
-                    (_, Pattern::Empty) => a2,
-                    _ => Pattern::Interleave(Box::new(a2), Box::new(b2)),
-                }
-            }
-            Pattern::Optional(inner) => match self.extract(inner, attrs, true, ref_depth) {
-                Pattern::Empty => Pattern::Empty,
-                inner2 => Pattern::Optional(Box::new(inner2)),
-            },
-            Pattern::Mixed(inner) => {
-                Pattern::Mixed(Box::new(self.extract(inner, attrs, optional, ref_depth)))
-            }
-            Pattern::Ref(name) => {
-                let Some(def) = self.defines.get(name) else {
-                    // Reported as an undefined reference when matched.
-                    return pattern.clone();
-                };
-                if ref_depth >= MAX_REF_CHAIN_DEPTH {
-                    return pattern.clone();
-                }
-                let before = attrs.len();
-                let content = self.extract(def, attrs, optional, ref_depth + 1);
-                if attrs.len() == before {
-                    pattern.clone()
-                } else {
-                    content
-                }
-            }
-            _ => pattern.clone(),
-        }
-    }
-}
-
-/// Checks whether a pattern tree contains a wildcard attribute pattern
-/// (attribute with `AnyName` name class).
-fn has_wildcard_attribute(pattern: &Pattern) -> bool {
-    match pattern {
-        Pattern::Attribute {
-            name: NameClass::AnyName,
-            ..
-        } => true,
-        Pattern::Group(a, b) | Pattern::Interleave(a, b) | Pattern::Choice(a, b) => {
-            has_wildcard_attribute(a) || has_wildcard_attribute(b)
-        }
-        Pattern::Optional(p)
-        | Pattern::ZeroOrMore(p)
-        | Pattern::OneOrMore(p)
-        | Pattern::Mixed(p) => has_wildcard_attribute(p),
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3529,8 +3728,9 @@ mod tests {
     }
 
     #[test]
-    fn test_split_attributes_cyclic_defines_terminates() {
-        // Hand-built schemas bypass the parser's §4.19 check.
+    fn test_validate_hand_built_cyclic_defines_terminates() {
+        // Hand-built schemas bypass the parser's §4.19 check; a reference
+        // cycle outside an element must not recurse forever.
         let mut defines = HashMap::new();
         defines.insert(
             "a".to_string(),
@@ -3542,15 +3742,21 @@ mod tests {
                 Box::new(Pattern::Ref("a".to_string())),
             ),
         );
-        let (attrs, _) = split_attributes(&Pattern::Ref("a".to_string()), &defines);
-        assert!(matches!(attrs.first(), Some(Pattern::Attribute { .. })));
-        assert!(attrs.len() <= MAX_REF_CHAIN_DEPTH + 1);
+        let schema = RelaxNgSchema {
+            start: Pattern::Element {
+                name: NameClass::AnyName,
+                pattern: Box::new(Pattern::Ref("a".to_string())),
+            },
+            defines,
+        };
+        assert!(!is_valid(&schema, r#"<root x="1"/>"#));
     }
 
     #[test]
-    fn test_split_attributes_exponential_refs_bounded() {
+    fn test_validate_hand_built_exponential_refs_bounded() {
         // d0 = group(ref d1, ref d1), d1 = group(ref d2, ref d2), ... would
-        // expand to 2^40 attribute patterns without the step budget.
+        // expand to 2^40 attribute patterns if refs were inlined; compiled
+        // defines are shared instead.
         let mut defines = HashMap::new();
         for i in 0..40 {
             let next = Pattern::Ref(format!("d{}", i + 1));
@@ -3566,7 +3772,190 @@ mod tests {
                 pattern: Box::new(Pattern::Text),
             },
         );
-        let (attrs, _) = split_attributes(&Pattern::Ref("d0".to_string()), &defines);
-        assert!(attrs.len() <= MAX_ATTR_SPLIT_STEPS);
+        let schema = RelaxNgSchema {
+            start: Pattern::Element {
+                name: NameClass::AnyName,
+                pattern: Box::new(Pattern::Ref("d0".to_string())),
+            },
+            defines,
+        };
+        assert!(!is_valid(&schema, r#"<root a="1" b="2"/>"#));
+    }
+
+    // --- Derivative-based validation: performance and correctness ---
+
+    /// An element whose content is an `interleave` of a repeated element
+    /// and a required one. The previous matcher tried all 2^n ways of
+    /// splitting n children between the two operands.
+    fn interleave_schema() -> RelaxNgSchema {
+        parse_relaxng(
+            r#"<element name="root" xmlns="http://relaxng.org/ns/structure/1.0">
+                 <zeroOrMore>
+                   <element name="g">
+                     <interleave>
+                       <zeroOrMore><element name="a"><text/></element></zeroOrMore>
+                       <element name="b"><empty/></element>
+                     </interleave>
+                   </element>
+                 </zeroOrMore>
+               </element>"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_validate_interleave_runtime_is_linear() {
+        let schema = interleave_schema();
+        // 200 groups of 19 children each: about 4 * 10^8 partition attempts
+        // per group for the old subset-enumerating matcher.
+        let group = format!("<g><b/>{}</g>", "<a>x</a>".repeat(18));
+        let valid = format!("<root>{}</root>", group.repeat(200));
+        // The same without `<b/>`, which must be rejected (the old matcher's
+        // worst case: no partition succeeds).
+        let invalid = valid.replacen("<b/>", "", 1);
+
+        let start = std::time::Instant::now();
+        assert!(is_valid(&schema, &valid));
+        assert!(!is_valid(&schema, &invalid));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "validation took {elapsed:?}"
+        );
+    }
+
+    fn binary_tree(depth: u32, out: &mut String) {
+        out.push_str("<n>");
+        if depth > 0 {
+            binary_tree(depth - 1, out);
+            binary_tree(depth - 1, out);
+        }
+        out.push_str("</n>");
+    }
+
+    #[test]
+    fn test_validate_deep_nesting_runtime_is_linear() {
+        let schema = parse_relaxng(&grammar(
+            r#"<start><ref name="n"/></start>
+               <define name="n">
+                 <element name="n">
+                   <zeroOrMore><ref name="n"/></zeroOrMore>
+                   <optional><element name="leaf"><empty/></element></optional>
+                 </element>
+               </define>"#,
+        ))
+        .unwrap();
+        // A complete binary tree of depth 12 (8191 elements).
+        let mut xml = String::new();
+        binary_tree(12, &mut xml);
+
+        let start = std::time::Instant::now();
+        assert!(is_valid(&schema, &xml));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "validation took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_interleave_more_than_twenty_children() {
+        // The previous matcher fell back to a greedy split above 20
+        // children, which cannot assign `<a/>` and `<b/>` to the group.
+        let schema = parse_relaxng(
+            r#"<element name="root" xmlns="http://relaxng.org/ns/structure/1.0">
+                 <interleave>
+                   <group>
+                     <element name="a"><empty/></element>
+                     <element name="b"><empty/></element>
+                   </group>
+                   <zeroOrMore><element name="c"><empty/></element></zeroOrMore>
+                 </interleave>
+               </element>"#,
+        )
+        .unwrap();
+        let cs = "<c/>".repeat(25);
+        assert!(is_valid(
+            &schema,
+            &format!("<root>{cs}<a/><c/><b/>{cs}</root>")
+        ));
+        assert!(!is_valid(
+            &schema,
+            &format!("<root>{cs}<b/><c/><a/>{cs}</root>")
+        ));
+    }
+
+    #[test]
+    fn test_validate_attributes_in_choice_of_groups() {
+        // Miniature of libvirt.rng's `graphics` element: alternative
+        // attribute sets in a `<choice>` of `<group>`s.
+        let schema = parse_relaxng(
+            r#"<element name="graphics" xmlns="http://relaxng.org/ns/structure/1.0">
+                 <choice>
+                   <group>
+                     <attribute name="type"><value>sdl</value></attribute>
+                     <optional><attribute name="display"/></optional>
+                   </group>
+                   <group>
+                     <attribute name="type"><value>vnc</value></attribute>
+                     <optional><attribute name="port"/></optional>
+                   </group>
+                 </choice>
+               </element>"#,
+        )
+        .unwrap();
+        assert!(is_valid(&schema, r#"<graphics type="vnc"/>"#));
+        assert!(is_valid(&schema, r#"<graphics type="vnc" port="5900"/>"#));
+        assert!(is_valid(&schema, r#"<graphics type="sdl" display=":0"/>"#));
+        // Attributes from different alternatives cannot be mixed.
+        assert!(!is_valid(&schema, r#"<graphics type="vnc" display=":0"/>"#));
+        assert!(!is_valid(&schema, r#"<graphics type="rdp"/>"#));
+        assert!(!is_valid(&schema, "<graphics/>"));
+    }
+
+    #[test]
+    fn test_validate_text_split_by_comment_is_one_value() {
+        let schema = parse_relaxng(
+            r#"<element name="n" xmlns="http://relaxng.org/ns/structure/1.0">
+                 <data type="integer"/>
+               </element>"#,
+        )
+        .unwrap();
+        assert!(is_valid(&schema, "<n>12<!-- c -->34</n>"));
+        assert!(!is_valid(&schema, "<n>12<!-- c -->x</n>"));
+    }
+
+    #[test]
+    fn test_validate_work_budget_exhaustion_is_an_error() {
+        let schema = interleave_schema();
+        let doc = Document::parse_str("<root><g><b/><a>x</a></g></root>").unwrap();
+        assert!(validate_with_budget(&doc, &schema, 1_000).is_valid);
+
+        let result = validate_with_budget(&doc, &schema, 5);
+        assert!(!result.is_valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("work limit")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_validate_reports_unexpected_element() {
+        let schema = interleave_schema();
+        let doc = Document::parse_str("<root><g><b/><z/></g></root>").unwrap();
+        let result = validate(&doc, &schema);
+        assert!(!result.is_valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("element <z> is not allowed here")),
+            "{:?}",
+            result.errors
+        );
     }
 }
