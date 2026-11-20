@@ -2613,6 +2613,37 @@ fn match_with_occurrence(
     }
 }
 
+/// Returns the normalized form of an `<!ATTLIST>` default value literal.
+///
+/// The DTD stores default values as their literal source text, but an
+/// attribute's value in the tree has had references expanded and whitespace
+/// normalized (XML 1.0 §3.3.3). This applies the same normalization so the
+/// two can be compared (e.g. for the `#FIXED` validity constraint).
+fn normalized_default_value<'v>(
+    dtd: &Dtd,
+    decl: &AttributeDecl,
+    literal: &'v str,
+) -> std::borrow::Cow<'v, str> {
+    use std::borrow::Cow;
+    if !literal.contains(['&', '\t', '\n', '\r', ' ']) {
+        return Cow::Borrowed(literal);
+    }
+    let mut input = crate::parser::input::ParserInput::new("");
+    for (name, entity) in &dtd.entities {
+        if let EntityKind::Internal(value) = &entity.kind {
+            input.entity_map.insert(name.clone(), value.clone());
+        }
+    }
+    let Some(normalized) = input.normalize_attr_literal(literal) else {
+        return Cow::Borrowed(literal);
+    };
+    if matches!(decl.attribute_type, AttributeType::CData) {
+        Cow::Owned(normalized)
+    } else {
+        Cow::Owned(normalized.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+}
+
 /// Validates attributes for an element against DTD attribute declarations.
 #[allow(clippy::too_many_arguments)]
 fn validate_attributes(
@@ -2644,7 +2675,9 @@ fn validate_attributes(
                         column: None,
                     });
                 }
-                (AttributeDefault::Fixed(fixed_val), Some(attr)) if attr.value != *fixed_val => {
+                (AttributeDefault::Fixed(fixed_val), Some(attr))
+                    if attr.value != normalized_default_value(dtd, decl, fixed_val) =>
+                {
                     errors.push(ValidationError {
                         message: format!(
                             "attribute '{}' on element '{elem_name}' must have \
@@ -3326,6 +3359,26 @@ mod tests {
             "errors: {:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn test_validate_fixed_attribute_with_references() {
+        // The #FIXED literal is compared in its normalized form (XML 1.0
+        // §3.3.3), so both a defaulted and an explicitly written attribute
+        // with the same normalized value are valid.
+        let subset = "<!ELEMENT doc (#PCDATA)>\
+                      <!ENTITY e \"E\">\
+                      <!ATTLIST doc v CDATA #FIXED \"a&amp;b\tc&#9;&e;\">";
+        let dtd = parse_dtd(subset).unwrap();
+        for body in ["<doc/>", "<doc v=\"a&amp;b c&#9;E\"/>"] {
+            let mut doc = make_doc(&format!("<!DOCTYPE doc [{subset}]>{body}"));
+            let result = validate(&mut doc, &dtd);
+            assert!(result.is_valid, "{body}: errors: {:?}", result.errors);
+        }
+        let mut doc = make_doc(&format!(
+            "<!DOCTYPE doc [{subset}]><doc v=\"a&amp;b c E\"/>"
+        ));
+        assert!(!validate(&mut doc, &dtd).is_valid);
     }
 
     #[test]

@@ -329,12 +329,19 @@ impl<'a> XmlParser<'a> {
                         }
 
                         // Store attribute default values for later application.
+                        // The DTD keeps each default as its literal source
+                        // text; normalize it once here (references expanded,
+                        // whitespace normalized per XML 1.0 §3.3.3) so a
+                        // defaulted attribute gets the same value it would
+                        // have had if written on the element.
                         for (element_name, attrs) in &dtd.attributes {
                             for attr_decl in attrs {
+                                let mut attr_decl = attr_decl.clone();
+                                self.normalize_attr_default(&mut attr_decl);
                                 self.attr_defaults
                                     .entry(element_name.clone())
                                     .or_default()
-                                    .push(attr_decl.clone());
+                                    .push(attr_decl);
                             }
                         }
 
@@ -931,6 +938,31 @@ impl<'a> XmlParser<'a> {
             }
         }
         value.to_string()
+    }
+
+    /// Normalizes the default value of an `<!ATTLIST>` declaration in place.
+    ///
+    /// Expands character and entity references and normalizes whitespace as
+    /// for an attribute written on an element (XML 1.0 §3.3.3), including the
+    /// extra collapsing for non-CDATA types. If the literal cannot be parsed
+    /// as an attribute value it is left unchanged.
+    fn normalize_attr_default(&mut self, decl: &mut AttributeDecl) {
+        use crate::validation::dtd::AttributeDefault;
+        let (AttributeDefault::Default(value) | AttributeDefault::Fixed(value)) = &mut decl.default
+        else {
+            return;
+        };
+        if !value.contains(['&', '\t', '\n', '\r', ' ']) {
+            return;
+        }
+        let Some(normalized) = self.input.normalize_attr_literal(value) else {
+            return;
+        };
+        *value = if matches!(decl.attribute_type, AttributeType::CData) {
+            normalized
+        } else {
+            normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
     }
 
     // --- Content ---
@@ -2219,5 +2251,35 @@ mod tests {
             "unexpected error message: {}",
             err.message
         );
+    }
+
+    // -- DTD default attribute normalization (XML 1.0 §3.3.3) ------------
+
+    #[test]
+    fn test_parse_default_attr_value_normalized() {
+        let doc = Document::parse_str(
+            "<!DOCTYPE a [<!ENTITY e 'E'>\
+             <!ATTLIST a b CDATA 'p&amp;q\tr\r\ns&#9;t&e;'>]><a/>",
+        )
+        .unwrap();
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.attribute(root, "b"), Some("p&q r s\ttE"));
+    }
+
+    #[test]
+    fn test_parse_fixed_attr_value_normalized() {
+        let doc =
+            Document::parse_str("<!DOCTYPE a [<!ATTLIST a b CDATA #FIXED 'x&#10;y\nz'>]><a/>")
+                .unwrap();
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.attribute(root, "b"), Some("x\ny z"));
+    }
+
+    #[test]
+    fn test_parse_default_attr_value_tokenized_collapsed() {
+        let doc = Document::parse_str("<!DOCTYPE a [<!ATTLIST a b NMTOKENS '\t x \r\n y '>]><a/>")
+            .unwrap();
+        let root = doc.root_element().unwrap();
+        assert_eq!(doc.attribute(root, "b"), Some("x y"));
     }
 }

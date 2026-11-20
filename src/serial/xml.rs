@@ -363,6 +363,12 @@ fn write_escaped_text(out: &mut String, text: &str, reencode_non_ascii: bool) {
 /// (`&amp;`, `&lt;`, `&gt;`, `&apos;`, `&quot;`) are decoded to their
 /// actual characters and then re-escaped normally through the attribute
 /// escaping logic. This matches libxml2's serialization behavior.
+///
+/// `text` is the raw, pre-normalization source text, so literal tab/LF/CR
+/// characters in it are written as the space the parser normalized them to
+/// (XML 1.0 §3.3.3), while character-referenced ones (`&#9;` etc.) are
+/// written back as character references. This keeps parse → serialize →
+/// parse stable.
 fn write_escaped_attr_preserve_refs(out: &mut String, text: &str, reencode_non_ascii: bool) {
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -402,15 +408,19 @@ fn write_escaped_attr_preserve_refs(out: &mut String, text: &str, reencode_non_a
         } else if b == b'"' {
             out.push_str("&quot;");
             i += 1;
-        } else if b == b'\t' {
-            out.push_str("&#9;");
-            i += 1;
-        } else if b == b'\n' {
-            out.push_str("&#10;");
-            i += 1;
-        } else if b == b'\r' {
-            out.push_str("&#13;");
-            i += 1;
+        } else if b == b'\t' || b == b'\n' || b == b'\r' {
+            // A *literal* tab/LF/CR in the raw source text was normalized to
+            // a space by the parser (XML 1.0 §2.11 + §3.3.3), so emit the
+            // space it became. Writing `&#9;`/`&#10;`/`&#13;` here would
+            // resurrect the original character on the next parse, because
+            // character references are exempt from normalization (#50).
+            // A `\r\n` pair is one line break and so a single space.
+            out.push(' ');
+            i += if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
         } else {
             let ch = &text[i..];
             if let Some(c) = ch.chars().next() {
@@ -764,5 +774,68 @@ mod tests {
         let xml1 = serialize(&doc);
         let xml2 = serialize_with_options(&doc, &SerializeOptions::default());
         assert_eq!(xml1, xml2);
+    }
+
+    // -- Attribute whitespace round-trip (#50) ------------------------------
+
+    /// Parses `src` and returns the root element's first attribute value.
+    fn first_attr_value(src: &str) -> String {
+        let doc = Document::parse_str(src).unwrap();
+        let root = doc.root_element().unwrap();
+        doc.attributes(root)[0].value.clone()
+    }
+
+    #[test]
+    fn test_serialize_raw_attr_literal_tab_written_as_space() {
+        let doc = Document::parse_str("<a b='x&amp;y\tz'/>").unwrap();
+        let xml = serialize(&doc);
+        assert!(xml.contains(r#"<a b="x&amp;y z"/>"#), "got: {xml}");
+    }
+
+    #[test]
+    fn test_serialize_raw_attr_literal_lf_cr_crlf_written_as_space() {
+        for (src, expected) in [
+            ("<a b='x&amp;y\nz'/>", r#"<a b="x&amp;y z"/>"#),
+            ("<a b='x&amp;y\rz'/>", r#"<a b="x&amp;y z"/>"#),
+            ("<a b='x&amp;y\r\nz'/>", r#"<a b="x&amp;y z"/>"#),
+            ("<a b='x&amp;y\r\r\nz'/>", r#"<a b="x&amp;y  z"/>"#),
+        ] {
+            let xml = serialize(&Document::parse_str(src).unwrap());
+            assert!(xml.contains(expected), "{src:?} serialized as {xml:?}");
+        }
+    }
+
+    #[test]
+    fn test_serialize_raw_attr_char_ref_whitespace_preserved() {
+        let doc = Document::parse_str("<a b='x&amp;&#9;y&#10;z&#13;w&#x9;'/>").unwrap();
+        let xml = serialize(&doc);
+        assert!(
+            xml.contains(r#"<a b="x&amp;&#9;y&#10;z&#13;w&#9;"/>"#),
+            "got: {xml}"
+        );
+    }
+
+    #[test]
+    fn test_serialize_raw_attr_custom_entity_with_whitespace() {
+        let src = "<!DOCTYPE a [<!ENTITY e 'E'>]><a b='x&e;\ty\r\n&#9;'/>";
+        let xml = serialize(&Document::parse_str(src).unwrap());
+        assert!(xml.contains(r#"<a b="x&e; y &#9;"/>"#), "got: {xml}");
+    }
+
+    #[test]
+    fn test_serialize_attr_whitespace_roundtrip_stable() {
+        for src in [
+            "<a b='x&amp;y\tz'/>",
+            "<a b='x&amp;y\nz'/>",
+            "<a b='x&amp;y\rz'/>",
+            "<a b='x&amp;y\r\nz'/>",
+            "<a b='\t&lt;\r\n&#9;&#10;&#13;&#xD;\n'/>",
+            "<!DOCTYPE a [<!ENTITY e 'E'>]><a b='&e;\t&amp;\r\n&#9;'/>",
+        ] {
+            let first = first_attr_value(src);
+            let xml = serialize(&Document::parse_str(src).unwrap());
+            let second = first_attr_value(&xml);
+            assert_eq!(first, second, "{src:?} serialized as {xml:?}");
+        }
     }
 }
