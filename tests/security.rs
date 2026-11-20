@@ -407,3 +407,68 @@ fn test_html_depth_limit() {
     // depth limit in ParserInput should still trigger
     assert!(result.is_err(), "HTML parser should enforce depth limit");
 }
+
+/// Builds hostile `XPath` expressions of each nesting shape that once
+/// overflowed the stack (issue #51).
+fn deep_xpath_expressions(n: usize) -> Vec<String> {
+    vec![
+        "(".repeat(n) + "1" + &")".repeat(n),
+        "not(".repeat(n) + "1" + &")".repeat(n),
+        "a".to_string() + &"[a".repeat(n) + &"]".repeat(n),
+        "-".repeat(n) + "1",
+        "1".to_string() + &"+1".repeat(n),
+        "1=1".to_string() + &" or 1=1".repeat(n),
+        "a".to_string() + &"|a".repeat(n),
+    ]
+}
+
+#[test]
+fn test_xpath_deep_nesting_rejected() {
+    // Before the fix each of these aborted the process with a stack
+    // overflow, during parsing, evaluation, or dropping the AST. The parser
+    // still recurses up to the limit before erroring, which needs more than
+    // the default test-thread stack in debug builds.
+    let result = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let doc = Document::parse_str("<a/>").unwrap();
+            let root = doc.root_element().unwrap();
+            deep_xpath_expressions(200_000)
+                .iter()
+                .map(|expr| xmloxide::xpath::evaluate(&doc, root, expr).is_err())
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(result.iter().all(|&rejected| rejected), "{result:?}");
+}
+
+#[test]
+fn test_xpath_nesting_at_limit_evaluates() {
+    // Expressions just inside the limit must parse, evaluate, and drop
+    // without overflowing.
+    let result = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let doc = Document::parse_str("<a/>").unwrap();
+            let root = doc.root_element().unwrap();
+            let nested = 127;
+            let chained = 1000;
+            let exprs = [
+                "(".repeat(nested) + "1" + &")".repeat(nested),
+                "not(".repeat(nested) + "1" + &")".repeat(nested),
+                "1".to_string() + &"+1".repeat(chained),
+                "1=1".to_string() + &" or 1=1".repeat(chained),
+                "a".to_string() + &"|a".repeat(chained),
+            ];
+            exprs
+                .iter()
+                .map(|expr| xmloxide::xpath::evaluate(&doc, root, expr).is_ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(result.iter().all(|&ok| ok), "{result:?}");
+}

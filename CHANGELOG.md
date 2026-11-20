@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **XPath: bound expression nesting depth** (#51). A small expression with
+  thousands of nested parentheses, predicates, or function calls — or a
+  very long operator chain such as `1+1+1+…` or `a|a|a|…`, or a run of
+  unary minus signs — exhausted the call stack while parsing, evaluating,
+  or dropping the expression, aborting the process (an uncatchable stack
+  overflow, not a panic). Any application evaluating untrusted `XPath`
+  (including Schematron rules) could be crashed this way. The parser now
+  enforces a nesting budget — 128 levels of grouping, or operator chains of
+  up to 1024 operands — and returns an `XPathError` for deeper expressions.
+  Unary-minus runs are also parsed iteratively instead of recursively.
+
 ## [0.5.0] - 2026-08-08
 
 ### Changed

@@ -38,6 +38,11 @@ use super::lexer::{Lexer, Token, XPathError};
 /// The error includes a human-readable message and the byte offset where the
 /// error was detected.
 ///
+/// Also returns [`XPathError`] if the expression is nested too deeply to
+/// process safely (more than 128 levels of parentheses, predicates, or
+/// function arguments, or operator chains of more than 1024 operands), so
+/// that hostile input cannot overflow the stack.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -70,18 +75,69 @@ pub fn parse(input: &str) -> Result<Expr, XPathError> {
     Ok(expr)
 }
 
+/// Nesting budget for a single `XPath` expression.
+///
+/// The parser, the evaluator, and the AST's destructor all recurse once per
+/// level of expression nesting, so without a bound a small hostile
+/// expression such as `((((…))))` or `1+1+1+…` exhausts the call stack and
+/// aborts the process. Expressions that exceed this budget are rejected
+/// with an [`XPathError`] instead.
+///
+/// Constructs are charged by how much stack they cost:
+///
+/// - a nested expression — a parenthesized sub-expression, a predicate, or
+///   a function argument — costs [`NESTED_EXPR_COST`] units;
+/// - each extra operand of a binary operator chain (`a or b or c`,
+///   `a | b | c`, `1 + 2 + 3`, …) and each unary `-` costs one unit.
+///
+/// The budget therefore allows 128 levels of grouping, or chains of up to
+/// 1024 operators — far beyond hand-written expressions — while keeping the
+/// worst case well inside a 2 MiB thread stack in release builds.
+const MAX_EXPR_BUDGET: u32 = 1024;
+
+/// Budget cost of entering a nested expression. See [`MAX_EXPR_BUDGET`].
+///
+/// A nested expression passes through the whole precedence chain
+/// (`parse_expr` down to `parse_primary_expr`), which measures at roughly
+/// eight times the stack of one more link in an operator chain.
+const NESTED_EXPR_COST: u32 = 8;
+
 /// Internal recursive descent parser for `XPath` 1.0 token streams.
 struct Parser {
     /// The token stream produced by the lexer.
     tokens: Vec<Token>,
     /// Current position in the token stream.
     pos: usize,
+    /// Nesting budget used so far. See [`MAX_EXPR_BUDGET`].
+    ///
+    /// Only restored on success paths: an error aborts the whole parse, so
+    /// a stale value after an `Err` is never observed.
+    depth: u32,
 }
 
 impl Parser {
     /// Creates a new parser for the given token stream.
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Charges `cost` units of nesting budget, failing once the total
+    /// exceeds [`MAX_EXPR_BUDGET`].
+    ///
+    /// The caller restores `self.depth` when the nested construct is done.
+    fn enter(&mut self, cost: u32) -> Result<(), XPathError> {
+        self.depth += cost;
+        if self.depth > MAX_EXPR_BUDGET {
+            return Err(self.error(
+                "expression is nested too deeply (limit: 128 levels of grouping \
+                 or 1024 chained operators)",
+            ));
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -158,7 +214,10 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.
     fn parse_expr(&mut self) -> Result<Expr, XPathError> {
-        self.parse_or_expr()
+        self.enter(NESTED_EXPR_COST)?;
+        let expr = self.parse_or_expr()?;
+        self.depth -= NESTED_EXPR_COST;
+        Ok(expr)
     }
 
     /// Parses an `or` expression.
@@ -168,8 +227,10 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.4.
     fn parse_or_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_and_expr()?;
         while self.eat(&Token::Or) {
+            self.enter(1)?;
             let right = self.parse_and_expr()?;
             left = Expr::BinaryOp {
                 op: BinaryOp::Or,
@@ -177,6 +238,7 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -187,8 +249,10 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.4.
     fn parse_and_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_equality_expr()?;
         while self.eat(&Token::And) {
+            self.enter(1)?;
             let right = self.parse_equality_expr()?;
             left = Expr::BinaryOp {
                 op: BinaryOp::And,
@@ -196,6 +260,7 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -206,9 +271,11 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.4.
     fn parse_equality_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_relational_expr()?;
         loop {
             if self.eat(&Token::Equal) {
+                self.enter(1)?;
                 let right = self.parse_relational_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Eq,
@@ -216,6 +283,7 @@ impl Parser {
                     right: Box::new(right),
                 };
             } else if self.eat(&Token::NotEqual) {
+                self.enter(1)?;
                 let right = self.parse_relational_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Neq,
@@ -226,6 +294,7 @@ impl Parser {
                 break;
             }
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -236,6 +305,7 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.4.
     fn parse_relational_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_additive_expr()?;
         loop {
             let op = if self.eat(&Token::LessThan) {
@@ -250,6 +320,7 @@ impl Parser {
                 None
             };
             if let Some(op) = op {
+                self.enter(1)?;
                 let right = self.parse_additive_expr()?;
                 left = Expr::BinaryOp {
                     op,
@@ -260,6 +331,7 @@ impl Parser {
                 break;
             }
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -270,9 +342,11 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.5.
     fn parse_additive_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_multiplicative_expr()?;
         loop {
             if self.eat(&Token::Plus) {
+                self.enter(1)?;
                 let right = self.parse_multiplicative_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Add,
@@ -280,6 +354,7 @@ impl Parser {
                     right: Box::new(right),
                 };
             } else if self.eat(&Token::Minus) {
+                self.enter(1)?;
                 let right = self.parse_multiplicative_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Sub,
@@ -290,6 +365,7 @@ impl Parser {
                 break;
             }
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -300,9 +376,11 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.5.
     fn parse_multiplicative_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_unary_expr()?;
         loop {
             if self.eat(&Token::Star) {
+                self.enter(1)?;
                 let right = self.parse_unary_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Mul,
@@ -310,6 +388,7 @@ impl Parser {
                     right: Box::new(right),
                 };
             } else if self.eat(&Token::Div) {
+                self.enter(1)?;
                 let right = self.parse_unary_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Div,
@@ -317,6 +396,7 @@ impl Parser {
                     right: Box::new(right),
                 };
             } else if self.eat(&Token::Mod) {
+                self.enter(1)?;
                 let right = self.parse_unary_expr()?;
                 left = Expr::BinaryOp {
                     op: BinaryOp::Mod,
@@ -327,6 +407,7 @@ impl Parser {
                 break;
             }
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -337,12 +418,20 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.5.
     fn parse_unary_expr(&mut self) -> Result<Expr, XPathError> {
-        if self.eat(&Token::Minus) {
-            let inner = self.parse_unary_expr()?;
-            Ok(Expr::UnaryNeg(Box::new(inner)))
-        } else {
-            self.parse_union_expr()
+        // Count the leading minus signs iteratively rather than recursing
+        // once per sign; each still adds a level of AST nesting.
+        let base = self.depth;
+        let mut negations = 0u32;
+        while self.eat(&Token::Minus) {
+            self.enter(1)?;
+            negations += 1;
         }
+        let mut expr = self.parse_union_expr()?;
+        for _ in 0..negations {
+            expr = Expr::UnaryNeg(Box::new(expr));
+        }
+        self.depth = base;
+        Ok(expr)
     }
 
     /// Parses a union expression.
@@ -352,11 +441,14 @@ impl Parser {
     /// ```
     /// See `XPath` 1.0 section 3.3.
     fn parse_union_expr(&mut self) -> Result<Expr, XPathError> {
+        let base = self.depth;
         let mut left = self.parse_path_expr()?;
         while self.eat(&Token::Pipe) {
+            self.enter(1)?;
             let right = self.parse_path_expr()?;
             left = Expr::Union(Box::new(left), Box::new(right));
         }
+        self.depth = base;
         Ok(left)
     }
 
@@ -797,6 +889,29 @@ mod tests {
     /// Asserts that parsing the input fails.
     fn assert_parse_error(input: &str) {
         assert!(parse(input).is_err(), "expected parse error for: {input}");
+    }
+
+    /// Runs `f` on a thread with a large stack.
+    ///
+    /// Expressions near the nesting limit recurse deeper than the default
+    /// 2 MiB test-thread stack allows in unoptimized builds.
+    fn with_big_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Asserts that parsing fails with the nesting-limit error.
+    fn assert_too_deep(input: &str) {
+        let err = parse(input).unwrap_err();
+        assert!(
+            err.message.contains("nested too deeply"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1496,5 +1611,67 @@ mod tests {
             matches!(filter, Expr::Filter { .. }),
             "expected Filter, got: {filter:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Nesting limit (issue #51)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_nested_parens_at_limit() {
+        with_big_stack(|| {
+            let n = (MAX_EXPR_BUDGET / NESTED_EXPR_COST) as usize - 1;
+            let expr = "(".repeat(n) + "1" + &")".repeat(n);
+            assert!(parse(&expr).is_ok());
+        });
+    }
+
+    #[test]
+    fn test_parse_nested_parens_over_limit() {
+        with_big_stack(|| {
+            assert_too_deep(&("(".repeat(4000) + "1" + &")".repeat(4000)));
+        });
+    }
+
+    #[test]
+    fn test_parse_nested_predicates_over_limit() {
+        with_big_stack(|| {
+            assert_too_deep(&("a".to_string() + &"[a".repeat(4000) + &"]".repeat(4000)));
+        });
+    }
+
+    #[test]
+    fn test_parse_nested_function_calls_over_limit() {
+        with_big_stack(|| {
+            assert_too_deep(&("not(".repeat(4000) + "1" + &")".repeat(4000)));
+        });
+    }
+
+    #[test]
+    fn test_parse_repeated_negation_over_limit() {
+        with_big_stack(|| {
+            assert_too_deep(&("-".repeat(100_000) + "1"));
+        });
+    }
+
+    #[test]
+    fn test_parse_long_operator_chains() {
+        with_big_stack(|| {
+            for op in [" or ", " and ", " = ", " < ", " + ", " * ", " | "] {
+                let ok = vec!["a"; 1000].join(op);
+                assert!(parse(&ok).is_ok(), "1000-operand chain with {op:?}");
+                assert_too_deep(&vec!["a"; 100_000].join(op));
+            }
+        });
+    }
+
+    #[test]
+    fn test_parse_depth_restored_between_siblings() {
+        // Sibling sub-expressions must not accumulate budget: many
+        // shallow groups side by side are fine.
+        let expr = vec!["((1))"; 500].join(" + ");
+        assert!(parse(&expr).is_ok());
+        let expr = format!("concat({})", vec!["'x'"; 2000].join(", "));
+        assert!(parse(&expr).is_ok());
     }
 }
