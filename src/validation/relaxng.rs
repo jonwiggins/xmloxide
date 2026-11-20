@@ -696,17 +696,19 @@ fn collect_child_patterns(
 }
 
 /// Combines a list of patterns using implicit `Group` (sequential composition).
+///
+/// `group` is associative, so the list is folded into a balanced tree (see
+/// [`fold_balanced`]): a long sequence of siblings must not produce a
+/// pattern nested deeply enough to overflow the stack in the recursive
+/// validator.
+#[allow(clippy::unnecessary_wraps)]
 fn combine_patterns(patterns: Vec<Pattern>) -> Result<Pattern, SchemaParseError> {
     if patterns.is_empty() {
         return Ok(Pattern::Empty);
     }
-
-    let mut iter = patterns.into_iter();
-    let first = iter.next().ok_or_else(|| SchemaParseError {
-        message: "internal error: empty pattern list".to_string(),
-    })?;
-
-    Ok(iter.fold(first, |acc, p| Pattern::Group(Box::new(acc), Box::new(p))))
+    Ok(fold_balanced(patterns, &|a, b| {
+        Pattern::Group(Box::new(a), Box::new(b))
+    }))
 }
 
 /// Parses a single pattern element.
@@ -787,16 +789,8 @@ fn parse_element_pattern(
     let name_class = parse_name_class_from_element(doc, el, ns, false)?;
     let el_ns = resolve_ns(doc, el, ns);
 
-    // Collect content patterns (everything except <name>, <anyName>, <nsName>,
-    // <choice> when used as name class).
     let mut content_patterns = Vec::new();
-    for child in rng_children(doc, el) {
-        let child_name = doc.node_name(child).unwrap_or("");
-        let child_local = strip_rng_prefix(child_name);
-        // Skip name-class children — they're handled by parse_name_class.
-        if is_name_class_element(child_local) && rng_attr(doc, el, "name").is_none() {
-            continue;
-        }
+    for child in content_children(doc, el) {
         let p = parse_pattern(doc, child, &el_ns)?;
         content_patterns.push(p);
     }
@@ -819,12 +813,7 @@ fn parse_attribute_pattern(
     let attr_ns = resolve_ns(doc, el, ns);
 
     let mut content_patterns = Vec::new();
-    for child in rng_children(doc, el) {
-        let child_name = doc.node_name(child).unwrap_or("");
-        let child_local = strip_rng_prefix(child_name);
-        if is_name_class_element(child_local) && rng_attr(doc, el, "name").is_none() {
-            continue;
-        }
+    for child in content_children(doc, el) {
         let p = parse_pattern(doc, child, &attr_ns)?;
         content_patterns.push(p);
     }
@@ -841,9 +830,16 @@ fn parse_attribute_pattern(
     })
 }
 
-/// Determines whether an element local name is a name-class element.
-fn is_name_class_element(local: &str) -> bool {
-    matches!(local, "name" | "anyName" | "nsName" | "choice")
+/// Iterates over the content-pattern children of an `<element>` or
+/// `<attribute>` pattern.
+///
+/// Without a `name` attribute, the first child is the name class (`RelaxNG`
+/// §3: `<element> nameClass pattern+ </element>`) and every later child is
+/// content — including a `<choice>`, which must not be mistaken for a
+/// name-class choice just because it appears after one.
+fn content_children(doc: &Document, el: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    let skip = usize::from(rng_attr(doc, el, "name").is_none());
+    rng_children(doc, el).skip(skip)
 }
 
 /// Extracts a [`NameClass`] from an element or attribute pattern element.
@@ -871,23 +867,14 @@ fn parse_name_class_from_element(
         return resolve_qname(doc, el, name_attr, default_ns);
     }
 
-    // Look for a name-class child element.
-    for child in rng_children(doc, el) {
+    // Otherwise the first child is the name class.
+    if let Some(child) = rng_children(doc, el).next() {
         let child_name = doc.node_name(child).unwrap_or("");
-        let child_local = strip_rng_prefix(child_name);
-        match child_local {
-            "name" => {
-                return parse_name_element(doc, child, ns);
-            }
-            "anyName" => {
-                return parse_any_name_class(doc, child, ns);
-            }
-            "nsName" => {
-                return parse_ns_name_class(doc, child, ns);
-            }
-            "choice" => {
-                return parse_name_class_choice(doc, child, ns);
-            }
+        match strip_rng_prefix(child_name) {
+            "name" => return parse_name_element(doc, child, ns),
+            "anyName" => return parse_any_name_class(doc, child, ns),
+            "nsName" => return parse_ns_name_class(doc, child, ns),
+            "choice" => return parse_name_class_choice(doc, child, ns),
             _ => {}
         }
     }
@@ -3957,5 +3944,55 @@ mod tests {
             "{:?}",
             result.errors
         );
+    }
+
+    #[test]
+    fn test_parse_element_name_class_child_then_content_choice() {
+        // The first child is the name class; a later <choice> is content.
+        let schema = parse_relaxng(
+            r#"<element xmlns="http://relaxng.org/ns/structure/1.0">
+                 <name>root</name>
+                 <choice>
+                   <element name="a"><empty/></element>
+                   <element name="b"><empty/></element>
+                 </choice>
+               </element>"#,
+        )
+        .unwrap();
+        assert!(is_valid(&schema, "<root><a/></root>"));
+        assert!(is_valid(&schema, "<root><b/></root>"));
+        assert!(!is_valid(&schema, "<root/>"));
+    }
+
+    #[test]
+    fn test_parse_attribute_name_class_choice_then_content_choice() {
+        let schema = parse_relaxng(
+            r#"<element name="root" xmlns="http://relaxng.org/ns/structure/1.0">
+                 <attribute>
+                   <choice><name>x</name><name>y</name></choice>
+                   <choice><value>1</value><value>2</value></choice>
+                 </attribute>
+               </element>"#,
+        )
+        .unwrap();
+        assert!(is_valid(&schema, r#"<root x="1"/>"#));
+        assert!(is_valid(&schema, r#"<root y="2"/>"#));
+        assert!(!is_valid(&schema, r#"<root x="3"/>"#));
+        assert!(!is_valid(&schema, r#"<root z="1"/>"#));
+    }
+
+    #[test]
+    fn test_parse_long_group_is_balanced() {
+        // A long run of sibling patterns must not build a left-leaning chain
+        // deep enough to overflow the stack in validation or `Drop`.
+        let mut schema = String::from(
+            r#"<element name="r" xmlns="http://relaxng.org/ns/structure/1.0"><group>"#,
+        );
+        for _ in 0..100_000 {
+            schema.push_str(r#"<optional><element name="a"><empty/></element></optional>"#);
+        }
+        schema.push_str("</group></element>");
+        let schema = parse_relaxng(&schema).unwrap();
+        assert!(is_valid(&schema, "<r><a/></r>"));
     }
 }
