@@ -271,6 +271,11 @@ pub fn parse_relaxng(schema_xml: &str) -> Result<RelaxNgSchema, SchemaParseError
     })?;
 
     let root_name = doc.node_name(root_el).unwrap_or("");
+    if !is_rng_element(&doc, root_el) {
+        return Err(SchemaParseError {
+            message: format!("root element <{root_name}> is not in the RELAX NG namespace"),
+        });
+    }
 
     // Determine default namespace for elements from the `ns` attribute
     // on the root schema element.
@@ -292,6 +297,45 @@ pub fn parse_relaxng(schema_xml: &str) -> Result<RelaxNgSchema, SchemaParseError
     }
 }
 
+/// The `RelaxNG` structure namespace URI.
+const RNG_NS: &str = "http://relaxng.org/ns/structure/1.0";
+
+/// Returns `true` if `node` is a `RelaxNG` element, i.e. an element in the
+/// `RelaxNG` namespace.
+///
+/// Elements in no namespace are also accepted for compatibility with
+/// schemas that omit the namespace declaration. Every other element is a
+/// *foreign element* (e.g. `<a:documentation>` compatibility annotations),
+/// which `RelaxNG` §3 allows anywhere and §4.1 removes during simplification.
+fn is_rng_element(doc: &Document, node: NodeId) -> bool {
+    match &doc.node(node).kind {
+        NodeKind::Element { namespace, .. } => match namespace.as_deref() {
+            None => true,
+            Some(ns) => ns == RNG_NS,
+        },
+        _ => false,
+    }
+}
+
+/// Iterates over the `RelaxNG` element children of `el`, skipping text,
+/// comments, and foreign elements (`RelaxNG` §4.1).
+fn rng_children(doc: &Document, el: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    doc.children(el).filter(move |&c| is_rng_element(doc, c))
+}
+
+/// Returns the value of an unqualified attribute on a schema element.
+///
+/// Attributes with a namespace prefix are either foreign attributes, which
+/// `RelaxNG` §4.1 says are removed, or namespace declarations (whose local
+/// part could otherwise collide with names like `ns` or `name`); both are
+/// ignored.
+fn rng_attr<'a>(doc: &'a Document, el: NodeId, name: &str) -> Option<&'a str> {
+    doc.attributes(el)
+        .iter()
+        .find(|a| a.name == name && a.prefix.is_none() && a.namespace.is_none())
+        .map(|a| a.value.as_str())
+}
+
 /// Strips a `rng:` prefix from a name, if present, returning the local part.
 fn strip_rng_prefix(name: &str) -> &str {
     name.strip_prefix("rng:").unwrap_or(name)
@@ -300,7 +344,7 @@ fn strip_rng_prefix(name: &str) -> &str {
 /// Returns the value of the `ns` attribute on an element, defaulting to
 /// the empty string.
 fn element_ns_attr(doc: &Document, node: NodeId) -> String {
-    doc.attribute(node, "ns").unwrap_or("").to_string()
+    rng_attr(doc, node, "ns").unwrap_or("").to_string()
 }
 
 /// Parses a `<grammar>` element containing `<start>` and `<define>` children.
@@ -337,10 +381,7 @@ fn collect_grammar_content(
     start: &mut Option<Pattern>,
     defines: &mut HashMap<String, Pattern>,
 ) -> Result<(), SchemaParseError> {
-    for child in doc.children(container) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, container) {
         let child_name = doc.node_name(child).unwrap_or("");
         let local = strip_rng_prefix(child_name);
 
@@ -350,8 +391,7 @@ fn collect_grammar_content(
                 *start = Some(inner);
             }
             "define" => {
-                let name = doc
-                    .attribute(child, "name")
+                let name = rng_attr(doc, child, "name")
                     .ok_or_else(|| SchemaParseError {
                         message: "<define> missing 'name' attribute".to_string(),
                     })?
@@ -376,8 +416,7 @@ fn collect_grammar_content(
 /// Resolves the effective namespace for pattern children. Uses the `ns`
 /// attribute on the current element if present, otherwise inherits.
 fn resolve_ns(doc: &Document, el: NodeId, parent_ns: &str) -> String {
-    doc.attribute(el, "ns")
-        .map_or_else(|| parent_ns.to_string(), String::from)
+    rng_attr(doc, el, "ns").map_or_else(|| parent_ns.to_string(), String::from)
 }
 
 /// Parses the child patterns of a container element (e.g., `<start>`,
@@ -399,10 +438,7 @@ fn collect_child_patterns(
     ns: &str,
 ) -> Result<Vec<Pattern>, SchemaParseError> {
     let mut patterns = Vec::new();
-    for child in doc.children(container) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, container) {
         let p = parse_pattern(doc, child, ns)?;
         patterns.push(p);
     }
@@ -461,8 +497,7 @@ fn parse_pattern(doc: &Document, el: NodeId, parent_ns: &str) -> Result<Pattern,
             Ok(Pattern::Mixed(Box::new(inner)))
         }
         "ref" => {
-            let ref_name = doc
-                .attribute(el, "name")
+            let ref_name = rng_attr(doc, el, "name")
                 .ok_or_else(|| SchemaParseError {
                     message: "<ref> missing 'name' attribute".to_string(),
                 })?
@@ -477,9 +512,8 @@ fn parse_pattern(doc: &Document, el: NodeId, parent_ns: &str) -> Result<Pattern,
             Ok(Pattern::Value(text))
         }
         "data" => {
-            let datatype = doc.attribute(el, "type").unwrap_or("string").to_string();
-            let library = doc
-                .attribute(el, "datatypeLibrary")
+            let datatype = rng_attr(doc, el, "type").unwrap_or("string").to_string();
+            let library = rng_attr(doc, el, "datatypeLibrary")
                 .unwrap_or("")
                 .to_string();
             Ok(Pattern::Data { datatype, library })
@@ -506,14 +540,11 @@ fn parse_element_pattern(
     // Collect content patterns (everything except <name>, <anyName>, <nsName>,
     // <choice> when used as name class).
     let mut content_patterns = Vec::new();
-    for child in doc.children(el) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, el) {
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
         // Skip name-class children — they're handled by parse_name_class.
-        if is_name_class_element(child_local) && doc.attribute(el, "name").is_none() {
+        if is_name_class_element(child_local) && rng_attr(doc, el, "name").is_none() {
             continue;
         }
         let p = parse_pattern(doc, child, &el_ns)?;
@@ -538,13 +569,10 @@ fn parse_attribute_pattern(
     let attr_ns = resolve_ns(doc, el, ns);
 
     let mut content_patterns = Vec::new();
-    for child in doc.children(el) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, el) {
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
-        if is_name_class_element(child_local) && doc.attribute(el, "name").is_none() {
+        if is_name_class_element(child_local) && rng_attr(doc, el, "name").is_none() {
             continue;
         }
         let p = parse_pattern(doc, child, &attr_ns)?;
@@ -578,7 +606,7 @@ fn parse_name_class_from_element(
     ns: &str,
 ) -> Result<NameClass, SchemaParseError> {
     // Check for `name` attribute shorthand.
-    if let Some(name_attr) = doc.attribute(el, "name") {
+    if let Some(name_attr) = rng_attr(doc, el, "name") {
         let el_ns = resolve_ns(doc, el, ns);
         return Ok(NameClass::Name {
             ns: el_ns,
@@ -587,10 +615,7 @@ fn parse_name_class_from_element(
     }
 
     // Look for a name-class child element.
-    for child in doc.children(el) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, el) {
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
         match child_local {
@@ -626,10 +651,7 @@ fn parse_any_name_class(
     el: NodeId,
     ns: &str,
 ) -> Result<NameClass, SchemaParseError> {
-    for child in doc.children(el) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, el) {
         let child_name = doc.node_name(child).unwrap_or("");
         if strip_rng_prefix(child_name) == "except" {
             let except = parse_name_class_children(doc, child, ns)?;
@@ -646,10 +668,7 @@ fn parse_ns_name_class(
     ns: &str,
 ) -> Result<NameClass, SchemaParseError> {
     let target_ns = resolve_ns(doc, el, ns);
-    for child in doc.children(el) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, el) {
         let child_name = doc.node_name(child).unwrap_or("");
         if strip_rng_prefix(child_name) == "except" {
             let except = parse_name_class_children(doc, child, ns)?;
@@ -669,10 +688,7 @@ fn parse_name_class_choice(
     ns: &str,
 ) -> Result<NameClass, SchemaParseError> {
     let mut classes = Vec::new();
-    for child in doc.children(el) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, el) {
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
         let nc = match child_local {
@@ -703,10 +719,7 @@ fn parse_name_class_children(
     ns: &str,
 ) -> Result<NameClass, SchemaParseError> {
     let mut classes = Vec::new();
-    for child in doc.children(container) {
-        if !matches!(doc.node(child).kind, NodeKind::Element { .. }) {
-            continue;
-        }
+    for child in rng_children(doc, container) {
         let child_name = doc.node_name(child).unwrap_or("");
         let child_local = strip_rng_prefix(child_name);
         let nc = match child_local {
@@ -2578,5 +2591,112 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("no <start>"), "{}", err.message);
+    }
+
+    // --- Foreign elements and attributes (§3, §4.1, issue #53) ---
+
+    #[test]
+    fn test_parse_relaxng_ignores_annotation_elements() {
+        let schema = parse_relaxng(
+            r#"<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+                        xmlns:a="http://relaxng.org/ns/compatibility/annotations/1.0">
+                <a:documentation>Grammar-level docs</a:documentation>
+                <start><ref name="root"/></start>
+                <define name="root">
+                    <a:documentation>some docs</a:documentation>
+                    <element name="root">
+                        <a:documentation>element docs</a:documentation>
+                        <choice>
+                            <a:documentation>choice docs</a:documentation>
+                            <element name="a"><empty/></element>
+                            <element name="b"><empty/></element>
+                        </choice>
+                    </element>
+                </define>
+            </grammar>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<root><b/></root>").unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        let doc = Document::parse_str("<root><c/></root>").unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_relaxng_ignores_foreign_element_content() {
+        // A foreign element's subtree is ignored even if it contains
+        // `RelaxNG`-namespaced elements.
+        let schema = parse_relaxng(
+            r#"<element name="root" xmlns="http://relaxng.org/ns/structure/1.0"
+                        xmlns:x="urn:example:ext">
+                <x:meta><element name="never"><empty/></element></x:meta>
+                <empty/>
+            </element>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<root/>").unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+
+        let doc = Document::parse_str("<root><never/></root>").unwrap();
+        assert!(!validate(&doc, &schema).is_valid);
+    }
+
+    #[test]
+    fn test_parse_relaxng_ignores_annotations_in_name_classes() {
+        let schema = parse_relaxng(
+            r#"<element xmlns="http://relaxng.org/ns/structure/1.0"
+                        xmlns:a="http://relaxng.org/ns/compatibility/annotations/1.0">
+                <a:documentation>before the name class</a:documentation>
+                <choice>
+                    <a:documentation>name choice</a:documentation>
+                    <name>x</name>
+                    <name>y</name>
+                </choice>
+                <empty/>
+            </element>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str("<y/>").unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_parse_relaxng_ignores_foreign_attributes() {
+        // `a:defaultValue` is a compatibility annotation; `x:name` and
+        // `xmlns:ns` must not be mistaken for the `name`/`ns` attributes.
+        let schema = parse_relaxng(
+            r#"<element name="root" xmlns="http://relaxng.org/ns/structure/1.0"
+                        xmlns:a="http://relaxng.org/ns/compatibility/annotations/1.0"
+                        xmlns:x="urn:example:ext"
+                        xmlns:ns="urn:example:bogus">
+                <optional>
+                    <attribute name="mode" a:defaultValue="fast" x:name="bogus">
+                        <text/>
+                    </attribute>
+                </optional>
+            </element>"#,
+        )
+        .unwrap();
+
+        let doc = Document::parse_str(r#"<root mode="slow"/>"#).unwrap();
+        let result = validate(&doc, &schema);
+        assert!(result.is_valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn test_parse_relaxng_foreign_root_is_error() {
+        let err = parse_relaxng(r#"<x:grammar xmlns:x="urn:example:not-rng"/>"#).unwrap_err();
+        assert!(
+            err.message.contains("not in the RELAX NG namespace"),
+            "{}",
+            err.message
+        );
     }
 }
