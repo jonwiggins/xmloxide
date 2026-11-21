@@ -878,7 +878,13 @@ impl<'a> XPathContext<'a> {
                 }
                 _ => false,
             },
-            NodeTest::Node => true,
+            // XPath's data model has no DOCTYPE node, so `node()` doesn't
+            // match one, as in libxml2. The self axis is exempt because it
+            // only reaches a DOCTYPE that is itself the context node, and
+            // there libxml2's `.` (parsed here as `self::node()`) keeps it.
+            NodeTest::Node => {
+                axis == Axis::Self_ || !matches!(node.kind, NodeKind::DocumentType { .. })
+            }
             NodeTest::Text => matches!(node.kind, NodeKind::Text { .. } | NodeKind::CData { .. }),
             NodeTest::Comment => matches!(node.kind, NodeKind::Comment { .. }),
             NodeTest::ProcessingInstruction(opt_name) => match &node.kind {
@@ -2960,6 +2966,96 @@ mod tests {
         match &result {
             XPathValue::NodeSet(ns) => assert_eq!(ns.len(), 2), // a and b
             _ => panic!("expected node-set"),
+        }
+    }
+
+    // -- DOCTYPE nodes --------------------------------------------------------
+
+    /// Labels each node in a node-set: elements by name, other nodes by kind.
+    fn node_labels(doc: &Document, context: NodeId, xpath: &str) -> Vec<String> {
+        let ctx = XPathContext::new(doc, context);
+        let result = ctx.evaluate(&parse(xpath).unwrap()).unwrap();
+        let XPathValue::NodeSet(nodes) = result else {
+            panic!("expected a node-set from {xpath}, got {result:?}");
+        };
+        nodes
+            .iter()
+            .map(|node| {
+                let XPathNode::Node(id) = *node else {
+                    panic!("expected a tree node from {xpath}, got {node:?}");
+                };
+                match &doc.node(id).kind {
+                    NodeKind::Document => "/".to_string(),
+                    NodeKind::Element { name, .. } => name.clone(),
+                    NodeKind::Comment { .. } => "comment".to_string(),
+                    NodeKind::ProcessingInstruction { target, .. } => format!("?{target}"),
+                    NodeKind::DocumentType { .. } => "doctype".to_string(),
+                    other => format!("{other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    const DOCTYPE_XML: &str =
+        r#"<!--c--><!DOCTYPE r [<!ELEMENT r ANY>]><?p?><r><a x="1"/></r><!--z-->"#;
+
+    #[test]
+    fn test_node_test_does_not_match_doctype() {
+        // XPath's data model has no DOCTYPE node, and libxml2 never selects
+        // one. Every expectation here is what libxml2 2.14 and 2.15 return.
+        let doc = Document::parse_str(DOCTYPE_XML).unwrap();
+        let labels = |xpath| node_labels(&doc, doc.root(), xpath);
+
+        assert_eq!(labels("/node()"), ["comment", "?p", "r", "comment"]);
+        assert_eq!(labels("/node()[2]"), ["?p"]);
+        assert_eq!(
+            labels("/comment()[1]/following-sibling::node()"),
+            ["?p", "r", "comment"]
+        );
+        assert_eq!(
+            labels("/processing-instruction()/preceding-sibling::node()"),
+            ["comment"]
+        );
+        assert_eq!(labels("//a/preceding::node()"), ["comment", "?p"]);
+        assert_eq!(labels("//@x/preceding::node()"), ["comment", "?p"]);
+        assert_eq!(
+            labels("/comment()[1]/following::node()"),
+            ["?p", "r", "a", "comment"]
+        );
+        assert_eq!(
+            labels("/descendant-or-self::node()"),
+            ["/", "comment", "?p", "r", "a", "comment"]
+        );
+        assert_eq!(labels("//node()"), ["comment", "?p", "r", "a", "comment"]);
+
+        let ctx = XPathContext::new(&doc, doc.root());
+        let count = ctx.evaluate(&parse("count(/node())").unwrap()).unwrap();
+        assert_eq!(count, XPathValue::Number(4.0));
+    }
+
+    #[test]
+    fn test_doctype_as_context_node() {
+        // libxml2 still lets `.` select a DOCTYPE that is the context node.
+        let doc = Document::parse_str(DOCTYPE_XML).unwrap();
+        let doctype = doc
+            .children(doc.root())
+            .find(|&id| matches!(doc.node(id).kind, NodeKind::DocumentType { .. }))
+            .unwrap();
+        let labels = |xpath| node_labels(&doc, doctype, xpath);
+
+        assert_eq!(labels("."), ["doctype"]);
+        assert_eq!(labels(".."), ["/"]);
+        assert_eq!(labels("following-sibling::node()"), ["?p", "r", "comment"]);
+        assert_eq!(labels("preceding-sibling::node()"), ["comment"]);
+    }
+
+    #[test]
+    fn test_node_test_does_not_match_html_doctype() {
+        // `parse_html` adds a DOCTYPE when the input has none, as libxml2
+        // 2.14 does; libxml2's XPath doesn't select either one.
+        for html in ["<p>hi</p>", "<!DOCTYPE html><p>hi</p>"] {
+            let doc = crate::html::parse_html(html).unwrap();
+            assert_eq!(node_labels(&doc, doc.root(), "/node()"), ["html"], "{html}");
         }
     }
 
