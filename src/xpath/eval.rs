@@ -263,6 +263,15 @@ impl<'a> XPathContext<'a> {
             // node-set that `//` produces.
             if let Some(fused) = Self::try_fuse_descendant_child(steps, i) {
                 nodes = self.apply_step(&nodes, &fused)?;
+                let predicates = &steps[i + 1].predicates;
+                if predicates.iter().all(ignores_position) {
+                    // Per parent or all at once, the result is the same.
+                    for predicate in predicates {
+                        nodes = self.apply_predicate(&nodes, predicate)?;
+                    }
+                } else {
+                    nodes = self.apply_predicates_per_parent(nodes, predicates)?;
+                }
                 i += 2; // skip both steps
             } else {
                 nodes = self.apply_step(&nodes, step)?;
@@ -292,6 +301,9 @@ impl<'a> XPathContext<'a> {
     /// Tries to fuse `descendant-or-self::node()` + `child::X` at position `i`
     /// into a single `descendant::X` step. Returns `None` if the pattern doesn't
     /// match (e.g., the first step has predicates, or the second step isn't `child`).
+    ///
+    /// The fused step has no predicates: `child::X`'s predicates must be
+    /// applied with [`apply_predicates_per_parent`](Self::apply_predicates_per_parent).
     fn try_fuse_descendant_child(steps: &[Step], i: usize) -> Option<Step> {
         if i + 1 >= steps.len() {
             return None;
@@ -308,11 +320,72 @@ impl<'a> XPathContext<'a> {
             Some(Step {
                 axis: Axis::Descendant,
                 node_test: second.node_test.clone(),
-                predicates: second.predicates.clone(),
+                predicates: Vec::new(),
             })
         } else {
             None
         }
+    }
+
+    /// Applies `child::X`'s predicates to the candidates of a fused
+    /// `descendant::X` step, with the meaning of the
+    /// `descendant-or-self::node()/child::X[p]` it replaces: each predicate
+    /// filters each parent's `X` children separately, so `//a/b[1]` and
+    /// `//b[1]` both select the first `b` of every parent. (`XPath` 1.0
+    /// section 2.5: `//para[1]` is not `/descendant::para[1]`.)
+    ///
+    /// The candidates with a given parent are exactly that parent's `X`
+    /// children, in document order, so grouping by parent recovers the
+    /// per-context node-sets.
+    fn apply_predicates_per_parent(
+        &self,
+        candidates: Vec<XPathNode>,
+        predicates: &[Expr],
+    ) -> Result<Vec<XPathNode>, XPathError> {
+        let parent_of = |node: &XPathNode| self.doc.parent(node.anchor());
+        let first_parent = candidates.first().map(parent_of);
+        if candidates
+            .iter()
+            .all(|node| Some(parent_of(node)) == first_parent)
+        {
+            // All one parent's children: a single node-set, as it stands.
+            let mut nodes = candidates;
+            for predicate in predicates {
+                nodes = self.apply_predicate(&nodes, predicate)?;
+            }
+            return Ok(nodes);
+        }
+
+        // Each group holds the indices of one parent's candidates.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut group_of_parent: HashMap<Option<NodeId>, usize> = HashMap::new();
+        for (index, node) in candidates.iter().enumerate() {
+            let group = *group_of_parent.entry(parent_of(node)).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[group].push(index);
+        }
+        let mut keep = vec![false; candidates.len()];
+        for group in groups {
+            let mut nodes: Vec<XPathNode> = group.iter().map(|&i| candidates[i]).collect();
+            for predicate in predicates {
+                nodes = self.apply_predicate(&nodes, predicate)?;
+            }
+            // Predicates keep a subsequence of the group, in order.
+            let mut indices = group.into_iter();
+            for node in nodes {
+                if let Some(index) = indices.by_ref().find(|&i| candidates[i] == node) {
+                    keep[index] = true;
+                }
+            }
+        }
+        // Filter rather than sort: the candidates are in document order,
+        // and node ids stop being in document order once the tree is edited.
+        let mut keep = keep.into_iter();
+        let mut nodes = candidates;
+        nodes.retain(|_| keep.next() == Some(true));
+        Ok(nodes)
     }
 
     fn eval_root_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
@@ -2047,6 +2120,84 @@ impl<'a> XPathContext<'a> {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Whether `predicate` keeps or drops a node regardless of its context
+/// position and size, so that applying it to all of a fused `//` step's
+/// candidates at once gives the same result as applying it per parent.
+///
+/// Conservative: true only if the predicate can't evaluate to a number
+/// (which `XPath` 1.0 section 2.4 compares with the position) and never calls
+/// `position()` or `last()`, not even in a nested path.
+fn ignores_position(predicate: &Expr) -> bool {
+    let not_a_number = match predicate {
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Lte
+                | BinaryOp::Gt
+                | BinaryOp::Gte
+                | BinaryOp::And
+                | BinaryOp::Or
+        ),
+        Expr::String(_)
+        | Expr::Path { .. }
+        | Expr::RootPath { .. }
+        | Expr::Filter { .. }
+        | Expr::FilterPath { .. }
+        | Expr::Union(..) => true,
+        // XPath 1.0's boolean, string and node-set functions.
+        Expr::FunctionCall { name, .. } => matches!(
+            name.as_str(),
+            "not"
+                | "true"
+                | "false"
+                | "boolean"
+                | "lang"
+                | "contains"
+                | "starts-with"
+                | "string"
+                | "concat"
+                | "substring"
+                | "substring-before"
+                | "substring-after"
+                | "normalize-space"
+                | "translate"
+                | "local-name"
+                | "name"
+                | "namespace-uri"
+                | "id"
+        ),
+        Expr::Number(_) | Expr::Variable(_) | Expr::UnaryNeg(_) => false,
+    };
+    not_a_number && !calls_position_or_last(predicate)
+}
+
+/// Whether `expr` calls `position()` or `last()` anywhere, including in
+/// the predicates of nested paths.
+fn calls_position_or_last(expr: &Expr) -> bool {
+    let in_steps = |steps: &[Step]| {
+        steps
+            .iter()
+            .any(|step| step.predicates.iter().any(calls_position_or_last))
+    };
+    match expr {
+        Expr::Number(_) | Expr::String(_) | Expr::Variable(_) => false,
+        Expr::BinaryOp { left, right, .. } | Expr::Union(left, right) => {
+            calls_position_or_last(left) || calls_position_or_last(right)
+        }
+        Expr::UnaryNeg(inner) => calls_position_or_last(inner),
+        Expr::FunctionCall { name, args } => {
+            name == "position" || name == "last" || args.iter().any(calls_position_or_last)
+        }
+        Expr::Path { steps } | Expr::RootPath { steps } => in_steps(steps),
+        Expr::Filter { expr, predicates } => {
+            calls_position_or_last(expr) || predicates.iter().any(calls_position_or_last)
+        }
+        Expr::FilterPath { expr, steps } => calls_position_or_last(expr) || in_steps(steps),
+    }
+}
+
 /// Sorts a node-set into document order using the arena index as a proxy.
 ///
 /// Since nodes are allocated in document order during parsing, the arena
@@ -3157,5 +3308,91 @@ mod tests {
             }
             other => panic!("expected node-set, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_double_slash_positional_predicate_is_per_parent() {
+        // XPath 1.0 section 2.5: //para[1] is not /descendant::para[1].
+        let xml = "<r><d><i>1</i><s><i>2</i></s><i>3</i></d><i>4</i></r>";
+        let doc = Document::parse_str(xml).unwrap();
+        let strings = |xpath: &str| -> Vec<String> {
+            let ctx = XPathContext::new(&doc, doc.root());
+            match ctx.evaluate(&parse(xpath).unwrap()).unwrap() {
+                XPathValue::NodeSet(nodes) => nodes
+                    .into_iter()
+                    .map(|n| doc.text_content(n.anchor()))
+                    .collect(),
+                other => panic!("expected node-set, got {other:?}"),
+            }
+        };
+        assert_eq!(strings("//i[1]"), ["1", "2", "4"]);
+        assert_eq!(strings("//d//i[last()]"), ["2", "3"]);
+        assert_eq!(strings("//i[position() = last()]"), ["2", "3", "4"]);
+        // Each predicate filters the node-set the previous one left.
+        assert_eq!(strings("//i[. < 4][last()]"), ["2", "3"]);
+        // Unchanged: no positional predicate, or no `//` abbreviation.
+        assert_eq!(strings("//i[. > 1]"), ["2", "3", "4"]);
+        assert_eq!(strings("/descendant::i[1]"), ["1"]);
+        assert_eq!(strings("(//i)[last()]"), ["4"]);
+        // Fused steps after a filter expression take the same path.
+        assert_eq!(strings("(//d)//i[1]"), ["1", "2"]);
+    }
+
+    #[test]
+    fn test_ignores_position_is_conservative() {
+        let ignores = |predicate: &str| {
+            let Expr::Path { steps } = parse(&format!("x[{predicate}]")).unwrap() else {
+                panic!("expected a path");
+            };
+            ignores_position(&steps[0].predicates[0])
+        };
+        for predicate in [
+            "@class = 'a'",
+            "contains(., 'a')",
+            "not(@z)",
+            "b and @c",
+            "b",
+            "'s'",
+            "@a | @b",
+            "b[1]",
+            "normalize-space()",
+        ] {
+            assert!(ignores(predicate), "{predicate} ignores position");
+        }
+        for predicate in [
+            "1",
+            "last()",
+            "position() > 1",
+            ". = last()",
+            "$v",
+            "count(b)",
+            "1 + 1",
+            "-1",
+            "b[last()]",
+            "string(position())",
+        ] {
+            assert!(!ignores(predicate), "{predicate} may depend on position");
+        }
+    }
+
+    #[test]
+    fn test_double_slash_predicate_keeps_document_order_after_insert() {
+        let mut doc = Document::parse_str("<r><a><b>x</b></a><c><b>y</b></c></r>").unwrap();
+        let r = doc.root_element().unwrap();
+        let a = doc.first_child(r).unwrap();
+        let x = doc.first_child(a).unwrap();
+        let y = doc.first_child(doc.last_child(r).unwrap()).unwrap();
+        // The new element has the highest id, but comes first in the document.
+        let new = doc.create_element("b");
+        doc.insert_before(x, new);
+        let ids = |xpath: &str| -> Vec<NodeId> {
+            let ctx = XPathContext::new(&doc, doc.root());
+            match ctx.evaluate(&parse(xpath).unwrap()).unwrap() {
+                XPathValue::NodeSet(nodes) => nodes.into_iter().map(XPathNode::anchor).collect(),
+                other => panic!("expected node-set, got {other:?}"),
+            }
+        };
+        assert_eq!(ids("//b[1]"), [new, y]);
+        assert_eq!(ids("//b[not(@z)]"), [new, x, y]);
     }
 }
